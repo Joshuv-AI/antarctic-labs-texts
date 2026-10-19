@@ -1,0 +1,1495 @@
+TIDE: Temporal Incremental Draft Engine for Self-Improving LLM Inference
+
+
+Abstract
+Speculative decoding can substantially accelerate LLM inference, but realizing its benefits in practice is challenging due to evolving workloads and system-level constraints. We present TIDE (Temporal Incremental Draft Engine), a serving-engine-native framework that integrates online draft adaptation directly into high-performance LLM inference systems. TIDE reuses target model hidden states generated during inference as training signals, enabling zero-overhead draft adaptation without reloading the target model, and employs adaptive runtime control to activate speculation and training only when beneficial. TIDE exploits heterogeneous clusters by mapping decoupled inference and training to appropriate GPU classes. Across diverse real-world workloads, TIDE achieves up to 1.15× throughput improvement over static speculative decoding while reducing draft training time by 1.67× compared to approaches that recompute training signals.
+
+
+
+Jiyoung Park
+
+Hankyu Jang
+
+Changseok Song
+
+Wookeun Jung
+
+Moreh, Inc.
+
+research@moreh.io
+
+†
+†
+footnotetext:
+This work originates from the development of Moreh’s production-grade inference software product, the MoAI Inference Framework, and the resulting techniques and design decisions will be used in this framework.
+https://moreh.io/inference-framework/
+
+1
+Introduction
+
+Large language models (LLMs) increasingly achieve state-of-the-art performance by scaling test-time computation, particularly for reasoning-intensive tasks such as mathematics and code generation
+(
+29
+;
+27
+)
+. As a result, inference efficiency has become a central bottleneck for deploying modern reasoning-oriented LLMs in real-world systems.
+
+Speculative decoding is one of the most effective techniques for accelerating LLM inference. By allowing a lightweight draft model to propose multiple tokens that are then verified in batch by a target model, speculative decoding can significantly improve throughput and latency when the draft and target models are well aligned
+(
+22
+;
+7
+)
+. However, its effectiveness is highly sensitive to draft–target alignment: when alignment degrades, acceptance rates drop sharply and speculative decoding yields little or no performance gain.
+
+A fundamental challenge is that draft–target alignment is inherently workload-dependent. In production LLM services, inference workloads evolve continuously as user behavior changes, application logic is updated, and prompt templates are modified. While workloads are globally non-stationary, prior studies show that they exhibit strong short-term temporal locality, with recent inference history remaining predictive of near-future requests
+(
+32
+;
+14
+;
+37
+;
+34
+)
+. This suggests that alignment can, in principle, be preserved by adapting to recent inference behavior, even as long-term distributions shift.
+
+Recent work has explored this opportunity by adapting draft models online using inference-time signals, for example via online distillation from target model corrections or logits
+(
+40
+;
+35
+)
+. While these approaches demonstrate that alignment can be recovered under distribution shift, they primarily focus on the learning algorithm itself. Whether online draft training can be integrated into high-performance inference engines in a way that yields sustained end-to-end throughput improvements remains an open systems-level question.
+
+In practice, addressing this question requires careful coordination between learning and serving. Online draft training must introduce minimal interference to latency-critical inference, operate under realistic resource constraints, and adapt only when beneficial. Because the performance impact of speculative decoding varies across workload phases,
+continuous speculation or training is often unnecessary and can even be counterproductive. Effective deployment therefore requires dynamic runtime control over
+when
+to speculate and
+when
+to train, based solely on signals observable during inference serving.
+
+To address these challenges, we introduce
+Temporal Incremental Draft Engine (TIDE)
+, a serving-engine-native framework for adaptive speculative decoding under evolving workloads. Rather than treating draft adaptation as an isolated learning problem, TIDE jointly manages training signal collection, draft model updates, and speculative decoding decisions entirely within the inference serving engine.
+
+TIDE exploits short-term temporal locality by incrementally adapting the draft model based on recent inference behavior, while dynamically controlling when speculative decoding and training are beneficial. Crucially, TIDE generates training data with zero additional inference overhead by reusing intermediate hidden representations already computed by the target model during verification, eliminating the need to reload or recompute target model activations during training.
+
+Finally, TIDE decouples inference serving and draft training to enable efficient deployment under realistic hardware constraints. In our evaluation, we demonstrate that inference serving on NVIDIA H100 GPUs can be paired with draft model training on AMD Instinct MI250 GPUs, improving overall system throughput while maintaining high speculative decoding performance.
+
+In summary, our main contributions are:
+
+•
+
+We propose TIDE, a serving-engine-native framework for adaptive speculative decoding that incrementally maintains draft–target alignment under non-stationary inference workloads.
+
+•
+
+We enable zero-overhead training data generation by reusing intermediate hidden states computed during inference, allowing efficient draft training without loading the large target model.
+
+•
+
+We introduce adaptive runtime control mechanisms that determine when to speculate and when to train, avoiding unnecessary overhead under unfavorable workload conditions.
+
+•
+
+We demonstrate effective heterogeneous GPU utilization by decoupling inference and training, running inference on NVIDIA H100 GPUs and draft training on AMD MI250 GPUs.
+
+•
+
+We implement a complete TIDE prototype and show consistent system-level throughput improvements across diverse real-world workload patterns.
+
+2
+Background
+
+Figure 1
+:
+Overview of TIDE architecture and workflow.
+
+2.1
+Speculative Decoding in Dynamic Workloads
+
+Speculative decoding accelerates LLM inference by using a smaller draft model to predict multiple tokens, which are then verified in parallel by the target model.
+(
+22
+)
+derived the theoretical speedup of speculative decoding relative to vanilla autoregressive decoding:
+
+Theoretical\ Speedup=\frac{1-\alpha^{\gamma+1}}{(1-\alpha)(c\gamma+1)}
+
+(1)
+
+where
+\alpha
+is the token acceptance rate,
+\gamma
+is the number of candidate tokens, and
+c
+is the ratio between draft and target model latency.
+
+This formula reveals three critical conditions for performance improvements: (1)
+high acceptance rate
+requiring strong draft-target alignment, (2)
+memory-bound regime
+where verification latency equals single-token decoding latency, and (3)
+minimal draft overhead
+achievable through lightweight draft model architectures.
+
+Prior work addresses these conditions individually. Online training approaches
+(
+25
+)
+improve draft–target alignment through continuous fine-tuning using inference-time signals. Adaptive systems
+(
+19
+;
+18
+;
+17
+)
+focus on runtime control by dynamically adjusting the number of speculative tokens or disabling speculative decoding based on system load and acceptance rates. Lightweight draft architectures
+(
+3
+;
+24
+)
+reduce draft model overhead by simplifying model structure or reusing intermediate representations.
+
+Prior work demonstrates the effectiveness of individual techniques under controlled experimental settings, but does not show their benefits when integrated into a complete serving system. In particular, there is limited investigation into how these techniques should be applied in practice to improve end-to-end throughput in real LLM serving environments.
+
+2.2
+Heterogeneous Systems for LLM Inference
+
+Modern datacenters inevitably consist of heterogeneous GPU clusters, as new accelerator generations are adopted incrementally over time. Prior work has primarily exploited such heterogeneity for inference-only execution, either by assigning different models to different GPUs based on coarse-grained criteria (e.g., model size or latency sensitivity)
+(
+9
+;
+33
+)
+, or by distributing different inference phases of a single model across heterogeneous devices, such as disaggregated prefill and decoding
+(
+39
+;
+20
+;
+8
+)
+. In these systems, heterogeneity is handled via static or periodically updated placement policies derived from offline profiling.
+
+In contrast, TIDE considers heterogeneity in a setting where inference is interleaved with online draft model adaptation. Rather than optimizing inference alone, TIDE decouples inference serving and draft training and assigns them to different GPU classes based on their respective performance and cost characteristics. This enables heterogeneous clusters to efficiently support adaptive speculative decoding, a dimension not addressed by prior heterogeneous LLM serving systems.
+
+3
+TIDE Architecture
+
+3.1
+System Overview
+
+Figure 2
+:
+Detailed TIDE architecture and workflow. The system monitors acceptance length to adaptively enable/disable speculative decoding and selectively trigger training signal collection based on workload changes.
+
+As illustrated in
+Figure
+
+1
+, TIDE consists of the Inference Serving Engine with its Adaptive Drafter, Acceptance Length Monitor, and Training Signal Extractor, and the Draft Model Training Engine, working collaboratively to maintain high inference throughput while continuously adapting the draft model to evolving workloads.
+
+Inference Serving Engine.
+The Inference Serving Engine handles incoming requests using speculative decoding with adaptive control. During each inference iteration, the draft model generates candidate tokens, which are then verified by the target model in parallel.
+This verification process produces two critical outputs: per-request acceptance length, the number of draft tokens accepted by the target model for each request, and draft model training signals, consisting of target model’s intermediate hidden states generated during prefill and verification phases for input and output tokens.
+
+Based on these outputs, two decision components operate as illustrated in Figure
+2
+: The Adaptive Drafter monitors batch size and acceptance length to determine whether to enable or disable speculative decoding, ensuring it is only applied when beneficial for performance (Section
+4.1
+). The Training Signal Extractor decides whether to store training signals in shared storage, minimizing storage and training overhead. It halts extraction when the acceptance length improvement plateaus, indicating the draft model has sufficiently adapted to the current workload distribution, and resumes extraction upon detecting distribution shift (Section
+4.2
+).
+
+Draft Model Training Engine.
+The Draft Model Training Engine operates asynchronously on separate GPU resources independent from the Inference Serving Engine. It continuously monitors shared storage for accumulated training signals. When the signals exceed a predefined threshold, it triggers a training cycle, loading the current draft model checkpoint and fine-tuning it using the accumulated training signals. After training converges, the updated draft model is evaluated and deployed to the Inference Serving Engine only if it demonstrates improved acceptance length.
+
+3.2
+Serving-Time Training Signal Extraction
+
+Figure 3
+:
+TIDE’s asynchronous adaptation pipeline. Hidden state extraction overlaps with GPU computation (top), and draft model training proceeds in parallel with inference serving (bottom), achieving zero-overhead continuous adaptation.
+
+TIDE employs EAGLE-3
+(
+24
+)
+, a state-of-the-art speculative decoding technique, to build a draft model consisting of a single decoder layer and an LM head. The EAGLE-3 draft model predicts the next token based on the target model’s intermediate hidden states, rather than directly from the input prompt as in conventional LLMs. Specifically, EAGLE-3 uses concatenated hidden states from decoder layers at low, middle, and high positions of the target model, leading to richer semantic information for next token predictions. These hidden states are computed during the target model’s prefill for input prompts and decoding (or verification if speculative decoding is enabled) phases, making them natural byproducts of normal inference operations that can be directly used as training signals for the EAGLE-3 draft model.
+
+To leverage this opportunity for efficient training signal collection, we implement intermediate hidden state extraction on top of SGLang
+(
+38
+)
+and vLLM
+(
+21
+)
+, making our approach applicable to any transformer-based architecture. Furthermore, to ensure that storing these signals does not impact inference performance, we overlap both the device-to-host memory transfer and subsequent storage write operations with the next verification step’s compute kernels. The hidden states from each decoder layer for accepted tokens (determined by the current verification step) are concatenated and copied to a pre-allocated buffer in host memory, which is then flushed to shared storage when full. This overlapping strategy achieves near-zero overhead for training signal extraction (see Figure
+3
+).
+
+3.3
+Online Draft Model Adaptation
+
+Traditional draft model training approaches
+(
+23
+;
+16
+)
+require running target model inference again during the training process to generate training data. This leads to two significant limitations: (1) substantially increased training time as analyzed in
+Section
+
+5.3
+, and (2) excessive GPU memory consumption from loading both the target and draft models simultaneously, constraining the resources available for training.
+
+TIDE addresses these limitations by directly utilizing training signals extracted from the inference serving engine, eliminating redundant computation. The target model’s intermediate hidden states—used as training data for the draft model—are already generated during inference serving, meaning only the compact draft model (a single decoder layer with an LM head) needs to be loaded onto the device for training, regardless of the target model’s size. This enables TIDE to scale to arbitrarily large target models without increasing training resource requirements.
+
+As illustrated in Figure
+3
+, draft model training proceeds asynchronously from inference serving. The draft model’s compact architecture, combined with multi-device parallelization using PyTorch FSDP
+(
+36
+)
+, enables real-time adaptation even with relatively modest resource allocation dedicated to training.
+
+4
+Adaptive Control and Runtime Optimization
+
+4.1
+Adaptive Speculative Decoding Control
+
+Figure 4
+:
+Ratio of verification latency
+T(b(\gamma+1))
+for
+\gamma=3
+candidate tokens to single-token decoding latency
+T(b)
+across different batch sizes. If decoding is completely memory-bound, this ratio would be 1.0 (ideal case shown by dashed line).
+
+Speculative decoding fundamentally relies on the memory-bound nature of standard autoregressive decoding to achieve speedup. Even when draft-target alignment is strong and draft model overhead is minimal, performance gains can be limited by batch size. As concurrent requests increase, target model decoding shifts from memory-bound to compute-bound, increasing verification overhead and diminishing the benefits of speculative decoding.
+
+This section presents a performance model that estimates the speedup of speculative decoding as a function of batch size, enabling TIDE to adaptively apply speculative decoding only when it provides measurable benefits. We derive a practical speedup formula that accounts for how batch size affects speculative decoding performance.
+
+In each speculation step, the draft model generates
+\gamma
+candidate tokens, of which an average fraction
+\alpha
+is accepted during target model verification. The expected acceptance length is
+(
+22
+;
+7
+)
+:
+
+E[\ell]=\frac{1-\alpha^{\gamma+1}}{1-\alpha}
+
+(2)
+
+Let
+D(n)
+and
+T(n)
+denote the latency for the draft model and the target model to decode
+n
+tokens in parallel, respectively. When processing
+b
+concurrent requests in a batch, the per-token latency with speculative decoding becomes:
+
+SD(b)=\frac{\gamma D(b)+T(b(\gamma+1))}{E[\ell]}
+
+(3)
+
+where
+\gamma D(b)
+represents the latency of generating
+\gamma
+candidate tokens by the draft model, and
+T(b(\gamma+1))
+represents the latency of verifying these
+\gamma
+tokens plus one bonus token from the previous step by the target model.
+
+The speedup relative to standard autoregressive decoding is:
+
+\displaystyle Speedup
+
+\displaystyle=\frac{T(b)}{SD(b)}
+
+\displaystyle=\frac{1-\alpha^{\gamma+1}}{(1-\alpha)\left(\frac{D(b)}{T(b)}\gamma+\frac{T(b(\gamma+1))}{T(b)}\right)}
+
+(4)
+
+The theoretical speedup formula in Equation
+1
+is derived by substituting
+c=D(b)/T(b)
+and approximating
+T(b(\gamma+1))/T(b)\approx 1
+, which holds only in the memory-bound regime. However, this assumption often fails to predict actual performance. As batch size increases and the standard decoding becomes compute-bound, the ratio
+\beta(b)=T(b(\gamma+1))/T(b)
+grows significantly (see
+Figure
+
+4
+).
+
+Moreover, the coefficient
+c=D(b)/T(b)
+is not static in practice. Modern speculative decoding architectures such as EAGLE-3
+(
+24
+)
+consist of a single decoder layer and an LM head, making the draft model’s computational cost negligible compared to the target model. However, in implementations such as vLLM
+(
+21
+)
+and SGLang
+(
+38
+)
+, the draft model latency is dominated by CPU overhead including kernel launch overhead, which is independent of batch size.
+Therefore, we can approximate
+D(b)\approx D_{0}
+as a static value, while
+T(b)
+varies with batch size, causing
+c(b)=D_{0}/T(b)
+to decrease as batch size increases.
+
+Incorporating these observations, we obtain a simplified practical speedup formula:
+
+Practical~Speedup=\frac{1-\alpha^{\gamma+1}}{(1-\alpha)\left(c(b)\gamma+\beta(b)\right)}
+
+(5)
+
+Given
+T(n)
+and
+D_{0}
+, we can determine the minimum acceptance rate required for speculative decoding to provide performance gains at a given batch size. Since
+T(n)
+and
+D_{0}
+vary depending on the model architecture, parallelization strategy, and system environment, they must be empirically profiled. TIDE’s Adaptive Drafter profiles
+T(n)
+and
+D_{0}
+during system initialization by measuring latencies across different batch sizes. These profiled values are used to estimate speedup in real-time according to Equation
+5
+, enabling TIDE to adaptively enable or disable speculative decoding based on current batch size and acceptance rates, thereby maintaining peak inference throughput.
+
+Algorithm 1
+
+Adaptive Training Control
+
+Input:
+
+\lambda_{\text{short}},\lambda_{\text{long}},\epsilon,N_{\text{init}},N_{\text{threshold}}
+
+\text{collection\_enabled}\leftarrow\text{False}
+,
+M_{\text{draft}}\leftarrow
+initial draft model
+
+Measure acceptance rates
+\{\alpha_{1},\ldots,\alpha_{N_{\text{init}}}\}
+from first
+N_{\text{init}}
+requests
+
+\bar{\alpha}_{\text{short}},\bar{\alpha}_{\text{long}}\leftarrow\frac{1}{N_{\text{init}}}\sum_{i=1}^{N_{\text{init}}}\alpha_{i}
+
+while
+serving requests
+do
+
+Measure acceptance rate
+\alpha
+
+\bar{\alpha}_{\text{short}}\leftarrow\lambda_{\text{short}}\bar{\alpha}_{\text{short}}+(1-\lambda_{\text{short}})\alpha
+
+\bar{\alpha}_{\text{long}}\leftarrow\lambda_{\text{long}}\bar{\alpha}_{\text{long}}+(1-\lambda_{\text{long}})\alpha
+
+if
+
+\bar{\alpha}_{\text{short}}<\bar{\alpha}_{\text{long}}-\epsilon
+
+then
+
+\text{collection\_enabled}\leftarrow\text{True}
+
+end
+
+if
+
+if
+
+collection_enabled
+
+then
+
+Store
+(h,\alpha)
+
+end
+
+if
+
+if
+
+|\text{stored samples}|\geq N_{\text{threshold}}
+
+then
+
+Split into
+D_{\text{train}},D_{\text{eval}}
+
+\bar{\alpha}_{\text{train}}\leftarrow
+average
+\alpha
+in
+D_{\text{train}}
+
+M_{\text{new}}\leftarrow\text{train}(M_{\text{draft}},D_{\text{train}})
+
+\bar{\alpha}_{\text{eval}}\leftarrow\text{eval}(M_{\text{new}},D_{\text{eval}})
+
+if
+
+\bar{\alpha}_{\text{eval}}>\bar{\alpha}_{\text{train}}
+
+then
+
+M_{\text{draft}}\leftarrow M_{\text{new}}
+
+else
+
+if
+
+\bar{\alpha}_{\text{eval}}<\bar{\alpha}_{\text{train}}
+
+then
+
+\text{collection\_enabled}\leftarrow\text{False}
+
+end
+
+if
+
+end
+
+if
+
+end
+
+while
+
+4.2
+Selective Draft Model Training
+
+Figure 5
+:
+Accept length evolution during draft model training across four datasets using gpt-oss-120b as the target model. Accept length measures the average number of tokens accepted per speculative decoding step. Each time step corresponds to 30 seconds of training time.
+
+Training on every incoming request would waste computational resources and could lead to overfitting on the observed distribution. TIDE employs a selective training strategy that dynamically enables or disables training signal collection based on whether the draft model training is effective, ensuring efficient adaptation while avoiding unnecessary computation once training yields diminishing returns.
+
+As shown in
+Figure
+
+5
+, accept length exhibits a characteristic saturation pattern during draft model training. This saturation behavior motivates TIDE’s selective training strategy, which adaptively pauses training when further updates yield minimal acceptance improvements, reducing computational overhead while maintaining draft model quality.
+
+The key challenge is detecting when draft model training is no longer effective—when training on the collected data does not improve acceptance rates. TIDE addresses this by monitoring distribution shifts through acceptance rate patterns and evaluating training effectiveness through train-eval performance comparison.
+
+Algorithm
+1
+presents the selective training control mechanism. The system maintains two moving averages of acceptance rates at different timescales: a short-term average (
+\bar{\alpha}_{\text{short}}
+) that responds quickly to recent changes, and a long-term average (
+\bar{\alpha}_{\text{long}}
+) that captures overall trends. Both averages are computed using exponential moving average (EMA):
+
+\bar{\alpha}_{t}=\lambda\cdot\bar{\alpha}_{t-1}+(1-\lambda)\cdot\alpha_{t}
+
+(6)
+
+where
+\lambda
+is the decay rate controlling the average’s responsiveness.
+
+This mechanism exhibits the desired self-regulating behavior. Initially, hidden state collection is disabled. When a distribution shift occurs, collection is automatically enabled. Once sufficient data is collected, the system fine-tunes the draft model. If the fine-tuned model achieves higher acceptance rates than the previous model, the updated model is deployed. Otherwise, hidden state collection is disabled until the next distribution shift.
+
+5
+Evaluation
+
+5.1
+Experimental Setup
+
+Implementation.
+TIDE’s inference serving engine is built on SGLang
+(
+38
+)
+, while the draft model training engine is based on SpecForge
+(
+23
+)
+.
+
+Target Models.
+We evaluate TIDE on four target models: gpt-oss-120b
+(
+28
+)
+, Qwen3-235B-A22B
+(
+30
+)
+, Llama-4-Scout-17B-16E
+(
+26
+)
+, and Llama-3.3-70B-Instruct
+(
+15
+)
+. These models span different architectures and parameter scales, providing a comprehensive evaluation across diverse model characteristics.
+
+Draft Model Configuration.
+
+We fix the number of candidate tokens to 3 across all experiments, as this empirically provides the best performance as shown in Appendix
+A.2
+.
+The draft models use the same vocabulary as their corresponding target models. Since the target models are large enough to require tensor parallelism for efficient serving, the vocabulary size overhead in the draft models is negligible.
+
+Datasets.
+We evaluate TIDE on diverse datasets spanning multiple domains: ShareGPT (conversational)
+(
+1
+)
+, Science (scientific text)
+(
+4
+;
+5
+;
+6
+)
+, NuminaMath (mathematical reasoning)
+(
+2
+)
+, and EvolCodeAlpaca (code generation)
+(
+31
+)
+. Additionally, we evaluate on multilingual Alpaca datasets (Korean, Arabic, Chinese, French)
+(
+13
+;
+10
+;
+11
+;
+12
+)
+to assess TIDE’s robustness to distribution shift, as vocabulary differences between languages represent the most significant source of distribution shift in our experiments.
+
+Figure 6
+:
+Throughput evolution over time across four datasets during inference serving using gpt-oss-120b as the target model. Each time step corresponds to 30 seconds of training time.
+
+5.2
+Throughput Improvement over Time
+
+Figure
+6
+shows the throughput evolution of TIDE during inference serving across four datasets. For three datasets—Science, NuminaMath, and EvolCodeAlpaca—throughput consistently improves over time as the draft model is incrementally adapted using inference-time training signals. This trend reflects increasing acceptance lengths due to improved draft–target alignment, resulting in up to 1.15× throughput improvement during live serving.
+
+We observe that ShareGPT exhibits limited throughput improvement despite online adaptation. This is not due to ineffective adaptation, but to the limited suitability of speculative decoding for open-ended conversational workloads, which often exhibit high token-level entropy and frequent changes in discourse flow and response structure
+(
+34
+;
+32
+)
+.
+
+Overall, these results show that online draft adaptation is effective when speculative decoding is well suited to the input workload, but yields limited gains otherwise. This demonstrates the need for runtime adaptation logic that determines when speculative decoding and draft adaptation should be applied.
+
+Figure 7
+:
+Draft model training accuracy comparison between SpecForge offline and TIDE across four datasets using a global batch size of 16 on four MI250 GPUs. Accuracy measures the top-1 token prediction match rate between the draft model and the target model.
+
+5.3
+Training Efficiency Comparison
+
+We compare TIDE against two state-of-the-art training approaches for EAGLE-3 draft models in SpecForge: offline training and online training.
+
+SpecForge Offline Training.
+This approach requires a two-phase process: first, it runs prefill on input prompts and target model-generated output sequences to compute hidden states, then stores these hidden states to disk for subsequent draft model training. While this enables efficient training without repeatedly loading the target model, it consumes substantial storage as shown in Table
+1
+.
+
+SpecForge Online Training.
+To reduce disk usage, this approach regenerates hidden states on-demand during each training iteration instead of storing them. However, this requires loading the target model and performing prefill repeatedly for every training step, resulting in significantly slower training time as shown in Table
+2
+.
+
+In contrast to both approaches, TIDE reuses hidden states generated during inference serving, eliminating both the storage overhead of offline training and the redundant computation of online training. Figure
+7
+shows that TIDE achieves comparable final accuracy to both SpecForge methods across four datasets. Table
+2
+demonstrates that TIDE is 1.67× faster than SpecForge offline and 3.02× faster than SpecForge online on the ShareGPT dataset with gpt-oss-120b, while Table
+1
+shows TIDE’s significantly reduced storage requirements compared to offline training.
+
+Table 1
+:
+Storage requirements for hidden states across different target models. SpecForge offline stores all hidden states for the entire dataset, while TIDE only maintains a small buffer for active training batches.
+
+Target Model
+
+SpecForge offline
+
+TIDE
+
+gpt-oss-120b
+
+4.66 TB
+
+0.19 TB
+
+Qwen3-235B-A22B
+
+19.89 TB
+
+0.82 TB
+
+Llama-4-Scout-17B-16E
+
+13.26 TB
+
+0.55 TB
+
+Llama-3.3-70B-Instruct
+
+46.40 TB
+
+1.92 TB
+
+Table 2
+:
+Training time comparison for gpt-oss-120b on ShareGPT (100k) dataset. TIDE eliminates prefill overhead by reusing hidden states from inference serving.
+
+Method
+
+Prefill
+
+Train
+
+Total
+
+Speedup
+
+SpecForge offline
+
+6.16hr
+
+9.16hr
+
+15.32hr
+
+1.00
+\times
+
+SpecForge online
+
+18.48hr
+
+9.16hr
+
+27.64hr
+
+0.55
+\times
+
+TIDE
+
+-
+
+9.16hr
+
+9.16hr
+
+1.67
+\times
+
+5.4
+Adaptive Speculative Decoding Control
+
+Figure 8
+:
+Comparison of practical and actual speedup across batch sizes. Actual speedup is measured using four H100 GPUs.
+
+Figure 9
+:
+Throughput over time for TIDE-default and TIDE-adaptive under distribution shifts. Sequential language transitions (Korean → Arabic → Chinese → French) using Alpaca datasets demonstrate adaptive performance. Both experiments process an identical total workload, while TIDE-adaptive finishes at an earlier timestep.
+
+Figure 10
+:
+Relative throughput comparison between all-inference baseline and TIDE across four datasets using a single MI250 node with 4 GPUs for draft model training and a single H100 node with 8 GPUs for inference. Values in parentheses indicate the speculative decoding speedup (
+s
+) achieved through draft model training on each dataset.
+
+We validate our analytical model for predicting speculative decoding speedup and use it to implement adaptive control mechanisms. Figure
+8
+compares practical speedup predicted by our analytical model (Equation
+5
+) against actual measured speedup across different batch sizes. For gpt-oss-120b and Qwen3-235B-A22B, the practical speedup closely aligns with actual speedup within 3% error, validating our model’s accuracy. However, for Llama models, we observe up to 25% prediction error. This discrepancy occurs because the draft models for Llama are relatively larger, violating our assumption that draft model overhead is negligible and static.
+
+Using this model, we calculate the minimum acceptance length required for performance improvement at each batch size. We evaluate two configurations: (1) TIDE-default, which always enables speculative decoding regardless of batch size and acceptance length, and (2) TIDE-adaptive, which dynamically enables or disables speculative decoding based on whether acceptance length exceeds the calculated threshold. Figure
+9
+compares throughput over time for both configurations. TIDE-adaptive mitigates throughput degradation during distribution shifts by adaptively disabling speculative decoding when acceptance length is insufficient, while TIDE-default experiences more severe performance drops.
+
+5.5
+Heterogeneous GPU Allocation
+
+Figure 11
+:
+Per-GPU throughput comparison for inference and draft model training, normalized to MI250 baseline. Inference throughput measured on gpt-oss-120b with ShareGPT dataset using SGLang. Training throughput measured on single nodes with 8 GPU devices using PyTorch with FSDP parallelization.
+
+We evaluate TIDE’s performance benefits when deploying on heterogeneous GPU clusters with varying compute capabilities. Figure
+11
+presents throughput comparison for inference and draft model training across different GPU types, normalized to MI250 baseline. The results reveal a disproportionate throughput gap between inference and training workloads. For inference, H100 achieves 6.76× higher throughput compared to MI250, with MI300X at 4.42×. However, for training, the gap is much smaller: H100 shows only 2.44× improvement over MI250, with MI300X at 1.77×. This disparity motivates TIDE’s heterogeneous resource allocation strategy, where lower-end GPUs like MI250 contribute more effectively to training while higher-end GPUs handle inference workloads.
+
+To quantify the benefits of this approach, we evaluate TIDE across four diverse datasets, comparing two resource allocation strategies: (1) all GPUs performing inference with speculative decoding disabled, and (2) TIDE allocating a single MI250 node with 4 GPUs for draft model training while a single H100 node with 8 GPUs handles inference.
+
+Figure
+
+10
+shows that TIDE achieves 1.08-1.22× throughput improvement over the all-inference baseline. The improvement correlates with the speculative decoding speedup achieved through draft model training, ranging from
+s=1.15
+(ShareGPT, 1.08× throughput) to
+s=1.30
+(Science, 1.22× throughput). These variations reflect differences in output distribution characteristics and draft model learning difficulty across datasets. For instance, Science dataset’s more structured output enables better draft model learning, resulting in higher acceptance rates and greater speedup. This result demonstrates that TIDE’s benefits vary with dataset characteristics and highlights the importance of considering workload properties when deploying heterogeneous training strategies.
+
+6
+Conclusion
+
+We present TIDE, a system that continuously adapts draft models at runtime for speculative decoding by leveraging target model hidden states as training signals. Through adaptive control mechanisms, TIDE maintains high inference throughput while efficiently utilizing heterogeneous GPU resources. Our evaluations demonstrate that TIDE achieves significant speedups over static speculative decoding approaches while adapting effectively to evolving workload distributions, making speculative decoding practical for dynamic production environments.
+
+Appendix A
+Appendix
+
+A.1
+Cross-Dataset Generalization
+
+Table 3
+:
+Acceptance length comparison between draft models trained on the same dataset (diagonal) versus different datasets. Each dataset was split into a 9:1 ratio for training and evaluation. All draft models were fine-tuned from
+lmsys/EAGLE3-gpt-oss-120b-bf16
+. All evaluations use
+\gamma=3
+candidate tokens.
+
+Evaluation Dataset
+
+Draft Model
+
+ShareGPT
+
+Camel-AI/Science
+
+EvolCodeAlpaca
+
+NumiaMath
+
+ShareGPT
+
+2.13
+
+1.6
+
+1.88
+
+1.47
+
+Camel-AI/Science
+
+1.84
+
+2.24
+
+1.68
+
+1.55
+
+EvolCodeAlpaca
+
+2.07
+
+1.56
+
+2.25
+
+1.52
+
+NumiaMath
+
+2.04
+
+1.9
+
+2.17
+
+2.67
+
+Table
+3
+shows the acceptance length when draft models trained on one dataset are evaluated on different datasets. The diagonal entries (bold) represent models evaluated on their training dataset, while off-diagonal entries show cross-dataset performance. Results demonstrate that draft models achieve best performance on their training distribution, with acceptance length degrading by 15-40% when evaluated on different datasets. This motivates TIDE’s runtime training approach to adapt models to the actual inference workload distribution.
+
+A.2
+EAGLE-3 Speculative Decoding Performance
+
+Table 4
+:
+Performance comparison across different configurations and datasets. The configuration tuple (batch, steps, topk, draft_tok) represents the batch size for inference, number of steps sampled from the draft model, top-k sampling parameter, and number of draft tokens generated, respectively.
+
+Config (batch, steps, topk, draft_tok)
+
+GSM8K
+
+HumanEval
+
+Math500
+
+Avg
+
+Throughput
+
+Avg
+
+Speedup
+
+Acc Length
+
+Throughput
+
+Acc Length
+
+Throughput
+
+Acc Length
+
+Throughput
+
+(1, 0, 0, 0)
+
+1
+
+243.04
+
+1
+
+249.38
+
+1
+
+247.45
+
+246.62
+
+1.00
+
+(1, 2, 1, 3)
+
+2.35
+
+303.31
+
+2.36
+
+312.29
+
+2.46
+
+324.74
+
+313.45
+
+1.27
+
+(1, 3, 1, 4)
+
+2.76
+
+329.98
+
+2.76
+
+336.74
+
+2.95
+
+359.88
+
+342.20
+
+1.39
+
+(1, 5, 4, 8)
+
+2.97
+
+267.09
+
+2.8
+
+256.96
+
+2.94
+
+268.08
+
+264.04
+
+1.07
+
+(4, 0, 0, 0)
+
+1
+
+582.23
+
+1
+
+607.73
+
+1
+
+591.4
+
+593.79
+
+1.00
+
+(4, 2, 1, 3)
+
+2.35
+
+737.6
+
+2.34
+
+759.42
+
+2.47
+
+778.44
+
+758.49
+
+1.28
+
+(4, 3, 1, 4)
+
+2.78
+
+791.58
+
+2.75
+
+806.38
+
+2.97
+
+865.87
+
+821.28
+
+1.38
+
+(4, 5, 4, 8)
+
+2.99
+
+688.94
+
+2.71
+
+635.63
+
+2.98
+
+713.53
+
+679.37
+
+1.14
+
+(8, 0, 0, 0)
+
+1
+
+818.9
+
+1
+
+883.49
+
+1
+
+851.67
+
+851.35
+
+1.00
+
+(8, 2, 1, 3)
+
+2.36
+
+1074.36
+
+2.34
+
+1093.27
+
+2.47
+
+1126.86
+
+1098.16
+
+1.29
+
+(8, 3, 1, 4)
+
+2.76
+
+1138.6
+
+2.75
+
+1153.75
+
+2.97
+
+1269.62
+
+1187.32
+
+1.39
+
+(8, 5, 4, 8)
+
+2.96
+
+1031.49
+
+2.76
+
+948.3
+
+2.97
+
+1055.92
+
+1011.90
+
+1.19
+
+(16, 0, 0, 0)
+
+1
+
+1143.75
+
+1
+
+1304.55
+
+1
+
+1230.01
+
+1226.10
+
+1.00
+
+(16, 2, 1, 3)
+
+2.35
+
+1449.8
+
+2.35
+
+1569.99
+
+2.47
+
+1669.4
+
+1563.06
+
+1.27
+
+(16, 3, 1, 4)
+
+2.77
+
+1596.02
+
+2.75
+
+1655.25
+
+2.97
+
+1654.48
+
+1635.25
+
+1.33
+
+(16, 5, 4, 8)
+
+2.99
+
+1464.96
+
+2.72
+
+1354.83
+
+3.08
+
+1494.41
+
+1438.07
+
+1.17
+
+(32, 0, 0, 0)
+
+1
+
+1581.66
+
+1
+
+1725.22
+
+1
+
+1708.67
+
+1671.85
+
+1.00
+
+(32, 2, 1, 3)
+
+2.35
+
+1828.95
+
+2.33
+
+2128.19
+
+2.46
+
+2299.1
+
+2085.41
+
+1.25
+
+(32, 3, 1, 4)
+
+2.76
+
+2054.76
+
+2.73
+
+2381.95
+
+2.96
+
+2380.18
+
+2272.30
+
+1.36
+
+(32, 5, 4, 8)
+
+2.99
+
+2024.31
+
+2.74
+
+2021.45
+
+3.04
+
+2226.15
+
+2090.64
+
+1.25
+
+(64, 0, 0, 0)
+
+1
+
+2035.52
+
+1
+
+2682.38
+
+1
+
+2218.33
+
+2312.08
+
+1.00
+
+(64, 2, 1, 3)
+
+2.36
+
+3008.81
+
+2.35
+
+3381.51
+
+2.47
+
+3169.21
+
+3186.51
+
+1.38
+
+(64, 3, 1, 4)
+
+2.74
+
+3395.07
+
+2.75
+
+3637.32
+
+2.97
+
+3172.18
+
+3401.52
+
+1.47
+
+(64, 5, 4, 8)
+
+2.94
+
+2679.72
+
+2.75
+
+2972.82
+
+3.02
+
+3053.78
+
+2902.11
+
+1.26
+
+Table
+4
+presents a comprehensive analysis of EAGLE-3 speculative decoding performance across different batch sizes and configurations. Results show that speculative decoding achieves consistent speedups of 1.27-1.47
+\times
+across all batch sizes, with optimal performance at configuration (batch, 3, 1, 4).
+
+A.3
+Profiling Data for Adaptive Control
+
+Table 5
+:
+Profiled latency measurements
+T(n)
+(ms) and
+D_{0}
+(ms) for target models measured on H100 nodes with Tensor Parallel parallelization.
+
+T(n)
+(ms)
+
+n
+
+gpt-oss-120b
+
+Qwen3-235B-A22B
+
+Llama-4-Scout
+
+Llama-3.3-70B
+
+-17B-16E
+
+-Instruct
+
+1
+
+3.416
+
+9.057
+
+6.461
+
+15.50
+
+2
+
+3.844
+
+10.07
+
+7.953
+
+16.00
+
+4
+
+4.341
+
+11.86
+
+8.932
+
+16.11
+
+8
+
+5.236
+
+14.68
+
+11.01
+
+16.36
+
+16
+
+6.123
+
+17.84
+
+13.61
+
+17.10
+
+32
+
+7.637
+
+23.47
+
+16.82
+
+18.45
+
+64
+
+9.345
+
+26.68
+
+19.58
+
+19.00
+
+128
+
+11.79
+
+31.46
+
+23.82
+
+21.38
+
+256
+
+15.50
+
+-
+
+27.89
+
+27.54
+
+512
+
+21.50
+
+-
+
+40.86
+
+64.76
+
+D_{0}
+
+0.393
+
+0.137
+
+0.330
+
+0.843
+
+Table
+5
+presents the profiled latency measurements used to calculate practical speedup (Equation
+5
+) for adaptive control.
+
+A.4
+Heterogeneous GPU Configuration Analysis
+
+Figure 12
+:
+Relative Inference throughput comparison between all-inference baseline and TIDE’s heterogeneous training strategy across different GPU configurations.
+
+We provide additional analysis on how different GPU configuration ratios and speculative decoding speedup values affect TIDE’s performance. Figure
+12
+evaluates multiple configurations with varying High:Low GPU ratios and speculative speedup values.
+
+TIDE’s heterogeneous strategy achieves up to 1.26× relative throughput improvement for H100:MI250 (4:1) configuration with speculative speedup of
+s=1.3
+. The benefits increase with both higher GPU ratios and larger speculative speedup. Notably, MI300X:MI250 (2:1) with low speculative speedup (
+s=1.1
+) shows 0.99× relative throughput, indicating that training overhead slightly outweighs benefits when the performance gap between high-end and low-end GPUs is small and speculative decoding speedup is modest. This analysis provides guidance for selecting appropriate GPU configurations based on available hardware and expected speculative gains.
+

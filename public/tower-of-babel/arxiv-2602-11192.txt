@@ -1,0 +1,2647 @@
+MELINOE: Fine-Tuning Enables Memory-Efficient Inference for Mixture-of-Experts Models
+Arian Raje ( araje@andrew.cmu.edu ), Anupam Nayak, Gauri Joshi
+
+Abstract
+Mixture-of-Experts (MoE) model architectures can significantly reduce the number of activated parameters per token, enabling computationally efficient training and inference. However, their large overall parameter counts and model sizes have precluded their widespread usage in resource-constrained settings as all of the parameters must still be loaded into GPU memory. Prior works aim to address this memory bottleneck by offloading certain experts into CPU memory and porting them to GPU memory only when they are activated. In practice, these methods suffer from the significant I/O latency incurred by expert transfer. We present melinoe , a method that fine-tunes an MoE model to more strongly prefer activating a smaller number of experts per sequence. Caching these preferred experts in GPU memory reduces expert churn and CPU-GPU transfer overhead. melinoe increases throughput by 1.2 1.2 – 3 × 3\times over efficient baselines and up to 14.7 × 14.7\times over transfer-heavy baselines while retaining or even improving the performance of the model on a downstream task, making it a reliable method for improving MoE inference efficiency.
+
+
+
+1  Introduction
+
+Mixture-of-Experts (MoE) models are a Large Language Model (LLM) architecture that aim to reduce the per-token computational cost of training and inference. MoEs achieve this reduction in compute by fragmenting the traditionally dense Feed Forward Network (FFN) layer in the model architecture into a sparsely gated set of multiple FFNs, referred to as “experts”
+[
+25
+,
+18
+,
+11
+]
+. This reparameterization of the FFN used in transformer-based architectures makes MoE models an efficient alternative to their traditional dense counterparts. MoE models have become the flagship models for open-source model developers
+[
+15
+]
+or have been offered as an alternative to dense transformers in a model suite
+[
+22
+,
+1
+,
+5
+]
+. However, these gains do not come for free; while MoEs execute only a fraction of their parameters per token, their total parameter footprint remains large. During autoregressive generation, any expert may be routed to at any given step, so the corresponding expert’s weights must be resident in GPU memory prior to its activation.
+
+The necessary residency of experts in GPU memory prior to activation results in one of two scenarios. First, all experts are simultaneously loaded into GPU memory, which can be prohibitive in resource-constrained settings with limited memory. This regime is also wasteful since only a small subset of experts is used per token, yet many unused expert parameters still occupy GPU memory. An alternative paradigm is where only a small subset of the total experts is kept in GPU memory while the remaining experts are
+offloaded
+into CPU memory
+[
+10
+,
+31
+,
+39
+]
+. The GPU resident experts constitute an expert
+cache
+, and experts are fetched from CPU memory on demand when selected by the router. While this reduces peak GPU memory usage, it introduces a new bottleneck. Frequent expert swaps incur substantial Peripheral Component Interconnect Express (PCIe) transfer latency and can stall generation when the required expert is not already cached. The resulting churn can dominate end-to-end inference latency, especially when expert routing is diverse across tokens causing frequent transfers. When GPU memory is especially constrained, these problems are exacerbated as only a limited number of experts can be retained in the GPU-resident expert cache (Table
+1
+).
+
+Prior methods propose a variety of alternative approaches to balancing memory efficiency and I/O latency. Mixtral-Offloading
+[
+10
+]
+offloads most experts to CPU DRAM and keeps a small per-layer GPU-resident expert cache. However, I/O slowdowns still hinder improvements in end-to-end inference latency. Their aggressive mixed-precision quantization also trades model quality for memory efficiency. MoE-Infinity
+[
+31
+]
+and FLoE
+[
+39
+]
+seek to reduce I/O transfers by using sophisticated prefetching techniques to predict which experts will be activated prior to the router selecting them. Yet, their gains depend on prediction accuracy and routing locality, where a subset of experts are activated with high probability for consecutive tokens, so diverse routing could still trigger a significant number of cache misses and evictions. Fiddler
+[
+16
+]
+reduces PCIe traffic by executing some expert computation on the CPU, but its gains are contingent on CPU capability and diminish as per-expert token counts grow, where CPU execution becomes slow and weight transfers to GPU become preferable. Meaningfully, several prior systems do not directly target reducing the
+number of CPU–GPU transfers
+, which can be a dominant cost in resource-constrained MoE inference. In other words, prior work largely treats routing as fixed and optimizes around it via prefetching, offloading, or quantization. An alternative perspective is to treat routing as malleable and directly shape expert activation patterns.
+
+In this vein, we present
+M
+ixture-of-
+E
+xperts with
+L
+ightweight
+I
+nference and
+N
+etwork
+O
+ffloading
+E
+fficiency,
+melinoe
+, a framework that targets the number of CPU-GPU transfers in MoE offloading applications to reduce the amount of I/O overhead. With
+melinoe
+, the model is fine-tuned with an auxiliary loss function that penalizes the model for inducing excessive cache transfers. This fine-tuning procedure occurs prior to deploying the MoE model in a memory-constrained system. Since individual sequences already have slight expert preferences, fine-tuning tilts the model towards using a small subset of experts more heavily while retaining or improving the performance of the model on a downstream task.
+melinoe
+then employs an MLP-based predictor to forecast these preferred experts prior to decoding, making prefetching more reliable since activated experts are less diverse per sequence.
+melinoe
+can improve throughput measured by tokens/s by
+1.2
+–
+3\times
+over efficient baselines and up to
+14.7\times
+over transfer-heavy baselines across model architectures and hardware configurations, demonstrating its reliability and robustness. Notably, since the fine-tuning procedure is orthogonal to prior offloading techniques, it composes naturally with other baselines and improves their effectiveness.
+melinoe
+provides a practical path to MoE deployment by fine-tuning the model to reduce I/O latency without sacrificing model quality.
+
+Table 1
+:
+Decoding throughput (tokens/s) on an NVIDIA H100 vs. cache size (fraction of experts resident in GPU VRAM). Throughput drops significantly when fewer experts are resident. Mixtral-8x7B does not fit on a single H100 GPU (80 GB VRAM) in FP16.
+
+Model
+
+Cache
+
+25% Experts
+
+Cache
+
+50% Experts
+
+Cache
+
+All Experts
+
+OLMoE
+
+15.68
+
+23.84
+
+37.84
+
+Phi-3.5-MoE
+
+4.43
+
+8.04
+
+19.91
+
+Mixtral-8x7B
+
+1.46
+
+2.32
+
+–
+
+2  Problem Setup and Motivation
+
+MoE models replace the dense FFN in each transformer block with a sparsely gated set of FFN “experts”. For each token in the sequence, a router selects a subset of experts to execute, producing token-level activations, while the remaining experts are inactive. We denote by
+\mathbf{E}^{(\ell)}
+the set of experts in the MoE layer
+\ell\in[1\cdots L]
+. Let
+E:=|\mathbf{E}^{(\ell)}|\;\forall\ell\in[1\cdots L]
+. Individual experts in this layer are indexed as
+\mathbf{E}^{(\ell)}_{i}
+, where
+i\in\{1,\cdots E\}
+.
+The output of the
+\ell
+-th MoE layer for an input
+\mathbf{x}_{\text{in}}\in\mathbb{R}^{d}
+is given by
+
+\mathbf{p}^{(\ell)}\;=\;\mathrm{softmax}\!\left(\mathbf{W}_{r}^{(\ell)}\mathbf{x}_{\text{in}}\right),\ \mathbf{r}^{(\ell)}=\;\mathrm{Top}\text{-}K\!\left(\mathbf{p}^{(\ell)}\right),
+
+\mathbf{y}\;=\;\sum_{\mathbf{r}^{(\ell)}_{i}=1}\mathbf{p}_{i}^{(\ell)}\,\mathbf{E}^{(\ell)}_{i}(\mathbf{x}_{\text{in}}).
+
+(1)
+
+Here,
+\mathbf{W}_{r}^{(\ell)}\in\mathbb{R}^{E\times d}
+denotes the router weight matrix at layer
+\ell
+. The
+\mathrm{Top}\text{-}K
+operator selects the
+K
+experts with the highest routing probabilities, setting the corresponding entries of
+\mathbf{r}^{(\ell)}
+to
+1
+and masking all remaining experts. Thus,
+\|\mathbf{r}^{(\ell)}\|_{1}=K
+. The layer output is then computed by activating only the selected experts, as shown in Equation (
+1
+).
+
+The hyperparameter
+K
+controls the number of experts activated per token and is model-specific, for example
+K=2
+in Mixtral-8x7B. For hidden dimension
+d
+and intermediate dimension
+d_{\mathrm{ff}}
+, each expert is implemented as an MLP with three linear projections: a gate
+\left(\mathbf{W}^{(\ell)}_{g,i}\in\mathbb{R}^{d_{\mathrm{ff}}\times d}\right)
+, an up
+\left(\mathbf{W}^{(\ell)}_{u,i}\in\mathbb{R}^{d_{\mathrm{ff}}\times d}\right)
+, and a down
+\left(\mathbf{W}^{(\ell)}_{d,i}\in\mathbb{R}^{d\times d_{\mathrm{ff}}}\right)
+projection. The forward computation of expert
+i
+at layer
+\ell
+is
+
+\mathbf{E}_{i}^{(\ell)}(\mathbf{x}_{\text{in}})\;=\;\mathbf{W}^{(\ell)}_{d,i}\Big(\phi\!\left(\mathbf{W}^{(\ell)}_{g,i}(\mathbf{x}_{\text{in}})\right)\odot\mathbf{W}^{(\ell)}_{u,i}(\mathbf{x}_{\text{in}})\Big).
+
+(2)
+
+where
+\odot
+is an element-wise product and
+\phi
+is the gate nonlinearity. Although only a few experts are evaluated per token, the expert parameters dominate the model’s memory footprint. In OLMoE, the experts constitute
+93\%
+of the weights in the model, and in Mixtral-8x7B, the experts make up
+96\%
+. This discordance between expert activations and their memory footprint motivates offloading applications.
+
+Expert Offloading Systems.
+
+Prior works mitigate MoE model’s memory requirements by storing most expert weights in CPU DRAM and keeping only a small subset resident in GPU VRAM as an expert cache. During decoding, when the router selects an expert that is not currently resident, the system must fetch that expert’s weights from DRAM and transfer them over the CPU–GPU interconnect, typically PCIe, into VRAM before the expert can be executed on the GPU. End-to-end decoding time therefore includes both GPU computation and transfer-induced stalls
+
+\text{Time}_{\text{decode}}\;\approx\;\text{Time}_{\text{compute}}\;+\;N_{\text{miss}}\;\cdot\;\text{Time}_{\text{transfer}}
+
+(3)
+
+where
+N_{\text{miss}}
+refers to the number of cache misses where the desired expert is not currently stored in GPU VRAM. Since expert weights dominate the model’s parameter count, even modest cache budgets can lead to substantial transfer overhead. In many cases,
+N_{\text{miss}}
+can reach tens of thousands even over short generations (Figure
+1(a)
+). During pretraining, load balancing objectives encourage broad expert utilization, a beneficial goal in batched, multi-GPU settings to ensure experts on different devices take roughly the same amount of time to execute. However, such objectives increase the number of distinct experts touched during generation, escalating the number of transfers from the expert cache.
+
+(a)
+
+Number of Host-to-Device (H2D) and Device-to-Host (D2H) transfers (log scale) when generating 64 tokens using the OLMoE model (original and fine-tuned with auxiliary loss). Fine-tuning can reduce weight transfers by
+3.03\times
+.
+
+(b)
+
+Experts in OLMoE exhibits only
+weak
+concentration within a layer. Activations are distributed across many experts and the most used experts account for a small fraction of total activations. Fine-tuning increases the concentration of activations.
+
+Figure 1
+:
+OLMoE transfer behavior and routing concentration before vs. after fine-tuning.
+
+Expert Specialization.
+
+While standard load balancing objectives spread the probability mass of expert activations across many experts, empirical evidence suggests that MoE routing is not arbitrary. Within a given sequence, the router typically exhibits a consistent but weak preference for a subset of experts, indicating a degree of sequence-level specialization
+[
+20
+,
+14
+,
+29
+]
+. This suggests that some experts contribute disproportionately to a sequence’s computation for a given prompt, even if the router still routes a nontrivial fraction of tokens elsewhere. However, in pretrained models this preference is too marginal to yield large gains from naïve caching. Even if we keep the “most preferred” experts in GPU VRAM, they may account for only a modest fraction of the total activations within a sequence, so cache hit rates remain limited. For example, with OLMoE we observe that, on average, the top
+8
+experts by activation within a sequence account for only
+\sim 31\%
+of expert activations (Figure
+1(b)
+). Even though this is still greater than the expected activation rate of
+12.5\%
+from all experts being activated equally, it still leaves substantial routing mass on experts that have been offloaded into CPU DRAM. Ultimately, the practical value of these preferred experts in offloading systems is paltry.
+
+Fine-Tuning to Achieve Cache-Friendliness.
+
+Nevertheless, the observation of preferred experts motivates an important question: to what extent can we increase the concentration of expert usage within a sequence to improve expert-cache hit rates? Specifically, since the model already has a set of preferred experts per sequence, tilting the model’s routing decisions towards these experts could amplify its natural per-sequence preferences. By tilting routing towards a more consistent set of experts within each sequence, we increase routing locality and make VRAM caching substantially more effective by reducing cache churn.
+
+A few considerations are critical for making this approach work in practice. First, we must design an auxiliary objective that encourages the router to reuse a smaller set of experts within a sequence, increasing routing locality and reducing the number of transfers. At the same time, fine-tuning must preserve the base model’s quality. A key failure mode that would impair the model’s expressiveness is router collapse where the same subset of experts become the preferred experts globally. Here, the remaining experts would not contribute to the model’s predictions, degrading the fine-tuned model’s integrity. The desired behavior is sequence-specific skew, where expert preferences should be persistent over the course of decoding for a given input but should vary across inputs. Finally, once such per-sequence structure is induced, we need a reliable way to predict the preferred experts before decoding begins. Accurate prediction enables proactive caching of these experts in GPU memory, making the cache substantially more effective because the same experts are likely to remain useful throughout generation. Thus, we have the following desiderata for
+melinoe
+:
+
+•
+
+Auxiliary Loss for Routing Locality
+: A practical fine-tuning procedure for offloading needs an objective that penalizes too broad expert utilization per sequence.
+
+•
+
+Global Expert Usage Diversity
+: Expert usage should remain diverse across sequences to preserve the model’s performance and prevent expert starvation.
+
+•
+
+Expert Activation Prediction
+: Once the model has been fine-tuned and subsequently deployed on a memory-constrained device, there must be a mechanism for predicting per-sequence expert activations based on the prompt.
+
+Figure 2
+:
+Overview of
+melinoe
+.
+Pre-deployment: fine-tune the model for per-sequence routing locality and train an activation predictor. Post-deployment: predict likely experts, preload a GPU-resident cache, and run offloaded inference with fewer CPU-GPU transfers.
+
+3  Method
+
+We present
+melinoe
+, a practical expert-offloading recipe that reduces end-to-end inference latency. We structure the method into two stages, namely pre- and post-deployment, because the resources available to a model provider differ fundamentally before and after releasing a model to a memory-constrained device. In the pre-deployment stage, the provider can access the full-precision MoE weights as well as fine-tuning data. We leverage this setting to
+(i)
+fine-tune the MoE with an auxiliary objective that increases per-sequence routing locality (Section
+3.1.1
+) and
+(ii)
+train an activation predictor that anticipates which experts will be most useful for a given input (Section
+3.1.2
+). In the post-deployment stage, the model is executed under tight VRAM budgets. Here, we use the trained predictor to proactively pre-load a GPU-resident expert cache before decoding begins for every sequence. Once these experts have been prefetched, we perform standard offloaded inference with substantially fewer transfers during generation (Section
+3.2
+).
+
+3.1  Pre-Deployment Stage
+
+3.1.1  MoE Fine-Tuning Procedure
+
+melinoe
+hinges on the following auxiliary fine-tuning objectives that we use to reshape routing behavior. We simplify notation for the purpose of improved readability.
+
+Cache Simulation Loss
+\mathcal{L}_{cs}
+.
+
+The first auxiliary objective is a cache simulation loss that directly penalizes routing patterns likely to induce expert transfers under a memory budget. We denote the router distribution for token
+t\in[1,\ldots,T]
+at layer
+\ell\in[1,\ldots,L]
+as
+\mathbf{p}^{(\ell,t)}\in\mathbb{R}^{E}
+. Since MoE inference routes each token to exactly
+K
+experts, we define a binary request vector
+\mathbf{r}^{(\ell,t)}\in\mathbb{[}0,1]^{E}
+by selecting the Top-
+K
+entries of
+\mathbf{p}^{(\ell,t)}
+. We additionally define a soft cache state for token
+t
+at layer
+\ell
+as
+\mathbf{c}^{(\ell,t)}\in\mathbb{R}_{\geq 0}^{E}
+and initialize each
+\mathbf{c}^{(\ell,0)}
+as
+\mathbf{0}
+. We update this cache state using an exponentially-decayed history of past requests to approximate a recency-weighted cache. Let
+\gamma\in\left[0,1\right]
+be a decay factor and
+C
+be the cache capacity. We first compute an un-normalized update according to the following rule
+
+\mathbf{c}^{(\ell,t+1)}\;=\;\gamma\mathbf{c}^{(\ell,t)}+\mathbf{r}^{(\ell,t)}
+
+During an initial “cache fill” phase, we allow
+\|\mathbf{c}^{(\ell,t)}\|_{1}
+to grow until it reaches
+C
+. After this point, we normalize
+\mathbf{c}^{(\ell,t)}
+for subsequent tokens so that
+\|\mathbf{c}^{(\ell,t)}\|_{1}=C
+is preserved
+
+\mathbf{c}^{(\ell,t+1)}\;=\;\frac{\gamma Z^{(t)}\mathbf{c}^{(\ell,t)}+\mathbf{r}^{(\ell,t)}}{Z^{(t+1)}},\ Z^{(t+1)}\;=\;\gamma Z^{(t)}+\frac{K}{C}
+
+where
+Z^{(t)}
+is a scalar normalizer that maintains
+\|\mathbf{c}^{(\ell,t)}\|_{1}=C
+and
+Z^{(1)}
+is initialized to
+1
+. Alternatively, one can also initialize using
+a uniform vector with
+\|\mathbf{c}^{(\ell,1)}\|_{1}=C
+to avoid the initial cache fill phase. In experiments, we set
+\gamma=0.9
+, but provide ablation studies for the impact of
+\gamma
+and
+C
+on throughput in Appendix
+D.6
+and
+D.7
+. As
+\gamma
+controls how long previous routing decisions persist in the cache, smaller values such as
+\gamma=0
+make the cache more reactive and closer to a Least Recently Used (LRU) cache. In contrast, larger values of
+\gamma
+such as
+\gamma=1
+allow previous routing decisions to remain relevant over long horizons in a manner similar to a Least Frequently Used (LFU) cache.
+
+The cache simulation loss can then be calculated as
+
+\mathcal{L}_{cs}\;=\;\frac{1}{LT}\sum\limits_{\ell=1}^{L}\sum\limits_{t=1}^{T}\hskip-25.00003pt\underbrace{\sum\limits_{i=1}^{E}\mathbf{r}_{i}^{(\ell,t)}\left(1-\mathbf{c}_{i}^{(\ell,t)}\right)}_{\text{\normalsize cache miss proxy at token $t$, layer $\ell$}}
+
+(4)
+
+since a value of
+1
+for
+\mathbf{r}_{i}^{(\ell,t)}
+means the router has selected expert
+\mathbf{E}_{i}^{(\ell)}
+while a higher value of
+1-\mathbf{c}_{i}^{(\ell,t)}
+means that it is less likely that
+\mathbf{E}_{i}^{(\ell)}
+is already in the GPU-resident cache.
+
+Rank Matching Loss
+\mathcal{L}_{rm}
+.
+
+The second auxiliary objective is a rank matching loss that aligns the relative routing preferences of the fine-tuned model with the preferences of the original base model. We change the notation slightly from the previous paragraph and refer to the base model’s router distribution for token
+t
+at layer
+\ell
+as
+\mathbf{p}_{b}^{(\ell,t)}
+and the fine-tuned model’s router distribution as
+\mathbf{p}_{f}^{(\ell,t)}
+. We count “mistakes” in the fine-tuned model’s ordering as
+
+m^{(\ell,t)}=\sum\limits_{i,j\in\left[E\right]}\mathbb{I}\!\left\{\mathbf{p}_{b,i}^{(\ell,t)}>\mathbf{p}_{b,j}^{(\ell,t)}\right\}\left[\rho-\left(\mathbf{p}_{f,i}^{(\ell,t)}-\mathbf{p}_{f,j}^{(\ell,t)}\right)\right]_{+}
+
+where the operation
+\left[a\right]_{+}:=\max(0,a)
+. In simple terms, if the base model is more likely to route to an expert
+\mathbf{E}_{i}^{(\ell)}
+over
+\mathbf{E}_{j}^{(\ell)}
+, then the fine-tuned model should also prefer
+\mathbf{E}_{i}^{(\ell)}
+over
+\mathbf{E}_{j}^{(\ell)}
+up to some margin
+\rho
+. This way, the amount that the fine-tuned model prefers
+\mathbf{E}_{i}^{(\ell)}
+over
+\mathbf{E}_{j}^{(\ell)}
+is only nominally factored into the loss, but the underlying ordering still matters. The rank matching loss is calculated as
+
+\mathcal{L}_{rm}\;=\;\frac{1}{LT}\sum\limits_{\ell=1}^{L}\sum\limits_{t=1}^{T}m^{(\ell,t)}
+
+(5)
+
+From this, we have the full loss calculation for fine-tuning
+
+\mathcal{L}\;=\;\mathcal{L}_{nll}\;+\;\lambda_{cs}\mathcal{L}_{cs}\;+\;\lambda_{rm}\mathcal{L}_{rm}
+
+(6)
+
+where
+\mathcal{L}_{nll}
+is the Negative Log-Likelihood loss used in standard language modeling applications. These loss functions jointly reshape routing in a way that is aligned with memory-constrained inference.
+\mathcal{L}_{cs}
+promotes within-sequence routing locality by directly penalizing excessive cache transfers, while
+\mathcal{L}_{rm}
+prevents router collapse by encouraging the fine-tuned router to preserve the base model’s relative expert preferences. To further highlight the utility of these specific loss functions, we provide brief theoretical justifications for both loss functions in Appendix
+C
+. Because we aim for fine-tuning to be memory-efficient, we update only the router parameters, specifically the router weights and gate projection, and apply low-rank adaptation (LoRA)
+[
+13
+]
+to the MLP up and down projections.
+
+3.1.2  Expert Activation Predictor
+
+In prior offloading systems, learning an expert activation predictor often provides only marginal benefit because routing is noisy, so prefetched experts are evicted before they can be reused. In
+melinoe
+, however, fine-tuning induces stronger prompt-conditioned structure in routing, as activations are more consistent per prompt. Motivated by contextual sparsity
+[
+21
+,
+12
+]
+, we learn a prompt-conditioned predictor of expert preferences,
+\Psi
+.
+
+The activation predictor is trained on a dataset generated in the following fashion. For each prompt
+\mathbf{q}
+, we compute a fixed-dimensional representation using an embedding model
+\Psi_{\text{EMB}}
+such that
+\Psi_{\text{EMB}}(\mathbf{q})\in\mathbb{R}^{d_{\text{EMB}}}
+. To construct targets for the activation predictor, we generate a response from the MoE and record router probabilities,
+\mathbf{p}^{(\ell,t)}\in\mathbb{R}^{E}
+, for each token and layer. The supervised target for the predictor is the per-layer average router probability vector defined as
+
+y^{(\ell)}(\mathbf{q})\;=\;\frac{1}{T}\sum\limits_{t=1}^{T}\mathbf{p}^{(\ell,t)},\ Y(\mathbf{q})=\left[y^{(1)}(\mathbf{q})\cdots y^{(L)}(\mathbf{q})\right]
+
+where
+Y(\mathbf{q})\in\mathbb{R}^{L\times E}
+. This yields a dataset of pairs
+\{\Psi_{\text{EMB}}(\mathbf{q}_{n}),Y(\mathbf{q}_{n})\}_{n=1}^{N}
+. We train a lightweight two-layer MLP
+\Psi_{\text{MLP}}:\mathbb{R}^{d_{\text{EMB}}}\rightarrow\mathbb{R}^{L\times E}
+to predict
+\widehat{Y}(\mathbf{q})
+whose rows
+[\widehat{Y}(\mathbf{q})]_{\ell}
+estimate the layerwise expert preference scores. We normalize the ground truth targets and train
+\Psi_{\text{MLP}}
+by minimizing the KL divergence between the normalized target distribution
+[Y(\mathbf{q})]_{\ell}
+and the predicted distribution by applying a row-wise softmax to
+[\widehat{Y}(\mathbf{q})]_{\ell}
+. Because
+melinoe
+reduces routing noise by amplifying prompt-specific expert preferences, even a relatively small
+\Psi_{\text{EMB}}
+suffices to produce a lightweight yet accurate predictor. Thus, we enable accurate prefetching, with minimal prefetching latency, and consequently reduce CPU-GPU transfers in the process.
+
+3.2  Post-Deployment Stage
+
+In the post-deployment stage, the fine-tuned MoE and the activation predictor are executed on a memory-constrained device. Given a prompt
+\mathbf{q}
+, we predict per-layer expert activations by calculating the following using the trained MLP
+
+\Psi_{\text{MLP}}(\Psi_{\text{EMB}}(\mathbf{q}))=\widehat{Y}(\mathbf{q})
+
+(7)
+
+For each layer
+\ell\in[1,\ldots,L]
+, we form a prefetch set
+c^{(\ell,1)}=\text{Top-}C([\widehat{Y}(\mathbf{q})]_{\ell})
+where
+C
+is the cache capacity. We proactively load the corresponding experts into the GPU-resident cache before generation begins. To increase effective cache capacity, all expert weights are maintained in
+HQQ INT4
+, allowing more experts to remain resident in limited GPU memory. Experts that are not resident in GPU VRAM remain in CPU DRAM and are stored in pinned memory to accelerate transfers from CPU to GPU. Transfers are additionally non-blocking, which ensures asynchronous transfers of experts and minimizes PCIe overhead. These offloaded experts are fetched on demand when selected by the router, evicting cached experts as dictated by the cache policy. Overall,
+melinoe
+localizes routing through fine-tuning, predicts the resulting per-sequence locality, and exploits it via proactive prefetching and quantized cache residency to reduce cache misses, transfers, and transfer-induced stalls during generation. In the following section, we demonstrate the effectiveness of these various design elements.
+
+Figure 3
+:
+Throughput comparison of
+melinoe
+against prior baselines across model/dataset/GPU configurations.
+
+4  Results
+
+4.1  Experimental Setup
+
+Models and Datasets.
+
+We evaluate
+melinoe
+on three MoE backbones that span size and granularity:
+OLMoE
+(
+7
+B params.),
+Phi-3.5-MoE
+(
+42
+B params.), and
+Mixtral-8x7B
+(
+47
+B params.). We train the activation predictor using fixed-dimensional representations from
+BGE-Base-EN-v1.5
+(
+109
+M params.)
+[
+30
+]
+with embedding dimension
+768
+. We fine-tune and evaluate across two complementary workloads. We fine-tune on
+Dolly15K
+
+[
+4
+]
+(general instruction-following dataset) and
+GSM8K
+
+[
+3
+]
+(math reasoning with longer generations) and benchmark on held-out evaluation splits.
+
+Fine-Tuning Hyperparameters.
+
+Across all models,
+melinoe
+updates the router weights and gate projection layers and applies LoRA rank
+r=32
+to the MLP up and down projections. Remaining weights are fixed at their pretrained initialization. For the cache-simulation loss
+\mathcal{L}_{cs}
+, we adopt a deliberately restrictive cache capacity to emphasize the intended deployment regime, setting the simulated cache budget to
+C=\frac{E}{4}
+(e.g.
+C=16
+for OLMoE). We fix the cache decay parameter to
+\gamma=0.9
+and the rank matching margin to
+\rho=0.1
+throughout. Optimizer settings and fine-tuning hyperparameters are provided in Appendix
+B.2
+.
+
+Hardware and Inference Configuration.
+
+We validate performance gains across multiple GPU types:
+H100 (80GB VRAM)
+,
+A100 (40GB VRAM)
+, and
+RTX 4090 (24GB VRAM)
+. To ensure that comparisons reflect realistic memory-constrained deployments, even on larger-memory accelerators, we artificially cap per-process GPU memory using PyTorch limits. We allocate 3GB for OLMoE, 16GB for Phi-3.5-MoE, and 24GB for Mixtral-8x7B. The expert cache uses an LFU eviction policy. Sensitivity to cache size and alternative budgets is deferred to Appendix
+D.4
+.
+
+4.2  Main Results
+
+Table 2
+:
+Downstream output quality across baselines. ROUGE-L is reported on Dolly15K. Accuracy is reported on GSM8K.
+
+Dataset: Dolly15K (ROUGE-L)
+
+Dataset: GSM8K (Accuracy %)
+
+Method
+
+OLMoE
+
+Phi-3.5-MoE
+
+Mixtral-8x7B
+
+OLMoE
+
+Phi-3.5-MoE
+
+Mixtral-8x7B
+
+Base Model
+
+0.1851
+
+0.2067
+
+0.2159
+
+79.21
+
+55.45
+
+77.23
+
+melinoe
+
+0.2486
+
+0.2270
+
+0.2361
+
+80.20
+
+63.37
+
+79.21
+
+Fiddler
+
+0.1851
+
+0.2067
+
+0.2159
+
+79.21
+
+55.45
+
+77.23
+
+Mixtral-Offloading
+
+0.1734
+
+0.2025
+
+0.2086
+
+72.28
+
+51.49
+
+61.39
+
+DeepSpeed-MoE
+
+0.1851
+
+0.2067
+
+0.2159
+
+79.21
+
+55.45
+
+77.23
+
+FLoE
+
+0.1775
+
+0.1884
+
+0.2212
+
+63.34
+
+53.47
+
+60.40
+
+MoE-Infinity
+
+0.1851
+
+0.2067
+
+0.2159
+
+79.21
+
+55.45
+
+77.23
+
+We validate the performance of
+melinoe
+against five prior baselines: Fiddler
+[
+16
+]
+, Mixtral-Offloading
+[
+10
+]
+, Deepspeed-MoE
+[
+23
+]
+, FLoE
+[
+39
+]
+, and MoE-Infinity
+[
+31
+]
+. Across every configuration,
+melinoe
+significantly improves throughput relative to the baseline methods (Figure
+3
+). Using OLMoE,
+melinoe
+achieves
+22.16
+-
+23.32
+tokens/s on the H100 setup and
+15.99
+-
+17.17
+tokens/s on the RTX 4090 setup. In comparison, the best competing baseline achieves only
+14.19
+-
+14.62
+tokens/s on the H100 setup (FLoE) and
+7.61
+-
+9.44
+tokens/s on the RTX 4090 setup (Fiddler). These improvements persist with the larger architectures. Phi-3.5-MoE reaches
+14.34
+-
+15.67
+tokens/s on the A100 setup whereas the next closest baselines (Fiddler and Mixtral-Offloading) only attain
+5.11
+-
+5.81
+tokens/s. Ultimately, MELINOE improves over the best competing baseline by
+1.2
+-
+3\times
+and yields substantially larger gains against baselines that incur frequent weight transfers. For instance,
+melinoe
+achieves a
+14.7\times
+throughput gain over Deepspeed-MoE when using Mixtral-8x7B on the RTX 4090 setup, showing considerable improvements on resource-constrained hardware configurations.
+
+Crucially,
+melinoe
+’s throughput gains do not come at the expense of task performance (Table
+2
+). Note that the Fiddler, DeepSpeed-MoE, and MoE-Infinity baselines do not change the base model weights and therefore have the same performance as the base model. On Dolly15K,
+melinoe
+achieves the best ROUGE-L with OLMoE (
+0.2486
+), Phi-3.5-MoE (
+0.2270
+), and Mixtral-8x7B (
+0.2361
+). On GSM8K,
+melinoe
+again attains the highest accuracy across all three architectures, with the most pronounced improvement occurring with Mixtral-8x7B where
+melinoe
+outperforms the next closest baseline by
+4.35\%
+. Tilting routing towards more persistent per-sequence experts can maintain or even improve quality on the downstream task.
+
+4.3  Ablation Studies and Additional Analysis
+
+Relative Impact of Fine-Tuning vs. Prefetching.
+
+Figure 4
+:
+Impact of varying
+\lambda_{cs}
+and
+\lambda_{rm}
+on number of expert transfers and model performance (OLMoE, 64 output tokens).
+
+Figure 5
+:
+Throughput of
+melinoe
+at various batch sizes relative to the base model with limited GPU VRAM.
+
+First, we aim to disambiguate the influence of fine-tuning and prefetching on the performance of
+melinoe
+. Table
+3
+quantifies the impact of these disparate components for OLMoE and Mixtral-8x7B on Dolly15K and GSM8K. We conclude that the primary factor in throughput improvements is fine-tuning, which can substantially reduce the number of CPU-GPU transfers. In OLMoE, fine-tuning the model can result in
+3\times
+fewer transfers relative to the base model. For Mixtral-8x7B, this reduction in transfer counts is especially valuable as transfers are slow in coarse-grained MoE architectures where experts themselves are larger. Even with PCIe
+5
+x
+16
+, a single expert transfer for Mixtral-8x7B without quantization can take
+5
+-
+6
+ms. Prefetching provides supplementary benefits, but the improvements are marginal relative to the gains achieved through fine-tuning alone. Nonetheless, prefetching itself takes roughly
+0.05
+seconds but can still reduce end-to-end latency by up to
+0.8
+seconds.
+
+Table 3
+:
+Impact of fine-tuning and prefetching (64 output tokens). Each entry reports throughput (tokens/s) with average transfers per layer in parentheses (Tx/L).
+
+Dataset: Dolly15K
+
+Dataset: GSM8K
+
+Setting
+
+OLMoE
+
+(
+C=16
+)
+
+Mixtral-8x7B
+
+(
+C=5
+)
+
+OLMoE
+
+(
+C=16
+)
+
+Mixtral-8x7B
+
+(
+C=5
+)
+
+Base Model
+
+15.15\,(727)
+
+3.37\,(105)
+
+15.10\,(771)
+
+3.59\,(100)
+
+Fine-Tuned Model
+
+23.35\,(240)
+
+8.36\,(48)
+
+24.88\,(255)
+
+7.82\,(52)
+
+Fine-Tuned Model + Prefetch
+
+\mathbf{24.10\,(229)}
+
+\mathbf{8.98\,(46)}
+
+\mathbf{25.00\,(250)}
+
+\mathbf{8.60\,(48)}
+
+Contribution of Loss Functions on Performance.
+
+Our fine-tuning objective uses two weighting coefficients,
+\lambda_{cs}
+and
+\lambda_{rm}
+, to control the relative influence of the auxiliary losses. Figure
+4
+exhibits the significance of these terms on the resulting fine-tuned model’s behavior. When holding
+\lambda_{cs}=1.0
+and varying
+\lambda_{rm}
+, perplexity is largely stable for moderate values
+\lambda_{rm}\in\{0.01,0.1,1.0\}
+while transfers rise slightly from
+278
+to
+314
+transfers per layer. When holding
+\lambda_{rm}=1.0
+and varying
+\lambda_{cs}
+, increasing
+\lambda_{cs}
+predictably reduces transfers, confirming that the transfer penalty stabilizes expert residency. However, pushing
+\lambda_{cs}
+too high sharply harms the fine-tuned model’s quality, indicating that aggressively minimizing transfers can over-constrain routing and degrade performance. Figure
+4
+highlights that moderate
+\lambda_{cs}
+and
+\lambda_{rm}
+is an effective balancing point between the objectives, simultaneously achieving large expert transfer reductions while minimally impacting perplexity.
+
+Effect of Batch Size.
+
+We study the impact of batched decoding in Figure
+5
+. We do not include prior offloading baselines as they do not specifically test regimes with batch size
+>1
+. For
+melinoe
+, the activation predictor pools the most likely experts across all sequences in the batch, while all other aspects of the caching policy remain identical to the batch size
+=1
+setting.
+melinoe
+yields significant throughput gains over the base model and maintains increasing throughput as batch size grows. The relative speedups modestly diminish at larger batch sizes as sequence diversity increases the union of requested experts and induces additional transfers. Fine-tuning to amplify prompt-specific expert preferences remains valuable for memory-constrained MoE inference in multi-request settings.
+
+Effect of Output Generation Length.
+
+A key observation is that fine-tuning does not over-constrain the model and lead to larger performance drops over longer generations. In Table
+4
+, we present the performance of the fine-tuned model at different generation lengths for all three model architectures. Across various output token lengths, the fine-tuned model remains performant. This suggests that
+melinoe
+preserves output quality as generation length increases, rather than trade long-horizon stability for short-context gains. Importantly, this supports the view that the cache simulation loss remains viable for variable-length generations.
+
+Coupling Fine-Tuning with Previous Baselines.
+
+Since the fine-tuning procedure in
+melinoe
+is not contingent on specific prefetching, quantization, or sparsity schemes, the fine-tuned model checkpoint can be used as a stand-in for the base model when using prior baselines. Table
+5
+shows that the fine-tuned model checkpoint can improve the throughput of cache-based methods like FLoE and Mixtral-Offloading. Using the same VRAM restrictions as Section
+4.2
+, swapping the base MoE model for the fine-tuned version can yield improvements of up to
+5.49
+tokens/s. Therefore, the fine-tuning procedure proposed in
+melinoe
+can be used to augment prior and future offloading baselines.
+
+Table 4
+:
+Fine-tuned model perplexity across generation lengths. The quality of the fine-tuned model does not degrade with long output horizons.
+
+Output Length
+
+OLMoE
+
+Phi-3.5-MoE
+
+Mixtral-8x7B
+
+64 Tokens
+
+13.11
+
+5.56
+
+6.12
+
+128 Tokens
+
+10.42
+
+4.81
+
+4.80
+
+256 Tokens
+
+9.50
+
+4.18
+
+4.14
+
+512 Tokens
+
+10.56
+
+3.95
+
+3.92
+
+1024 Tokens
+
+9.86
+
+4.38
+
+4.29
+
+Table 5
+:
+Impact of fine-tuning on prior baselines. Each entry reports throughput (tokens/s).
+
+Dataset: Dolly15K
+
+Dataset: GSM8K
+
+Method
+
+OLMoE
+
+Phi-3.5-MoE
+
+OLMoE
+
+Phi-3.5-MoE
+
+FLoE
+
+14.19
+
+5.23
+
+14.62
+
+5.61
+
++ Fine-Tuning
+
+20.11
+
+6.28
+
+20.24
+
+9.56
+
+Mixtral-Offloading
+
+5.70
+
+8.58
+
+5.55
+
+8.52
+
++ Fine-Tuning
+
+9.22
+
+8.96
+
+9.07
+
+8.91
+
+5  Conclusion
+
+We present
+melinoe
+, a procedure that makes MoE models more deployment-friendly under tight VRAM budgets.
+melinoe
+fine-tunes an MoE model to strongly prefer a small subset of experts on a per-sequence basis. With these stronger and more consistent expert preferences, caching the preferred experts in GPU memory yields substantially fewer expert transfers during decoding, improving throughput without sacrificing output quality on downstream tasks.
+
+We identify three areas for future work. First, we aim to conduct studies with larger-scale fine-tuning on general-purpose corpora. While we evaluate generalization (Appendix
+D.1
+), future work should explore whether this approach is valuable for deploying MoE models across diverse tasks. Second, our current design uses the same number of cached experts per layer, whereas layer-wise cache budgets may provide increased flexibility. Finally, for very long generations, dynamically adapting cache sizes over time may be beneficial. Overall, we view
+melinoe
+as a step towards deployment-ready MoE models that retain strong quality while operating efficiently under real hardware constraints.
+
+Appendix Contents
+
+A   Related Works
+
+.
+15
+
+B   Additional Experimental Details
+
+.
+16
+
+B.1   Model Details
+.
+16
+
+B.2   Optimizer and Loss Function Parameters
+.
+16
+
+B.3   Hardware Configurations
+.
+117
+
+B.4   Evaluation Settings
+.
+17
+
+C   Loss Function Design Justification
+
+.
+18
+
+C.1   Choice of
+\mathcal{L}_{cs}
+
+.
+18
+
+C.2   Choice of
+\mathcal{L}_{rm}
+
+.
+20
+
+D   Additional Experiments
+
+.
+22
+
+D.1   Out-of-Distribution Generalization Performance of
+melinoe
+.
+22
+
+D.2   Effect of Output Generation Length on Throughput
+.
+22
+
+D.3   Impact of Fine-Tuning on Expert Routing
+.
+23
+
+D.4   Ablation on GPU VRAM Budget
+.
+27
+
+D.5   Ablation on Quantized Experts
+.
+27
+
+D.6   Ablation on Soft Cache Capacity in Loss
+.
+28
+
+D.7   Ablation on Loss Function Decay Factor
+\gamma
+
+.
+28
+
+D.8   Ablation on Cache Eviction Policy
+.
+28
+
+Appendix A
+Related Works
+
+Mixture-of-Experts Model Architectures.
+
+Mixture-of-Experts (MoE) model architectures were first proposed as an alternative to traditional transformer-based models
+[
+25
+]
+. In MoE models, the Feed Forward Network (FFN) present in each transformer block is separated into multiple FFNs which are sparsely activated on a per-token basis. These sparse activations allow MoE models to increase model capacity without a proportional increase in training compute, since only a small subset of experts is executed per token
+[
+18
+,
+11
+,
+9
+,
+24
+]
+. A few design choices are critical for making MoE models effective in practice. First, expert granularity controls the size and number of experts in the MoE model. Coarse-grained MoE models such as Mixtral-8x7B
+[
+15
+]
+, Phi-3.5-MoE
+[
+1
+]
+, and DBRX
+[
+27
+]
+all use a relatively small number of large experts. In contrast, fine-grained MoE architectures such as OLMoE
+[
+22
+]
+, Qwen2MoE
+[
+33
+]
+, Qwen3MoE
+[
+32
+]
+, DeepSeek-V2
+[
+6
+]
+, and DeepSeek-V3
+[
+7
+]
+use a higher number of small experts to increase expert specialization and reduce training costs. Another axis by which MoE models differ is their token routing strategy. Initial MoE model architectures such as GShard
+[
+18
+]
+and GLaM
+[
+9
+]
+employ router load balancing losses to ensure all experts are utilized in training to prevent expert collapse and token dropping from overloaded experts. BASE Layers
+[
+19
+]
+instead formulates routing as a linear assignment problem, ensuring experts receive an equal number of tokens during generation. Expert Choice Routing
+[
+38
+]
+allows each expert to instead pick its Top-
+K
+tokens. More recent works such as Loss-Free Balancing
+[
+28
+]
+add expert-wise biases to the router’s decisions and update these biases throughout generation to achieve approximate load balancing without an auxiliary loss term. Granularity and routing are critical design choices in downstream deployments as they directly shape the tradeoff between capacity, efficiency, and serving latency.
+
+On-Device Mixture-of-Experts.
+
+The proliferation of open-source MoE models has made on-device deployments of MoEs a critical research direction. MoE inference is often memory-bound since all experts must be accessible at inference time despite their sparse activations. In turn, on-device settings are particularly challenging for MoEs since these devices often have limited GPU memory. In this regime, expert offloading techniques have emerged as a promising way of managing the memory constraints imposed by MoE models. Edge-MoE
+[
+35
+]
+assumes a highly constrained setting that requires offloading quantized experts to disk memory. However, the following works allow for a larger amount of GPU VRAM and enough CPU DRAM to host all offloaded model weights. Mixtral-Offloading
+[
+10
+]
+, which operates in this more lenient regime, uniformly quantizes experts to
+3
+bits and all remaining weights to
+4
+bits, allowing for a larger number of experts to remain resident in GPU DRAM. This variable bit-width quantization incurs additional compute overhead and a non-negligible decrease in model performance. FLoE
+[
+39
+]
+similarly uses quantization and activation sparsity to increase the size of the GPU-resident expert set but applies them to specific layers where they find compression techniques have the least effect on performance. Other techniques avoid lossy compression schemes and exploit other avenues for reducing I/O latency. MoE-Infinity
+[
+31
+]
+prefetches experts by profiling previous expert activations and uses
+K
+-means to identify experts that are likely to be activated for a specific request. FineMoE
+[
+36
+]
+aims to improve on this prefetching scheme by creating expert maps that track token-level activation patterns to prefetch experts in every iteration. An alternative approach proposed by Fiddler
+[
+16
+]
+is to directly move intermediate activations to CPU memory and perform expert computation on the CPU for CPU-resident experts. As activations are smaller than the expert weights themselves, this method trades compute efficiency for a reduction in I/O latency. Methods such as HarMoEny
+[
+8
+]
+and Faster MoE
+[
+34
+]
+which target the multi-GPU inference setting aim to optimize communication but are not directly applicable to this resource-constrained setting.
+
+Routing and Semantic Locality.
+
+While expert offloading is a promising direction for reducing the memory demands of MoE models, recent works suggest that naïvely applying expert offloading may lead to substantial hidden I/O latency. Concretely, MoE models may exhibit low local routing consistency
+[
+20
+]
+, where nearby tokens may activate different experts. This diversity in activations increases the number of cache transfers, reducing the efficacy of a GPU-resident expert set. Recent literature approaches the issue of routing locality in various ways. Oracle-MoE
+[
+37
+]
+pretrains MoE architectures to route tokens based on attention score-based semantic similarity in order to reduce expert transfers. However, its evaluation is limited to GPT-2-scale models, leaving open how well the approach extends to modern MoE models, where larger architectures and tighter GPU memory budgets can make offloading and transfer bottlenecks more pronounced. BlockFFN
+[
+26
+]
+similarly performs MoE pretraining but utilizes an auxiliary loss function that encourages neighboring tokens to activate similar experts. BlockFFN does not specifically target expert offloading and only mentions speculative decoding as a device-side acceleration technique that composes with their method.
+
+Appendix B
+Additional Experimental Details
+
+B.1  Model Details
+
+In Table
+6
+, we include details of OLMoE, Phi-3.5-MoE, and Mixtral-8x7B, the models that we use in all experiments.
+
+Table 6
+:
+Model details for the MoE backbones used in all experiments. Total parameters count all experts; active parameters correspond to the parameters used per token under Top-
+K
+routing. FP16 size is the approximate weight footprint assuming
+2
+bytes/parameter.
+
+Model
+
+Layers
+
+Experts/
+
+Layer
+
+Active
+
+Experts
+
+Total
+
+Params. (B)
+
+Active
+
+Params. (B)
+
+Context
+
+Len.
+
+FP16
+
+Size (GB)
+
+OLMoE
+
+16
+
+64
+
+8
+
+6.9
+
+1.3
+
+4
+K
+
+13.8
+
+Phi-3.5-MoE
+
+32
+
+16
+
+2
+
+42.0
+
+6.6
+
+128
+K
+
+84.0
+
+Mixtral-8x7B
+
+32
+
+8
+
+2
+
+46.7
+
+12.9
+
+32
+K
+
+93.4
+
+B.2  Optimizer and Loss Function Parameters
+
+In Tables
+7
+and
+8
+, we highlight training hyperparameters used for fine-tuning each MoE model and training the MLP activation predictor, respectively.
+
+Table 7
+:
+Fine-tuning hyperparameters for each dataset and MoE model backbone.
+
+Dataset: Dolly15K
+
+Dataset: GSM8K
+
+Hyperparameter
+
+OLMoE
+
+Phi-3.5-MoE
+
+Mixtral-8x7B
+
+OLMoE
+
+Phi-3.5-MoE
+
+Mixtral-8x7B
+
+Peak Learning Rate
+
+10^{-5}
+
+10^{-5}
+
+10^{-5}
+
+10^{-5}
+
+10^{-5}
+
+10^{-5}
+
+Optimizer
+
+AdamW
+
+AdamW
+
+AdamW
+
+AdamW
+
+AdamW
+
+AdamW
+
+Schedule
+
+Linear
+
+Linear
+
+Linear
+
+Linear
+
+Linear
+
+Linear
+
+Warmup Ratio
+
+0.03
+
+0.03
+
+0.03
+
+0.03
+
+0.03
+
+0.03
+
+Max Tokens
+
+512
+
+512
+
+512
+
+512
+
+512
+
+512
+
+LoRA Rank (
+r
+)
+
+32
+
+32
+
+32
+
+32
+
+32
+
+32
+
+LoRA
+\alpha
+
+16
+
+16
+
+16
+
+16
+
+16
+
+16
+
+Epochs
+
+3
+
+3
+
+3
+
+5
+
+5
+
+5
+
+\lambda_{\text{cs}}
+
+0.5
+
+0.5
+
+0.5
+
+0.05
+
+0.05
+
+0.05
+
+\lambda_{\text{rm}}
+
+0.1
+
+0.1
+
+0.1
+
+0.01
+
+0.01
+
+0.01
+
+\gamma
+(Cache Decay)
+
+0.9
+
+0.9
+
+0.9
+
+0.9
+
+0.9
+
+0.9
+
+\rho
+(Rank Margin)
+
+0.1
+
+0.1
+
+0.1
+
+0.1
+
+0.1
+
+0.1
+
+Cache Capacity
+C
+
+16
+
+4
+
+2
+
+16
+
+4
+
+2
+
+Table 8
+:
+Activation predictor MLP training hyperparameters (same values across datasets).
+
+Hyperparameter
+
+Value
+
+Number of Layers
+
+2
+
+Input Size
+
+768
+
+Hidden Dimension
+
+1024
+
+Loss
+
+KL Divergence
+
+Learning Rate
+
+2\times 10^{-4}
+
+Epochs
+
+10
+
+Optimizer
+
+SGD
+
+Momentum
+
+0.9
+
+Batch Size
+
+16
+
+B.3  Hardware Configurations
+
+In Table
+9
+, we characterize the various hardware setups and configurations used in our experiments.
+
+Table 9
+:
+Hardware configurations used in offloaded MoE inference experiments.
+
+Spec
+
+H100 Setup
+
+A100 Setup
+
+RTX 4090 Setup
+
+GPU
+
+H100
+
+A100
+
+RTX 4090
+
+GPU VRAM (GB)
+
+80
+
+40
+
+24
+
+Host CPU
+
+Intel Xeon Platinum 8470
+
+AMD EPYC 7J13
+
+AMD EPYC 7B13
+
+Host DRAM (GB)
+
+2048
+
+216
+
+270
+
+PCIe Gen xLanes
+
+Gen
+5
+x
+16
+
+Gen
+4
+x
+16
+
+Gen
+4
+x
+16
+
+PCIe Bandwidth (GB/s)
+
+64.0
+
+32.0
+
+32.0
+
+B.4  Evaluation Settings
+
+Finally, in Table
+10
+, we present model settings and decoding metrics used during the evaluation of our method.
+
+Table 10
+:
+Evaluation configuration used for throughput measurements.
+
+OLMoE
+
+Phi-3.5-MoE
+
+Mixtral-8x7B
+
+Resident Experts / Layer
+
+16
+
+8
+
+5
+
+Quantized Modules
+
+gate_proj, up_proj, down_proj
+
+w1, w2, w3
+
+w1, w2, w3
+
+Decoding Strategy
+
+Greedy
+
+Greedy
+
+Greedy
+
+Throughput Metric
+
+Output tokens/s
+
+Output tokens/s
+
+Output tokens/s
+
+Max Output Tokens
+
+256
+
+256
+
+256
+
+Appendix C
+Loss Function Design Justification
+
+In this section, we provide theoretical justification for the choice of our loss functions. Throughout the section, we will use
+b
+and
+f
+in the subscript to associate symbols with the base model and the fine-tuned model respectively,
+\mathbf{x}=[\mathbf{x}_{1},\ldots,\mathbf{x}_{T}]
+refers to the sequence of tokens, and
+\textup{Top-}C(\mathbf{\cdot})
+refers to an operation that returns a vector with
+L_{1}
+norm
+C
+and entries
+1
+for
+C
+positions with the highest magnitude and
+0
+otherwise.
+[N]
+for any natural number
+N\in\mathbb{Z}_{+}
+denotes the set
+[1,\ldots,N]
+.
+
+C.1  Choice of
+\mathcal{L}_{cs}
+
+The cache simulation loss
+\mathcal{L}_{cs}(\mathbf{x})
+is designed to penalize expert activation patterns with excessive switching. Previous work indicates that certain MoE models activate similar experts across adjacent tokens, while others consistently activate a small subset of experts across the decoding trajectory for a given prompt. In the former case, an LRU cache eviction policy is preferable, whereas in the latter an LFU-based eviction policy is more appropriate under conventional caching frameworks.
+
+By fine-tuning the router layers, we can control the underlying expert activation distribution, allowing us to tailor the distribution towards a specific cache eviction policy. The
+\mathcal{L}_{cs}
+loss encourages tokens to have similar activation distributions. The decay parameter
+\gamma
+weights older requests relative to newer ones when computing this similarity. In the following proposition, we will first explain how
+\gamma
+can be used to interpolate between LFU and LRU updates with hard cache states.
+
+Definition C.1
+
+(
+\gamma
+cache eviction)
+.
+
+For any given sequence of tokens
+\mathbf{x}=[\mathbf{x}_{1},\ldots,\mathbf{x}_{T}]
+, let
+\mathbf{r}_{f}^{(\ell,t)}(\mathbf{x})\in\{0,1\}^{E}
+denote the binary request vector at layer
+\ell
+and token position
+t
+with
+\|\mathbf{r}_{f}^{(\ell,t)}(\mathbf{x})\|_{1}=K
+. Then, we define the
+\gamma
+-discounted count and the
+\gamma
+-discounted cache state under model
+f
+(
+\mathbf{C}_{f,\gamma}
+) as follows
+
+\displaystyle\textup{Count}_{f,\gamma}^{(\ell,t+1)}(\mathbf{x})
+
+\displaystyle=\gamma\textup{Count}_{f,\gamma}^{(\ell,t)}(\mathbf{x})+\mathbf{r}_{f}^{(\ell,t)}(\mathbf{x}),
+
+(8)
+
+\displaystyle\mathbf{C}_{f,\gamma}^{(\ell,t+1)}(\mathbf{x})
+
+\displaystyle=\textup{Top-}C\left(\textup{Count}_{f.\gamma}^{(\ell,t+1)}(\mathbf{x})\right),
+
+(9)
+
+where
+\textup{Count}_{f,\gamma}^{(\ell,t)}(\mathbf{x})
+is a vector representing the discounted expert request numbers up to
+t-1
+for layer
+\ell
+under sequence
+\mathbf{x}
+and
+\textup{Count}_{f,\gamma}^{(\ell,1)}(\mathbf{x})
+is initialized as a vector with
+L_{1}
+norm
+C
+. Note that
+\textup{Count}_{f,\gamma}^{(\ell,1)}
+can be set to anything based on the prefetch initialization used. Alternatively, one could also use a uniform initialization.
+
+Remark C.2
+.
+
+From Definition
+C.1
+, we have
+
+•
+
+Using
+\gamma=1
+corresponds to LFU cache updates, and when
+\gamma\rightarrow 0^{+}
+we get LRU cache updates.
+
+•
+
+For any
+\gamma
+, the cache can be updated lazily. Specifically, any expert that is present in the cache for layer
+\ell
+at time
+t+1
+, that is any index with a nonzero entry in
+\mathbf{C}_{f,\gamma}^{(\ell,t+1)}(\mathbf{x})
+, must either have been present in
+\mathbf{C}_{f,\gamma}^{(\ell,t)}(\mathbf{x})
+or appear in
+\mathbf{r}_{f}^{(\ell,t)}(\mathbf{x})
+. Consequently, the cache can be updated during offloaded inference without incurring additional overhead.
+
+The total number of cache misses equals the number of PCIe transfers. Under a
+\gamma
+-cache eviction policy, the number of cache misses at layer
+\ell
+over
+T
+tokens is given by
+
+\textup{Cache misses at layer }\ell:=\sum_{t=1}^{T}\left\langle\mathbf{r}_{f}^{(\ell,t)}(\mathbf{x}),\mathbf{1}-\mathbf{C}_{f,\gamma}^{(\ell,t)}(\mathbf{x})\right\rangle,
+
+and the hard loss
+\mathcal{L}_{cs}^{\textup{hard}}(\mathbf{x},f)
+as
+
+\mathcal{L}_{cs}^{\textup{hard}}(\mathbf{x},f):=\frac{1}{LT}\sum_{\ell=1}^{L}\sum_{t=1}^{T}\left\langle\mathbf{r}_{f}^{(\ell,t)}(\mathbf{x}),\mathbf{1}-\mathbf{C}_{f,\gamma}^{(\ell,t)}(\mathbf{x})\right\rangle.
+
+(10)
+
+However, the loss above is hard to differentiate with respect to the parameters of
+f
+due to the
+\textup{Top-}C
+operation used to define
+\mathbf{C}_{f,\gamma}^{(\ell,t)}(\mathbf{x})
+. Hence, we use a “soft" cache proxy
+\mathbf{c}_{f,\gamma}^{(\ell,t)}(\mathbf{x})
+instead of
+\mathbf{C}_{f,\gamma}^{(\ell,t)}(\mathbf{x})
+where
+
+\mathbf{c}_{f,\gamma}^{(\ell,t)}(\mathbf{x}):=\frac{\textup{Count}_{f,\gamma}^{(\ell,t)}(\mathbf{x})}{\left\|\textup{Count}_{f,\gamma}^{(\ell,t)}(\mathbf{x})\right\|_{1}}\cdot C,
+
+(11)
+
+which is the
+\textup{Count}_{f,\gamma}^{(\ell,t)}(\mathbf{x})
+scaled to make its
+L_{1}
+norm equal to
+C
+.
+
+Proposition C.3
+.
+
+Using the definitions in Equations (
+8
+) and (
+11
+), we have
+
+\displaystyle\left\|\textup{Count}_{f,\gamma}^{(\ell,t)}(\mathbf{x})\right\|_{1}=\gamma^{t-1}C+K\sum_{i=1}^{t-1}\gamma^{t-i-1},
+
+define
+Z^{(t)}=\gamma^{t-1}+\frac{K}{C}\sum_{i=1}^{t-1}\gamma^{t-i-1}
+. Then, by Equation (
+11
+), one can recursively update the soft cache state as
+
+\mathbf{c}_{f,\gamma}^{(\ell,t+1)}(\mathbf{x}):=\frac{\gamma Z^{(t)}\mathbf{c}_{f,\gamma}^{(\ell,t)}(\mathbf{x})+\mathbf{r}_{f}^{(\ell,t)}(\mathbf{x})}{Z^{(t+1)}}\qquad\textup{and}\qquad Z^{(t+1)}=\gamma Z^{(t)}+\frac{K}{C}
+
+Proof.
+
+Using the definition in Equation (
+8
+), we have
+
+\left\|\textup{Count}_{f,\gamma}^{(\ell,t)}(\mathbf{x})\right\|_{1}=\left\|\gamma^{t-1}\textup{Count}_{f,\gamma}^{(\ell,1)}(\mathbf{x})+\sum_{i=1}^{t-1}\gamma^{t-i-1}\mathbf{r}_{f}^{(\ell,t)}(\mathbf{x})\right\|_{1}=\gamma^{t-1}C+K\sum_{i=1}^{t-1}\gamma^{t-i-1}
+
+Next, using this, one can show
+\forall t\in[T]
+
+\mathbf{c}_{f,\gamma}^{(\ell,t)}(\mathbf{x})=\frac{\textup{Count}_{f,\gamma}^{(\ell,t)}(\mathbf{x})}{\left\|\textup{Count}_{f,\gamma}^{(\ell,t)}(\mathbf{x})\right\|_{1}}\cdot C=\frac{\textup{Count}_{f,\gamma}^{(\ell,t)}(\mathbf{x})}{Z^{(t)}}.
+
+and
+
+\mathbf{c}_{f,\gamma}^{(\ell,t+1)}(\mathbf{x})=\left(Z^{(t+1)}\right)^{-1}\left(\gamma\textup{Count}_{f,\gamma}^{(\ell,t)}(\mathbf{x})+\mathbf{r}_{f}^{(\ell,t)}(\mathbf{x})\right)=\left(Z^{(t+1)}\right)^{-1}\left(\gamma Z^{(t)}\mathbf{c}_{f,\gamma}^{(\ell,t)}(\mathbf{x})+\mathbf{r}_{f}^{(\ell,t)}(\mathbf{x})\right).
+
+The recursion for
+Z^{(t)}
+follows directly from the definition.
+∎
+
+Subsequently, we define
+\mathcal{L}_{cs}(\mathbf{x},f)
+by replacing the cache state
+\mathbf{C}_{f,\gamma}^{(\ell,t)}(\mathbf{x})
+in Equation (
+10
+) with the “soft" cache state
+\mathbf{c}_{f,\gamma}^{(\ell,t)}(\mathbf{x})
+in order to facilitate fine-tuning the model
+f
+via gradient-based methods
+
+\mathcal{L}_{cs}(\mathbf{x},f):=\frac{1}{LT}\sum_{\ell=1}^{L}\sum_{t=1}^{T}\left\langle\mathbf{r}_{f}^{(\ell,t)}(\mathbf{x}),\mathbf{1}-\mathbf{c}_{f,\gamma}^{(\ell,t)}(\mathbf{x})\right\rangle.
+
+The next lemma provides an interpretation of the cache simulation loss
+\mathcal{L}_{cs}
+.
+
+Lemma C.4
+.
+
+Let
+\mathbf{x}\sim\mathcal{D}_{\text{train}}
+denote the training dataset of SFT traces. Define
+\mathcal{L}_{cs}(f):=\mathop{\mathbb{E}}_{\mathbf{x}\sim\mathcal{D}_{\text{train}}}[\mathcal{L}_{cs}(\mathbf{x},f)]
+, then we have
+
+\mathcal{L}_{cs}(f)=K-\frac{1}{LT}\sum_{\ell=1}^{L}\sum_{t=1}^{T}\left(Z^{(t)}\right)^{-1}\left(\sum_{i=1}^{t-1}\gamma^{t-1-i}\phi_{f}^{(\ell)}(t,i)+\gamma^{t-1}\phi_{f}^{(\ell)}(t,1)\right)
+
+where
+\phi_{f}^{(\ell)}(t,i):=\mathop{\mathbb{E}}_{\mathbf{x}\sim\mathcal{D}_{\text{train}}}\left[\left\langle\mathbf{r}_{f}^{(\ell,t)}(\mathbf{x}),\mathbf{r}_{f}^{(\ell,i)}(\mathbf{x})\right\rangle\right]
+,
+\phi_{f}^{(\ell)}(t,1):=\mathop{\mathbb{E}}_{\mathbf{x}\sim\mathcal{D}_{\text{train}}}\left[\left\langle\mathbf{r}_{f}^{(\ell,t)}(\mathbf{x}),\mathbf{c}_{f,\gamma}^{(\ell,1)}(\mathbf{x})\right\rangle\right]
+, and its derivative with respect to the parameter
+\gamma
+:
+\frac{d\mathcal{L}_{cs}(f)}{d\gamma}\leq 0
+
+Proof.
+
+Recall,
+\mathcal{L}_{cs}(\mathbf{x},f)
+is given by
+
+\mathcal{L}_{cs}(\mathbf{x},f)=\frac{1}{LT}\sum_{\ell=1}^{L}\sum_{t=1}^{T}\left\langle\mathbf{r}_{f}^{(\ell,t)}(\mathbf{x}),\mathbf{1}-\mathbf{c}_{f,\gamma}^{(\ell,t)}(\mathbf{x})\right\rangle
+
+Let us denote
+\mathcal{L}_{cs}^{(\ell,t)}(\mathbf{x}):=\left\langle\mathbf{r}_{f}^{(\ell,t)}(\mathbf{x}),\mathbf{1}-\mathbf{c}_{f,\gamma}^{(\ell,t)}(\mathbf{x})\right\rangle
+. Then, for some initialization
+\mathbf{c}_{f,\gamma}^{(\ell,1)}(\mathbf{x})
+, using Proposition
+C.3
+, one can unroll
+\mathbf{c}_{f,\gamma}^{(\ell,t)}(\mathbf{x})
+as follows
+
+\mathbf{c}_{f,\gamma}^{(\ell,t)}(\mathbf{x})=\left(Z^{(t)}\right)^{-1}\left(\sum_{i=1}^{t-1}\gamma^{t-1-i}\mathbf{r}_{f}^{(\ell,i)}(\mathbf{x})+\gamma^{t-1}\mathbf{c}_{f,\gamma}^{(\ell,1)}(\mathbf{x})\right)\
+
+Using this expression and the fact
+\|\mathbf{r}_{f}^{(\ell,t)}(\mathbf{x})\|_{1}=K
+, one can obtain
+
+\mathcal{L}_{cs}^{(\ell,t)}(\mathbf{x},f)=K-\left(Z^{(t)}\right)^{-1}\left(\sum_{i=1}^{t-1}\gamma^{t-1-i}\left\langle\mathbf{r}_{f}^{(\ell,t)}(\mathbf{x}),\mathbf{r}_{f}^{(\ell,i)}(\mathbf{x})\right\rangle+\gamma^{t-1}\left\langle\mathbf{r}_{f}^{(\ell,t)}(\mathbf{x}),\mathbf{c}_{f,\gamma}^{(\ell,1)}(\mathbf{x})\right\rangle\right)
+
+and its derivative with respect to
+\gamma
+is given by
+
+\displaystyle\frac{d\mathcal{L}_{cs}^{(\ell,t)}(\mathbf{x},f)}{d\gamma}=-\left(Z^{(t)}\right)^{-1}\left(\sum_{i=1}^{t-2}(t-1-i)\gamma^{t-2-i}\left\langle\mathbf{r}_{f}^{(\ell,t)}(\mathbf{x}),\mathbf{r}_{f}^{(\ell,i)}(\mathbf{x})\right\rangle+(t-1)\gamma^{t-2}\left\langle\mathbf{r}_{f}^{(\ell,t)}(\mathbf{x}),\mathbf{c}_{f,\gamma}^{(\ell,1)}(\mathbf{x})\right\rangle\right)\leq 0
+
+Taking the expectation with respect to
+\mathbf{x}\sim\mathcal{D}_{\text{train}}
+completes the result.
+∎
+
+Remark C.5
+.
+
+From Lemma
+C.4
+, one can observe that minimizing the loss
+\mathcal{L}_{cs}(f)
+entails maximizing the terms
+\phi_{f}^{(\ell)}(t,i):=\mathop{\mathbb{E}}_{\mathbf{x}\sim\mathcal{D}_{\text{train}}}\left[\left\langle\mathbf{r}_{f}^{(\ell,t)}(\mathbf{x}),\mathbf{r}_{f}^{(\ell,i)}(\mathbf{x})\right\rangle\right]
+which encourages the expert request distributions at layer
+\ell
+for token positions
+t
+and
+i
+to be similar. Note that
+\gamma<1
+implies that
+\phi_{f}^{(\ell)}(t,i)
+receives a higher weight when
+t
+and
+i
+are closer, and this incentivizes reduced switching.
+
+Remark C.6
+.
+
+We choose
+\gamma=0.9
+in our experiments since
+\frac{d\mathcal{L}_{cs}(f)}{d\gamma}\leq 0
+while also enabling the resulting model to work with both LRU and LFU cache eviction policies.
+
+C.2  Choice of
+\mathcal{L}_{rm}
+
+Given a sequence of tokens
+\mathbf{x}=[\mathbf{x}_{1},\ldots,\mathbf{x}_{T}]
+, the purpose of the term
+\mathcal{L}_{rm}(\mathbf{x})
+is to discourage router collapse onto a small subset of experts. A broadly adopted strategy for preventing distributional collapse while retaining desirable properties of the base model is KL-regularization. Incorporating a KL penalty is ubiquitous across domains including safety fine-tuning, RLHF, knowledge distillation, and reasoning model training where it serves as a general mechanism for constraining policy updates relative to the base model. In our setting, let
+\mathbf{p}^{(\ell,t)}_{f}(\mathbf{x})
+and
+\mathbf{p}^{(\ell,t)}_{b}(\mathbf{x})
+denote the router distributions at layer
+\ell
+and token position
+t
+induced by the fine-tuned and base routers, respectively. One may then define the KL loss as follows
+
+\mathcal{L}_{rm}^{\textup{KL}}(\mathbf{x},f)=\frac{1}{LT}\sum_{\ell=1}^{L}\sum_{t=1}^{T}\textup{KL}\left(\mathbf{p}^{(\ell,t)}_{f}(\mathbf{x})\|\mathbf{p}^{(\ell,t)}_{b}(\mathbf{x})\right).
+
+Although this may be a natural choice in tasks such as knowledge distillation where the objective is to match the teacher’s distribution, our setting is different. We are less concerned with divergence between the two distributions in the KL or entropy sense and are ultimately interested in the induced rankings, since the model selects the Top-
+K
+experts from the router distribution. We, therefore, choose a loss that is more directly aligned with mismatches in the induced rankings. Concretely, we model this using the Kendall rank correlation coefficient
+[
+17
+]
+.
+
+Definition C.7
+.
+
+Given two router output distributions
+\mathbf{p},\mathbf{q}\in\Delta^{E}
+, the Kendall rank correlation coefficient
+\tau(\mathbf{p},\mathbf{q})\in[-1,1]
+is defined as
+
+\tau(\mathbf{p},\mathbf{q})=1-\frac{2\textup{Inv}(\mathbf{p},\mathbf{q})}{{n\choose 2}},
+
+where
+\textup{Inv}(\mathbf{p},\mathbf{q})
+is the number of pairwise inversions between distributions
+\mathbf{p}
+and
+\mathbf{q}
+.
+
+Maximizing the rank correlation coefficient is equivalent to minimizing the inversion number. Ideally, one could use the following loss function
+
+\mathcal{L}_{rm}^{\textup{inv}}(\mathbf{x})=\frac{1}{LT}\sum_{\ell=1}^{L}\sum_{t=1}^{T}\textup{Inv}\left(\mathbf{p}^{(\ell,t)}_{f}(\mathbf{x}),\mathbf{p}^{(\ell,t)}_{b}(\mathbf{x})\right).
+
+Note that when this loss is
+0
+, the experts activated by the fine-tuned router and the base router will be exactly the same. However, the term
+\textup{Inv}(\cdot,\cdot)
+is difficult to parameterize and differentiate with respect to the parameters of the fine-tuned model
+f
+. One can express the inversion number as follows
+
+\textup{Inv}\left(\mathbf{p}^{(\ell,t)}_{f}(\mathbf{x}),\mathbf{p}^{(\ell,t)}_{b}(\mathbf{x})\right)=\sum\limits_{i,j\in\left[E\right]}g_{b}^{(\ell,t)}(\mathbf{x},i,j)\;g_{f,\textup{Inv}}^{(\ell,t)}(\mathbf{x},i,j),
+
+where
+
+\displaystyle g_{b}^{(\ell,t)}(\mathbf{x},i,j):=\mathbb{I}\!\left\{\mathbf{p}^{(\ell,t)}_{b,i}(\mathbf{x})>\mathbf{p}^{(\ell,t)}_{b,j}(\mathbf{x})\right\}\quad\text{and}\quad g_{f,\textup{Inv}}^{(\ell,t)}(\mathbf{x},i,j):=\mathbb{I}\!\left\{\mathbf{p}^{(\ell,t)}_{f,i}(\mathbf{x})<\mathbf{p}^{(\ell,t)}_{f,j}(\mathbf{x})\right\}.
+
+To facilitate learning using gradient-based methods, we use
+m^{(\ell,t)}
+as a proxy for the inversion number
+\textup{Inv}(\cdot,\cdot)
+. Specifically, we replace
+g_{f,\textup{Inv}}
+by
+g_{f}
+, i.e.,
+
+m^{(\ell,t)}(\mathbf{x})=\!\!\!\!\!\sum\limits_{i,j\in\left[E\right]}g_{b}^{(\ell,t)}(\mathbf{x},i,j)\;g_{f}^{(\ell,t)}(\mathbf{x},i,j)\quad\textup{with}\quad g_{f}^{(\ell,t)}(\mathbf{x},i,j):=\left[\rho-\left(\mathbf{p}^{(\ell,t)}_{f,i}(\mathbf{x})-\mathbf{p}^{(\ell,t)}_{f,j}(\mathbf{x})\right)\right]_{+}
+
+(12)
+
+and define
+\mathcal{L}_{rm}
+as
+
+\mathcal{L}_{rm}(\mathbf{x},f)=\frac{1}{LT}\sum_{\ell=1}^{L}\sum_{t=1}^{T}m^{(\ell,t)}(\mathbf{x}).
+
+Lemma C.8
+.
+
+Define
+
+m^{(\ell,t)}(\mathbf{x})=\sum\limits_{i,j\in\left[E\right]}\mathbb{I}\!\left\{\mathbf{p}^{(\ell,t)}_{b,i}(\mathbf{x})>\mathbf{p}^{(\ell,t)}_{b,j}(\mathbf{x})\right\}\left[\rho-\left(\mathbf{p}^{(\ell,t)}_{f,i}(\mathbf{x})-\mathbf{p}^{(\ell,t)}_{f,j}(\mathbf{x})\right)\right]_{+}
+as in Equation (
+12
+). Then, we have
+
+m^{(\ell,t)}(\mathbf{x})\geq\rho\;\textup{Inv}\left(\mathbf{p}^{(\ell,t)}_{f}(\mathbf{x}),\mathbf{p}^{(\ell,t)}_{b}(\mathbf{x})\right).
+
+Proof.
+
+Without loss of generality, assume that no two entries for either vector
+\mathbf{p}^{(\ell,t)}_{f}(\mathbf{x})
+or
+\mathbf{p}^{(\ell,t)}_{b}(\mathbf{x})
+are equal. Then, we have
+
+\displaystyle\rho\;\textup{Inv}\left(\mathbf{p}^{(\ell,t)}_{f}(\mathbf{x}),\mathbf{p}^{(\ell,t)}_{b}(\mathbf{x})\right)
+
+\displaystyle=\sum\limits_{i,j\in\left[E\right]}\rho\mathbb{I}\!\left\{\mathbf{p}^{(\ell,t)}_{f,i}(\mathbf{x})<\mathbf{p}^{(\ell,t)}_{f,j}(\mathbf{x})\right\}\mathbb{I}\!\left\{\mathbf{p}^{(\ell,t)}_{b,i}(\mathbf{x})>\mathbf{p}^{(\ell,t)}_{b,j}(\mathbf{x})\right\}
+
+\displaystyle\leq\sum\limits_{i,j\in\left[E\right]}\left[\rho-\left(\mathbf{p}^{(\ell,t)}_{f,i}(\mathbf{x})-\mathbf{p}^{(\ell,t)}_{f,j}(\mathbf{x})\right)\right]_{+}\mathbb{I}\!\left\{\mathbf{p}^{(\ell,t)}_{b,i}(\mathbf{x})>\mathbf{p}^{(\ell,t)}_{b,j}(\mathbf{x})\right\}=m^{(\ell,t)}(\mathbf{x}),
+
+where the last line follows from
+\rho\;\mathbb{I}(a<b)\leq[\rho-(a-b)]_{+}
+
+∎
+
+Remark C.9
+.
+
+As a consequence of Lemma
+C.8
+, minimizing loss
+\mathcal{L}_{rm}
+is equivalent to maximizing a lower bound on the rank correlation coefficient between the fine-tuned and base router expert request distributions averaged across layers
+\ell\in[L]
+and token positions
+t\in[T]
+.
+
+Appendix D
+Additional Experiments
+
+D.1  Out-of-Distribution Generalization Performance of
+melinoe
+
+As mentioned in Section
+5
+, computational constraints prevented us from performing large-scale fine-tuning on a comprehensive, general-purpose dataset. Such training would likely yield a more deployment-friendly model that reduces inference latency across a wider range of downstream tasks. Instead, we evaluate whether
+melinoe
+continues to provide throughput improvements when the fine-tuning data used in the pre-deployment stage and the downstream task differ.
+
+Table 11
+:
+Decoding throughput (tokens/s) when evaluating on Dolly15K vs. GSM8K. For
+melinoe
+, we report throughput after fine-tuning on either Dolly15K or GSM8K; baselines are shown for reference.
+
+Eval: Dolly15K
+
+Eval: GSM8K
+
+Method
+
+Phi-3.5-MoE
+
+Mixtral-8x7B
+
+Phi-3.5-MoE
+
+Mixtral-8x7B
+
+melinoe
+
+(Fine-Tune: Dolly15K)
+
+14.34
+
+9.35
+
+13.52
+
+8.25
+
+melinoe
+
+(Fine-Tune: GSM8K)
+
+10.44
+
+8.21
+
+15.67
+
+10.38
+
+Fiddler
+
+5.88
+
+5.24
+
+7.26
+
+4.11
+
+Mixtral-Offloading
+
+8.58
+
+5.08
+
+8.52
+
+5.04
+
+DeepSpeed-MoE
+
+2.63
+
+1.25
+
+2.69
+
+1.23
+
+FLoE
+
+5.23
+
+2.25
+
+5.61
+
+2.20
+
+MoE-Infinity
+
+3.73
+
+1.25
+
+3.79
+
+1.24
+
+In Table
+11
+, we consider the same settings and resource constraints highlighted in Sections
+4.1
+and
+4.2
+. We find that even when the fine-tuning dataset and downstream task differ fundamentally, the throughput improvements relative to prior baselines persist but are partially dampened. For example, when evaluated on a holdout of Dolly15K, Phi-3.5-MoE fine-tuned exclusively on GSM8K still achieves
+10.44
+tokens/s,
+1.86
+tokens/s greater than Mixtral-Offloading, the next best baseline. However, this is still slower than the
+14.34
+tokens/s achieved when Phi-3.5-MoE is fine-tuned on Dolly15K itself. Mixtral-8x7B can remarkably achieve
+8.21
+tokens/s when fine-tuned on GSM8K and evaluated on a holdout of Dolly15K, only
+1.14
+tokens/s less than when it is fine-tuned on Dolly15K. Similarly, when Mixtral-8x7B is fine-tuned on Dolly15K, its decoding throughput is only
+2.13
+tokens/s less on GSM8K then a model fine-tuned on in-distribution data. This suggests that the improvements present in
+melinoe
+are largely preserved even when the resource-constrained device in question has a particularly different local data distribution. We hope that future work can better demonstrate
+melinoe
+’s generalizability on various downstream tasks by performing more diverse pre-deployment fine-tuning and downstream evaluation.
+
+D.2  Effect of Output Generation Length on Throughput
+
+Figure 6
+:
+Throughput of baselines with various output lengths using OLMoE on the H100 setup with 3GB of VRAM.
+
+As output length increases,
+melinoe
+maintains stable throughput (Figure
+6
+), which suggests that the fine-tuned model’s expert preferences endure even in longer generations. In this regime, memory-efficiency becomes increasingly critical as the KV cache grows with the number of generated tokens, leaving less room for resident experts. Despite this,
+melinoe
+sustains near constant tokens/s, indicating that its routing stability reduces cache churn over long decoding horizons.
+
+D.3  Impact of Fine-Tuning on Expert Routing
+
+Figure 7
+:
+Activations of experts for a single sequence in the first
+10
+layers of OLMoE.
+
+Figure 8
+:
+Activations of experts for a single sequence in the first
+10
+layers of Phi-3.5-MoE.
+
+Figure 9
+:
+Activations of experts for a single sequence in the first
+10
+layers of Mixtral-8x7B.
+
+Figure 10
+:
+Activations of experts for
+8
+different sequences in layer
+0
+of OLMoE.
+
+Figures
+7
+,
+8
+, and
+9
+demonstrate the effects of fine-tuning on expert activations for OLMoE, Phi-3.5-MoE, and Mixtral-8x7B, respectively. Across all model architectures, fine-tuning skews activations towards a few highly preferred experts, justifying fine-tuning as a meaningful approach to make routing more predictable for MoE models. Additionally, Figure
+10
+demonstrates that routing still remains diverse across multiple sequences, suggesting that the combined effect of the fine-tuning procedure presented in
+melinoe
+is to create sequence-specific skew but retain global expert usage diversity.
+
+D.4  Ablation on GPU VRAM Budget
+
+Figure 11
+:
+Throughput of baselines under GPU VRAM restrictions on H100 across three MoE models.
+
+Figure
+11
+displays the impact of GPU VRAM on decoding throughput. Across all VRAM budgets,
+melinoe
+outperforms prior offloading baselines, demonstrating its robustness across a diverse array of downstream deployments.
+
+D.5  Ablation on Quantized Experts
+
+Table 12
+:
+Impact of quantized experts for OLMoE. We report the number of GPU experts per layer and decoding throughput (tokens/s).
+
+Dolly15K
+
+GSM8K
+
+GPU-Resident
+
+Experts / Layer
+
+Throughput
+
+GPU-Resident
+
+Experts / Layer
+
+Throughput
+
+Base Model
+
+8
+
+13.98
+
+8
+
+13.66
+
+Base Model + Quantized Experts
+
+24
+
+15.80
+
+24
+
+17.95
+
+Fine-Tuned Model
+
+8
+
+22.77
+
+8
+
+19.89
+
+Fine-Tuned Model + Quantized Experts
+
+24
+
+25.99
+
+24
+
+28.59
+
+Quantizing experts to
+HQQ INT4
+allows more experts to remain in GPU VRAM. In Table
+12
+, we analyze the effects of quantization on throughput. Each setting has roughly equal GPU VRAM usage. Quantization improves throughput, but its benefit is not proportional to the increase in resident experts due to compute overhead. The fine-tuned model with
+8
+resident experts has greater throughput than the quantized base model with
+24
+resident experts.
+
+D.6  Ablation on Soft Cache Capacity in Loss
+
+Figure 12
+:
+Transfers per layer with fine-tuned model using different soft cache capacities (OLMoE, 64 output tokens).
+
+In Figure
+12
+, we evaluate the effect of the soft cache capacity used in fine-tuning on the average number of transfers per layer in the downstream evaluation. We consider three different cache budgets during evaluation,
+C=16
+,
+C=32
+, and
+C=48
+. Performance is noticeably worse when the soft cache capacity is set too low as transfers are dominated by forced evictions, making subtle routing choices more difficult to learn. There is also a slight degradation in the number of transfers when the soft cache budget is set too high as few transfers occur in this regime so transfer penalties remain limited.
+
+D.7  Ablation on Loss Function Decay Factor
+
+Figure 13
+:
+Transfers per layer with fine-tuned model using different
+\gamma
+decay factors (OLMoE, 64 output tokens).
+
+Figure
+13
+studies the decay factor
+\gamma
+used in the cache simulation loss, which controls how long past expert usage is factored into current eviction decisions. We find that transfers are high when
+\gamma
+is too small but decrease rapidly as
+\gamma
+increases across all cache budgets. Thus, overly aggressive decay makes routing decisions too myopic when using an LFU eviction policy.
+
+D.8  Ablation on Cache Eviction Policy
+
+Table 13
+:
+Transfers per layer for OLMoE under different decay factors
+\gamma
+and different eviction policies during inference.
+
+LRU Eviction Policy
+
+LFU Eviction Policy
+
+Fine-Tuned w/
+\gamma=0.1
+
+314
+
+329
+
+Fine-Tuned w/
+\gamma=0.3
+
+287
+
+294
+
+Fine-Tuned w/
+\gamma=0.5
+
+262
+
+252
+
+Fine-Tuned w/
+\gamma=0.7
+
+264
+
+255
+
+Fine-Tuned w/
+\gamma=0.9
+
+262
+
+253
+
+Finally, in Table
+13
+, we quantify the impact of the cache eviction policy on the number of transfers per layer. For smaller values of
+\gamma
+, an LRU policy results in fewer cache transfers as the model was fine-tuned with a more reactive cache simulation loss. However, using a larger
+\gamma
+with an LFU policy results in the fewest number of transfers overall.
+

@@ -1,0 +1,2053 @@
+XShare: Collaborative in-Batch Expert Sharing for Faster MoE Inference
+Daniil Vankov, Nikita Ivkin, Kyle Ulrich, Xiang Song, Ashish Khetan, George Karypis
+
+Abstract
+Mixture-of-Experts (MoE) architectures are increasingly used to efficiently scale large language models. However, in production inference, request batching and speculative decoding significantly amplify expert activation, eroding these efficiency benefits. We address this issue by modeling batch-aware expert selection as a modular optimization problem and designing efficient greedy algorithms for different deployment settings. The proposed method, namely XShare , requires no retraining and dynamically adapts to each batch by maximizing the total gating score of selected experts. It reduces expert activation by up to 30% under standard batching, cuts peak GPU load by up to 3x in expert-parallel deployments, and achieves up to 14% throughput gains in speculative decoding via hierarchical, correlation-aware expert selection even if requests in a batch drawn from heterogeneous datasets.
+
+
+
+1
+Introduction
+
+Mixture-of-Experts (MoE) architectures have emerged as a powerful paradigm for scaling neural networks to unprecedented sizes while maintaining computational efficiency during training. The key insight, introduced by
+17
+, is to replace feed-forward layers with a collection of fully connected networks, where only a sparse subset is activated for each input token. This conditional computation approach fundamentally changes the scaling characteristics of neural networks: by decoupling total model capacity (parameters) from per-token computation (FLOPs), MoE models achieve dramatically better performance-to-FLOPs ratios compared to dense models. Recent work on scaling laws for MoE models
+(
+1
+)
+demonstrates that for a fixed computational budget, sparse MoE models with 10-100
+\times
+more parameters than their dense counterparts can achieve superior accuracy while maintaining similar training costs. For instance, Switch Transformers
+(
+5
+)
+scale to trillion-parameter models while requiring only a fraction of the FLOPs needed to train equivalent-quality dense models. This favorable parameter-to-FLOPs trade-off during training has made MoE the architecture of choice for state-of-the-art large language models, with architectures like GShard
+(
+9
+)
+successfully demonstrating that sparse expert activation enables efficient training of models at unprecedented scales.
+
+However, the training-time efficiency gains of MoE architectures do not directly translate to inference-time efficiency in production serving systems. Production LLM serving systems can be categorized by their optimization objective:
+latency-optimized
+systems minimize per-request latency (typically using batch size 1),
+throughput-optimized
+systems maximize requests per second, and
+goodput-optimized
+systems maximize throughput subject to service level objectives for latency. Our work primarily targets goodput-optimized deployments, which must balance batching for hardware efficiency against latency constraints. These systems introduce two key challenges that make MoE inference inefficient. First, to maximize hardware utilization and amortize the cost of memory transfers, serving systems batch multiple requests together. While each individual token activates only
+k
+experts (typically from
+k=1
+,
+k=4
+, or
+k=8
+), the union of experts activated across all tokens in a batch grows substantially with batch size. Second, virtually all modern serving systems employ speculative decoding to improve throughput, where a small draft model generates candidate tokens that are verified in parallel by the target model. For a speculative length of
+s
+, each request effectively multiplies the batch size by
+(s+1)
+: a batch of
+B
+requests becomes
+B(s+1)
+tokens that must be processed simultaneously. The combination of request batching and speculative decoding results in expert activation patterns, where, for moderate batch sizes, the majority of experts must be loaded into memory, and for large batches, nearly all experts are activated.
+To quantify this effect, the expected number of activated experts in a batch follows
+
+\mathbb{E}[N_{a}]=N\left(1-(1-k/N)^{B}\right),
+
+where
+N
+is the total number of experts,
+k
+is the top-
+k
+routing, and
+B
+is the effective batch size (including speculative tokens). For DeepSeek-R1 (
+N=256
+,
+k=8
+), this predicts that at batch size 8, approximately 57 experts are activated, and at batch size 32, approximately 163 experts—closely matching our empirical observations. With speculative decoding of length
+s
+, the effective batch becomes
+B(s+1)
+, further accelerating expert activation growth.
+While a sparse MoE model remains computationally more efficient than a dense model with equivalent parameters (only activated experts consume FLOPs), the memory bandwidth bottleneck dominates during the autoregressive decode phase: all activated experts must be loaded from memory regardless of their utilization, making inference memory-IO-bound rather than compute-bound.
+
+Figure 1
+:
+Average number of activated experts
+
+Recent interpretability work on MoE models
+(
+20
+)
+demonstrates that stronger models achieve better performance with lower neuron utilization — suggesting that efficient sparse activation is a hallmark of model quality rather than a compromise. However, these insights have not been translated into practical inference optimization strategies that can dynamically adapt expert selection to batch characteristics.
+
+Related works.
+Traditional network pruning techniques such as MetaPruning
+(
+12
+)
+and BilevelPruning
+(
+6
+)
+have been adapted to MoE architectures. More recently,
+11
+demonstrates that not all experts contribute equally to model accuracy, enabling aggressive static pruning of less important experts. DiEP
+(
+3
+)
+advances this direction by learning non-uniform pruning ratios across layers.
+19
+proposes MoE-Pruner, which uses router-weighted pruning metrics for one-shot weight-level pruning on calibration data, but produces static pruning decisions dependent on the calibration datasets and requires knowledge distillation to recover from moderate accuracy degradation. While these methods reduce the total parameter count, they require retraining or fine-tuning and produce fixed, static pruning decisions that cannot adapt to different workload characteristics or speculative decoding patterns.
+
+Most closely related to our work,
+13
+proposes Dynamic Skipping method, which operates at the token level, skipping expert
+e_{1}
+if
+w_{e_{1}}<\beta w_{e_{0}}
+, where
+\beta
+is calibrated per-layer.
+Intuitively, an expert is skipped when there is a large diminishing return, reflected by a sharp drop in gating scores between consecutively ranked experts.
+However, it processes each token independently and does not account for batch composition, so the batch-level expert explosion problem in production remains unresolved.
+
+In contrast, Lynx
+(
+7
+)
+was the first to recognize the batch-level expert explosion problem and to propose a batch-aware expert selection policy, LYNX-Lat.
+LYNX-Lat aggregates per-token expert preferences across a batch to identify the least-used experts, then drops a fixed, pre-selected number of them. The number of experts dropped is determined offline by tuning the accuracy–performance tradeoff. However, dropping the least frequently used experts ignores how important those experts were when they were selected (e.g., their rank for the tokens that used them). As a result, it can remove highly ranked experts for some tokens and severely hurt accuracy. Authors describe this policy at a conceptual level, without providing precise algorithms or pseudocode, making the approach difficult to reproduce or directly compare against.
+
+During the preparation of this manuscript, we became aware of concurrent work by
+14
+where authors propose building a shared pool of candidate experts by taking the top-
+k^{\prime}
+experts (with
+k^{\prime}<k
+) for each token, then filling the remaining
+(k-k^{\prime})
+slots by reusing experts from that pool — i.e. piggybacking on experts already selected by other tokens in the batch. The idea of creating a shared pool of top
+k^{\prime}
+is similar to Warm-up routine which we implemented in Algorithm
+2
+. However,
+14
+selected the experts for the shared pool based on individual token preferences, so its usefulness for other tokens is often limited, thus can hurt the accuracy.
+
+Core idea.
+Our method is motivated by the observation that expert selection should be optimized for the batch as a whole rather than on a per-token basis. We first aggregate gating scores across all tokens and select the top-
+K
+experts according to this batch-level utility. This selected subset then constrains per-token routing, from which each token chooses its own top-
+k
+experts as it depicted on the Figure
+2
+. Our approach further extends to production-critical settings: expert-parallel deployments across GPUs and speculative decoding,
+which existing methods do not address.
+
+Figure 2
+:
+Batch utility expert pruning
+
+Our Contributions.
+In this paper, we mathematically formulate the batch-aware expert selection problem, reduce it to a modular optimization problem, and propose efficient inference-time pruning methods tailored to different deployment scenarios:
+
+1.
+
+We formulate expert selection as maximizing a modular proxy objective (sum of gating scores) under cardinality constraints, enabling efficient greedy optimization with theoretical guarantees.
+
+2.
+
+We develop a practical three-step algorithm (warm-up, greedy optimization, refinement) that requires no retraining and adapts dynamically to each batch. It reduces number of activated experts by up to 30% and improves end-to-end OTPS by up to 13%, while maintaining accuracy within 1% drop.
+
+3.
+
+In speculative decoding scenarios, we demonstrate and exploit strong expert-preference correlation among speculative tokens via novel hierarchical expert selection approach, providing speedups up to 14%. We show that our method remains robust under mixed-dataset evaluation, where requests originate from different datasets.
+
+4.
+
+For expert parallel (EP) deployments, we propose an EP-aware greedy algorithm that minimizes the maximum per-GPU load. It reduces peak GPU load from 25.6 to 8.6 experts (3
+\times
+improvement) while preserving the accuracy.
+
+2
+Preliminaries
+
+We consider a pre-trained Large Language Model (LLM) incorporating Mixture-of-Experts (MoE) layers.
+This section formalizes the MoE layer operation during the inference phase, assuming all model parameters are fixed.
+
+2.1
+MoE Layer Definition
+
+Let
+x\in\mathbb{R}^{d}
+denote the input hidden state corresponding to a specific token, where
+d
+is the model dimension. An MoE layer consists of a set of
+N
+routing expert networks
+\{E_{i}\}_{i=1}^{N}
+and
+N_{s}
+shared expert networks
+\{{E^{s}_{i}(x)}\}_{i=1}^{N_{s}}
+, where each expert
+E_{i}:\mathbb{R}^{d}\to\mathbb{R}^{d}
+is typically a feed-forward neural network (FFN).
+
+The output of an MoE layer,
+y\in\mathbb{R}^{d}
+, is a weighted sum of outputs of experts, mediated by a gating network. Formally, the output is defined as:
+
+y=\sum_{i=1}^{N}g_{i}(x)\cdot E_{i}(x)+\sum_{j=1}^{N_{s}}E^{s}_{j}(x)
+
+where
+g(x)\in\mathbb{R}^{N}
+is the output of the gating function, and
+g_{i}(x)
+represents the scalar gating value (or confidence score) assigned to expert
+i
+for input
+x
+.
+
+2.2
+Gating and Routing Mechanism
+
+The gating network determines the routing strategy, i.e. which experts are activated and how their outputs are weighted. In modern sparse MoE architectures (e.g., GShard, Switch Transformer, Mixtral), a Top-
+k
+routing mechanism is employed to enforce sparsity.
+
+Let
+W_{g}\in\mathbb{R}^{N\times d}
+be the trainable weight matrix of the router. It first computes the raw routing logits
+h(x)=W_{g}x
+. To ensure sparse activation, it selects the top
+k
+indices with the highest logits, denoted by the set
+\mathcal{T}
+. The gating values
+g(x)
+are computed as follows:
+
+\displaystyle g_{i}(x)=
+
+\displaystyle\begin{cases}\bar{g}_{i}(x)&\text{if }g_{i}(x)\in{\rm{Top}}k(g(x))\\
+0&\text{otherwise}\end{cases},
+
+\displaystyle\bar{g}_{i}(x)=
+
+\displaystyle\frac{\exp(h_{i}(x))}{\sum_{j\in\mathcal{T}}\exp(h_{j}(x))}.
+
+Here,
+k\ll N
+(typically from
+k=1
+,
+k=4
+, or
+k=8
+), ensuring that the majority of
+g_{i}(x)
+are zeros. During inference, this sparsity allows the model to bypass the computation of
+E_{i}(x)
+for all
+i\notin\mathcal{T}
+, significantly reducing Floating Point Operations (FLOPs) while maintaining high model capacity.
+
+2.3
+Inference Setting
+
+In the inference setting, we assume the parameters of the experts
+\{E_{i}\}
+and the gating weights
+W_{g}
+are frozen. The problem of efficient MoE inference reduces to identifying the set
+\mathcal{T}
+and
+retrieving the specific expert weights for computation
+.
+
+Decoding Phase Focus.
+Our methods target the autoregressive
+decoding phase
+of LLM inference, where the model generates output tokens one at a time. During this phase, the model operates in a memory-bandwidth-bound regime, making expert activation patterns particularly critical. In contrast, the prefill (prompt processing) phase typically processes a single long sequence and already exhibits high expert activation due to the diversity of tokens in the prompt. The decoding phase, however, processes multiple independent sequences in a batch, each generating one token at a time, which is where batching and speculative decoding dramatically increase expert activation and where our optimization provides the most benefit.
+
+3
+Problem Formulation
+
+In this section, we formalize the
+batch-aware expert selection problem
+and develop an efficient algorithm with theoretical guarantees.
+
+3.1
+Batch-Level Expert Activation
+
+Consider a batch
+B=\{x_{1},\ldots,x_{n}\}
+of
+n
+tokens arriving at the model during the decode phase. At each MoE layer
+l~\in~\{1,\ldots,L\}
+, for each token
+x_{i}
+, the router produces scores
+G_{i}^{(l)}=(g_{i,1}^{(l)},\ldots,g_{i,N}^{(l)})
+over the
+N
+experts, where
+g_{i,j}^{(l)}~=~g_{j}^{(l)}(x_{i})
+denotes the gating score for expert
+j
+at layer
+l
+. Under standard top-
+k
+token routing, each token activates its
+k
+highest-scoring experts per layer. However, across the batch, the
+union
+of activated experts can be much larger than
+k
+:
+
+\left|\bigcup_{i=1}^{n}\text{TopK}(G_{i}^{(l)})\right|\gg k\quad\text{for moderate }n.
+
+As shown in Section
+1
+, this union grows to 62% and 95% of all experts for batch sizes 32 and 64, respectively.
+
+Although the model remains computationally sparse (each token still activates only
+k
+experts), the large fraction of activated experts must be loaded into memory, creating a memory-IO bottleneck that dominates inference latency during the decode phase.
+
+3.2
+Optimization Objective
+
+Our goal is to select small subsets of experts
+S_{l}\subseteq E
+for each layer
+l
+such that routing each token to its top-
+k
+experts
+within
+
+S_{l}
+preserves model accuracy, while keeping the total number of activated experts across all layers small. Formally, given a batch
+B
+, we seek:
+
+\displaystyle\max_{S_{1},\ldots,S_{L}\subseteq E}
+
+\displaystyle\text{Accuracy}\bigl(f(S_{1},\ldots,S_{L};B)\bigr)
+
+(1)
+
+\displaystyle\text{s.t.}
+
+\displaystyle\sum_{l=1}^{L}|S_{l}|\leq K,
+
+where
+f(S_{1},\ldots,S_{L};B)
+denotes the model output when layer
+l
+is restricted to expert set
+S_{l}
+, and
+K\ll L\cdot N
+is the global expert budget across all layers.
+
+Problem (
+1
+) is intractable for two reasons: (i) the search space is combinatorial with
+2^{N\cdot L}
+possible configurations, and (ii) evaluating accuracy requires a complete forward pass through the model, which is infeasible during inference. We therefore develop a proxy objective that can be optimized efficiently.
+
+Assumption 3.1
+(Router Score Reliability)
+
+The router’s gating scores
+G_{i}^{(l)}
+accurately reflects expert importance for token
+x_{i}
+at layer
+l
+. That is, experts with higher gating scores contribute more to the model’s output quality.
+
+This assumption is well-supported by prior work. The router is trained end-to-end to select experts that maximize model performance, so high gating scores indicate experts the model deems most relevant. Empirically,
+7
+demonstrates that top-ranked experts contribute the majority of accuracy, while lower-ranked experts provide diminishing returns.
+
+Note that MoE layer was trained in assumption to activate uniform number of experts on each layer, thus we can consider each layer in isolation and following the Assumption
+3.1
+we can rewrite the optimization problem (
+1
+) as its per-layer proxy:
+
+\displaystyle\max_{S_{l}\subseteq E}
+
+\displaystyle f_{l}(S_{l};G^{(l)})=\sum_{j\in S_{l}}\sum_{i=1}^{n}g_{i,j}^{(l)}
+
+(2)
+
+\displaystyle\text{s.t.}
+
+\displaystyle|S_{l}|\leq m_{l}.
+
+In practice, we use a uniform budget allocation
+m_{l}=K/L
+(described in Section
+3.4
+), instead of a threshold-based approach that adaptively determines
+|S_{l}|
+based on the total sum of gating scores at each layer.
+
+3.3
+Modularity and Optimal Greedy Solution
+
+A key property of the per-layer proxy objective enables efficient optimization:
+
+Proposition 3.2
+(Modularity of
+f_{l}
+)
+
+For each layer
+l
+, the function
+f_{l}(S_{l};G^{(l)})
+is modular. That is, for any subset of experts
+S\subseteq E
+and expert
+e\in E\setminus S
+:
+
+f_{l}(S\cup\{e\};G^{(l)})-f_{l}(S;G^{(l)})=f_{l}(\{e\};G^{(l)})=\sum_{i=1}^{n}g_{i,e}^{(l)},
+
+independent of
+S
+.
+
+By definition,
+f_{l}(S;G^{(l)})=\sum_{j\in S}\sum_{i=1}^{n}g_{i,j}^{(l)}
+, thus adding expert
+e
+contributes exactly
+\sum_{i=1}^{n}g_{i,e}^{(l)}
+, regardless of which other experts are in
+S
+.
+
+Modularity implies that the marginal gain from adding any expert is independent of the set of experts that are already included. Consequently, the greedy algorithm, which iteratively adds the expert with maximum marginal gain, produces an
+optimal
+solution to each per-layer subproblem (
+2
+).
+
+Corollary 3.3
+
+At each layer
+l
+, sorting experts by their total sum of gating scores
+\sum_{i=1}^{n}g_{i,j}^{(l)}
+and selecting the top
+m_{l}
+yields an optimal solution to (
+2
+).
+
+Since the main objective (
+1
+) decomposes across layers and each per-layer subproblem can be solved optimally, the combination of per-layer solutions is optimal for the global proxy problem (given a fixed per-layer budget allocation). Our algorithm requires one additional top-
+k
+call, which is negligible in a memory-bound regime.
+
+3.4
+Practical Algorithm
+
+Now we introduce a practical implementation of the greedy method which is applied to each layer
+l
+independently during inference.
+
+Algorithm 1
+
+Greedy Expert Selection (Per-Layer)
+
+0:
+
+Experts
+E
+, router scores
+G^{(l)}
+for layer
+l
+,           threshold
+\tau
+, initial set
+S_{0}
+
+S\leftarrow S_{0}
+
+## Precompute expert scores for entire batch B
+
+\textit{scores}[j]\leftarrow\sum_{i=1}^{n}g_{i,j}^{(l)}
+for all
+j\in E
+
+while
+
+f_{l}(S;P^{(l)})<\tau\cdot f_{l}(E;g^{(l)})
+
+do
+
+e^{*}\leftarrow\argmax_{e\in E\setminus S}\textit{scores}[e]
+
+S\leftarrow S\cup\{e^{*}\}
+
+end
+
+while
+
+return
+
+S
+
+While Corollary
+3.3
+provides an optimal solution to the proxy problem, we find that a variant of Algorithm
+1
+with a fixed per-layer budget
+and warm-up initialization performs better in practice.
+
+Warm-up initialization.
+We initialize
+S_{0}
+with the top-1 (or top-
+k_{0}
+) experts for each token, ensuring that every token’s highest-confidence expert is always included. This guarantees a baseline level of per-token quality before optimizing for batch-level efficiency.
+
+Refinement step.
+After selecting the expert subset
+S_{l}
+at layer
+l
+, we route each token to its top-
+k
+experts
+within
+
+S_{l}
+. This refinement ensures that the final routing respects the original top-
+k
+constraint while restricting choices to the optimized subset.
+
+During inference, Algorithm
+2
+is applied at each MoE layer
+l\in\{1,\ldots,L\}
+as the batch propagates through the network.
+
+Algorithm 2
+
+Batch-Aware Expert Selection (Per-Layer)
+
+0:
+
+Experts
+E
+, batch
+B
+, router scores
+G^{(l)}
+,           budget
+m_{l}
+, warm-up
+k_{0}
+
+## Warm-up: include top-
+k_{0}
+experts per token
+
+S_{0}\leftarrow\bigcup_{i=1}^{n}\text{Top}\,{k_{0}}(G_{i}^{(l)},E)
+
+S_{l}\leftarrow\textsc{GreedySelect}(E,G^{(l)},m_{l},S_{0})
+# Algorithm
+1
+
+for
+each token
+x_{i}\in B
+
+do
+
+## Refinement: top-
+k
+within selected set
+
+Route
+x_{i}
+to
+\text{Top}\,k(G_{i}^{(l)},S_{l})
+
+end
+
+for
+
+4
+Speculative Decoding Aware Pruning
+
+Speculative decoding has become a standard technique in modern LLM serving systems to improve throughput. In this approach, a small draft model generates multiple candidate tokens (typically 3–5) that are verified in parallel by the target model.
+While speculative decoding significantly improves token generation rate, it also worsens the expert activation problem: for a batch of
+b
+requests with speculative length
+L_{s}
+, the effective batch size becomes
+b\times(1+L_{s})
+.
+For instance, with 8 requests and 3 speculative tokens, the model must process 32 tokens simultaneously, dramatically increasing the number of activated experts.
+
+However, speculative decoding also presents an opportunity: speculative tokens from the same request exhibit strong correlation in their expert preferences, as they represent consecutive steps in the same generation sequence.
+This correlation can be exploited to further reduce expert activation.
+We demonstrate this via the following experiment: we measure the size of the overlap between the top-
+k
+selected experts (
+|E_{i}\cap E_{j}|
+) on Figure
+3
+.
+As observed, the overlap in expert selection between consecutive speculative tokens is often 2–3× larger than that between two independent tokens drawn from the same dataset.
+
+Figure 3
+:
+Overlap between the top-
+k
+(
+k=5,10,15,30
+) experts (
+|E_{i}\cap E_{j}|
+) for (1) two speculative tokens; (2) two tokens from the same dataset; and (3) two tokens from different datasets.
+
+Assumption 4.1
+(Intra-Request Correlation)
+
+Tokens within the same request exhibit correlated expert preferences: if expert
+e
+has high gating scores for token
+x_{r}^{(0)}
+, it is likely to have high scores for
+x_{r}^{(1)},\ldots,x_{r}^{(L_{s})}
+as well.
+
+4.1
+Hierarchical Proxy for Speculative Decoding
+
+Consider a batch
+B=\{r_{1},\ldots,r_{b}\}
+of
+b
+requests, where each request
+r
+contains
+(1+L_{s})
+tokens:
+L_{s}
+speculative tokens and one generating token.
+Let
+T_{r}~=~\{x_{r}^{(0)},x_{r}^{(1)},\ldots,x_{r}^{(L_{s})}\}
+denote the set of tokens belonging to request
+r
+. The total number of tokens is
+n=b\cdot(1+L_{s})
+. Similar to Section
+3
+we aim to solve optimization problem
+1
+, given that expert preferences within same request have higher correlation than between requests.
+
+We propose a hierarchical proxy that exploits the correlation structure within requests. For a subset
+S
+at layer
+l
+and request
+r
+, define the per-request proxy:
+
+f_{l}(S;G^{(l)};r)=\sum_{x\in T_{r}}\sum_{j\in S}g_{x,j}^{(l)},
+
+(3)
+
+which measures the total gating score captured by
+S
+for all tokens in request
+r
+. Then, the batch-level proxy decomposes as:
+
+f_{\text{spec}}(S;G^{(l)})=\sum_{r\in B}f_{l}(S;G^{(l)},r)=\sum_{r\in B}\sum_{x\in T_{r}}\sum_{j\in S}g_{x,j}^{(l)}.
+
+(4)
+
+Under Assumption
+4.1
+, optimizing
+f_{l}(S;G^{(l)};r)
+for each request separately before combining results is more efficient than direct batch-level optimization, as it exploits the shared structure among speculative tokens.
+Based on these observations, we propose Algorithm
+3
+which performs per-request expert greedy selection and Algorithm
+4
+which combines per-request greedy selection with batch-level aggregation.
+
+Algorithm 3
+
+Per-Request Expert Greedy Selection
+
+0:
+
+Request
+r
+with tokens
+T_{r}
+, router scores
+G^{(l)}
+,            per-request budget
+m_{r}
+, warm-up
+k_{0}
+
+## Warm-up: top-
+k_{0}
+per token
+
+S_{0}\leftarrow\bigcup_{x\in T_{r}}\text{Top}\,k_{0}(G_{x}^{(l)})
+
+## Aggregate scores across request
+
+\textit{scores}[j]\leftarrow\sum_{x\in T_{r}}g_{x,j}^{(l)}
+for all
+j\in E
+
+## Add top experts to reach per-request budget
+
+S_{r}\leftarrow S_{0}\cup\text{Top}\;{m_{r}}(\textit{scores},E\setminus S_{0})
+
+return
+
+S_{r}
+
+Algorithm 4
+
+Speculative Decoding Aware Expert Selection
+
+0:
+
+Batch
+B
+, router scores
+G^{(l)}
+, batch budget
+m
+,            per-request budget
+m_{r}
+, warm-up
+k_{0}
+
+for
+each request
+r\in B
+
+do
+
+## Calling Algorithm
+3
+
+S_{r}\leftarrow\textsc{PerRequestSelect}(r,G^{(l)},m_{r},k_{0})
+
+end
+
+for
+
+## Aggregate per-request selections
+
+S_{\text{batch}}\leftarrow\bigcup_{r\in B}S_{r}
+
+## Calling Algorithm
+1
+
+S_{\text{batch}}\leftarrow\textsc{GreedySelect}(E,G^{(l)},m_{l},S_{\text{batch}})
+
+for
+each token
+x_{i}\in B
+
+do
+
+## Refinement: top-
+k
+within selected set
+
+Route
+x_{i}
+to
+\text{Top}\,k(G_{i}^{(l)},S_{\text{batch}})
+
+end
+
+for
+
+return
+
+S_{\text{batch}}
+
+The hierarchical approach efficiently exploits the correlation among speculative tokens: since tokens from the same request share context, their expert preferences overlap significantly, allowing a small per-request budget
+m_{r}
+(typically 4–5 experts) to capture most of the gating mass.
+
+Our experiments in Section
+6
+show that this approach achieves up to 14% throughput improvement on GPT-OSS 120B with speculative length 3, while maintaining accuracy within statistical noise of the baseline.
+
+5
+Experts Selection for Multi-GPU Inference
+
+Algorithm 5
+
+GPU-Aware Greedy Expert Selection
+
+0:
+
+Experts per GPU
+E_{1},\ldots,E_{G}
+, router scores
+G^{(l)}
+,            per-GPU budget
+m_{g}
+, initial subset
+S_{0}
+
+S\leftarrow S_{0}
+
+while
+
+|S|<m_{g}\cdot G
+
+do
+
+for
+
+g\in 1,\ldots,G
+
+do
+
+## Best expert on GPU
+g
+
+e^{*}\leftarrow\argmax_{E_{g}\setminus S}[f(S\cup\{e\};G^{(l)})-f(S;G^{(l)})]
+
+S\leftarrow S\cup\{e^{*}\}
+
+end
+
+for
+
+end
+
+while
+
+return
+
+S
+
+Algorithm 6
+
+Expert Parallelism Aware Selection
+
+0:
+
+Experts per GPU
+E_{1},\ldots,E_{G}
+, router scores
+G^{(l)}
+,            batch
+B
+, per-GPU budget
+m_{g}
+, warm-up
+k_{0}
+
+## Warm-up: top-
+k_{0}
+per token
+
+S_{0}\leftarrow\bigcup_{x\in B}\text{Top}_{k_{0}}(G_{x}^{(l)})
+
+## Calling Algorithm
+5
+
+S\leftarrow\textsc{GPUAwareGreedy}(E_{1},\ldots,E_{G},G^{(l)},m_{g},S_{0})
+
+for
+each token
+x_{i}\in B
+
+do
+
+## Refinement: top-
+k
+within selected set
+
+Route
+x_{i}
+to
+\text{Top}_{k}(G_{i}^{(l)},S)
+
+end
+
+for
+
+return
+
+S
+
+Expert parallelism (EP) is another promissing technique to scale MoE model training across multiple GPUs. Recently, LLM serving systems such as vLLM and SGLang integrated EP into thier platform to accelerate inference on multiple GPUs.
+In this approach, experts are partitioned across
+G
+GPU groups, with each group
+g
+hosting a subset of experts
+E_{g}\subseteq E
+.
+While expert parallelism enables serving large MoE models that exceed single-GPU memory, it introduces a load balancing challenge: the inference latency for each layer is determined by the GPU with the largest number of activated experts, as all GPUs must synchronize after processing.
+
+However, expert parallelism also presents an optimization opportunity: by considering the GPU placement of experts during selection, we can balance the load across GPUs while maintaining model quality. This is particularly important for production deployments where consistent latency is critical.
+
+5.1
+GPU-Aware Proxy Function
+
+Consider a system with
+G
+GPU groups, where GPU group
+g
+hosts experts
+E_{g}
+. The experts form a partition:
+E~=~\bigcup_{g=1}^{G}E_{g}
+with
+E_{g}\cap E_{g^{\prime}}=\emptyset
+for
+g\neq g^{\prime}
+. For a batch
+B
+with router scores
+G^{(l)}
+at layer
+l
+, we define the per-GPU load for subset
+S
+:
+\text{Load}_{g}(S)=|S\cap E_{g}|
+,
+
+which counts the number of selected experts on GPU
+g
+. The bottleneck load is:
+
+\text{MaxLoad}(S)=\max_{g\in\{1,\ldots,G\}}\text{Load}_{g}(S).
+
+We maximize our proxy
+f(S;G^{(l)})
+while minimizing the bottleneck load, thus GPU-aware optimization problem is:
+
+\max_{S\subseteq E}f(S;G^{(l)})\quad\text{s.t.}\quad\text{MaxLoad}(S)\leq m_{\text{gpu}},
+
+(5)
+
+where
+m_{\text{gpu}}
+is the per-GPU budget.
+
+Standard greedy selection (Algorithm
+1
+) can overload a few GPUs with high-scoring experts, while GPU-aware selection trades off gating score to achieve balanced load and lower latency. We modify our greedy approach to select experts per GPU.
+At each iteration, instead of selecting the globally best expert, we select the best expert for each GPU group in turn. This ensures that no single GPU accumulates disproportionately many experts. Based on this insight, we propose Algorithm
+5
+which performs GPU-balanced greedy selection and Algorithm
+6
+which combines warm-up initialization with GPU-aware optimization.
+
+Algorithm
+5
+enforces balanced load by design: after
+G
+iterations, each GPU has at most one more expert than any other GPU, ensuring
+\text{MaxLoad}(S)\leq\lceil|S|/G\rceil
+. As previously, it still prioritizes high-scoring experts within each GPU, thus maintaining quality.
+
+6
+Experiments
+
+We evaluate all our methods across multiple models (DSR1, GPT-OSS 120B), datasets (AIME2025, GPQA, MMLU-Pro, IFEval, AA-LCR), and deployment scenarios (minimal, speculative decoding, expert parallelism). For details on experimental setup and baselines refer to Appendix
+A
+.
+
+Figure 4
+:
+Trade-off between OTPS improvement and accuracy degradation across three datatsets for GPT-OSS 120B (BS=16, speculations off). Each datapoint is accompanied with the pair of parameters defining the algorithm settings (budget
+m_{l}
+, warm-up
+k_{0}
+).
+
+6.1
+Minimal Settings - Single GPU, No Speculation
+
+We first present experiments in the simplest setting, where the model is hosted on a single GPU and speculative decoding is disabled. We evaluate GPT-OSS-120B using a moderate batch size of 16, which provides a favorable trade-off between latency and cost.
+Figure
+4
+shows the trade-off between OTPS improvement and accuracy degradation across three reasoning benchmarks. Two configurations of Algorithm
+2
+consistently achieve throughput gains while keeping accuracy within the 1% tolerance threshold across all datasets:
+(m_{l}=24,k_{0}=1)
+delivers 7 -13% OTPS improvement, and
+(12,2)
+provides 6 - 7% improvement while actually improving accuracy on all three benchmarks. Looking at the Pareto frontier, four configurations
+(0,2)
+,
+(0,1)
+,
+(12,1)
+, and
+(12,2)
+consistently represent optimal trade-off points between throughput and accuracy across datasets.
+
+The most aggressive setting
+(0,1)
+relies solely on the warm-up set, achieves the best speedup of 50%, however it comes with a drastic accuracy loss (
+-10.83\%
+on AIME2025) . This suggests that warm-up-only expert selection fails to capture the expert utilization patterns required for complex reasoning. Selecting experts that maximize total gating score recovers much of the accuracy loss while retaining meaningful throughput gains. In practice, users should select configurations based on their accuracy tolerance. For full tables with experiments and number of activated experts refer to Appendix
+B
+.
+
+Figure 5
+:
+Trade-off between OTPS improvement and accuracy degradation across three datatsets for GPT-OSS 120B (BS=4, speculation length 3). Each datapoint has a set of parameters defining the algorithm settings (warm-up
+k_{0}
+, batch budget
+m_{l}
+, per-request budget
+m_{r}
+).
+
+6.2
+Speculative Decoding Settings
+
+In Figure
+5
+we observe that Algorithm 4, which incorporates speculative decoding-aware expert selection, consistently outperforms Algorithm 2, which does not leverage this structure.
+Algorithm 4 configurations
+(k_{0}=1,m=0,m_{r}=4)
+and
+(k_{0}=1,m=0,m_{r}=5)
+are Pareto optimal across all three datasets, boosting OTPS by 13–14% and 8–10% respectively while maintaining competitive accuracy. Notably, two configurations consistently preserve accuracy:
+(k_{0}=1,m=0,m_{r}=5)
+achieves +1.67%, +2.80%, and -0.36% on AIME2025, GPQA, and AALCR respectively, while
+(k_{0}=2,m=0,m_{r}=4)
+achieves +0.84%, +2.42%, and -0.36% on the same benchmarks.
+
+The configuration
+(k_{0}=0,m=16,m_{r}=4)
+, is missing warm-up selection and achieves moderate throughput gains (
+3-10
+% OTPS) but suffers severe accuracy degradation across all datasets :
+-20.83\%
+(AIME2025),
+-3.89\%
+(GPQA),
+-19.61\%
+(AALCR). This indicates that incorporating even a single token from the warm-up phase is crucial for maintaining accuracy in speculative decoding settings. In contrast,
+k_{0}\geq 1
+consistently achieves both throughput gains and accuracy preservation. The full tables for this experiments as well as ablation on batch size are provided in Appendix
+B
+.
+
+Figure 6
+:
+Trade-off between OTPS improvement and accuracy degradation across four datatsets for GPT-OSS 120B (BS=4, speculation length 3) for
+batch with mixed requests
+. Each datapoint has a set of parameters defining the algorithm settings (warm-up
+k_{0}
+, batch budget
+m_{l}
+, per-request budget
+m_{r}
+).
+
+Baseline
+
+(0,4,16)
+
+(1,0,4)
+
+(1,0,5)
+
+(2,0,4)
+
+(1,24,0)
+
+(1,32,0)
+
+(2,10,0)
+
+(0,0,8)
+
+OTPS
+
+AIME2025
+
+165.39
+
+180.81
+
+186.50
+
+176.95
+
+183.96
+
+168.25
+
+168.36
+
+174.60
+
+178.12
+
++9.3%
+
++12.8%
+
++7.0%
+
++11.2%
+
++1.7%
+
++1.8%
+
++5.6%
+
++7.7%
+
+GPQA
+
+154.65
+
+171.55
+
+180.31
+
+172.80
+
+172.58
+
+165.54
+
+158.55
+
+159.30
+
+170.01
+
++10.9%
+
++16.6%
+
++11.7%
+
++11.6%
+
++7.0%
+
++2.5%
+
++3.0%
+
++9.9%
+
+Accuracy
+
+AIME2025
+
+87.50
+
+63.33
+
+90.00
+
+90.00
+
+86.67
+
+93.33
+
+86.67
+
+93.33
+
+86.67
+
+Drop
+
+-24.17
+
++2.50
+
++2.50
+
+-0.83
+
++5.83
+
+-0.83
+
++5.83
+
+-0.83
+
+GPQA
+
+76.26
+
+70.71
+
+74.75
+
+77.27
+
+77.27
+
+73.23
+
+78.79
+
+78.28
+
+76.77
+
+Drop
+
+-5.55
+
+-1.51
+
++1.01
+
++1.01
+
+-3.03
+
++2.53
+
++2.02
+
++0.51
+
+Table 1:
+Trade-off between OTPS improvement and accuracy degradation across four datatsets for GPT-OSS 120B (BS=4, speculation length 3) for
+batch with mixed requests
+. Each datapoint is defined by the algorithm settings ( warm-up
+k_{0}
+, batch budget
+m_{l}
+, request budget
+m_{r}
+). For related info refer to Section
+6.2
+.
+
+6.3
+Heterogeneous Requests
+
+In practical deployment, user requests often originate from heterogeneous domains. To reflect this setting in our evaluation, we construct mixed batches consisting of four requests drawn from distinct benchmarks:
+r_{1}
+from GPQA,
+r_{2}
+, from AIME2025,
+r_{3}
+, from MMLU-Pro, and
+r_{4}
+from AA-LCR. During the verification stage of speculative decoding, each request contributes four tokens, resulting in a batch where requests span diverse datasets, while the speculative tokens within each request remain domain-consistent. We show that this structure enables our method to improve output tokens per second (OTPS) without degrading model quality, even when batches contain requests from multiple, heterogeneous datasets. The main results are reported in Figure
+6
+and Table
+1
+.
+
+6.4
+Expert Parallelism Settings
+
+In Table
+2
+our EP-aware algorithm (Algorithm
+6
+with
+(k_{0}=1,m_{g}=5)
+) for DeepSeek-R1 achieves a 73% drop in total activate experts while maintaining accuracy within 1% of baseline. It effectively reduces the peak GPU load by 3
+\times
+(25.6
+\to
+8.6 experts), directly translating to improved memory efficiency and reduced communication overhead.
+
+Method
+
+Accuracy
+
+# Experts
+
+Max/GPU
+
+GSM-8K (Batch Size 8)
+
+Original
+
+0.956
+
+50.7
+
+11.3
+
+Algorithm
+6
+
+(1,5)
+
+0.946
+
+33.2
+
+5.94
+
+IFeval (Batch Size 16)
+
+Original
+
+0.697
+
+160.4
+
+25.6
+
+Algorithm
+6
+
+(1,5)
+
+0.696
+
+43.4
+
+8.64
+
+Table 2:
+DS-R1 accuracy and per-GPU load (batch size 8 and 16).
+
+7
+Conclusion
+
+We address expert activation explosion in batched MoE inference, where batching and speculative decoding activate 60–95% of experts despite each token using only
+k
+.
+We introduce the first formal framework for batch-aware expert selection, where maximizing gating mass yields a modular objective with optimal greedy solutions.
+
+We developed 3 algorithms tailored to 3 deployment scenarios: standard serving (batch-aware selection with warm-start initialization), speculative decoding (hierarchical intra-request approach), expert-parallelism (peak GPU load minimizing selection). All algorithms operate at inference time without model retraining and can easily added to existing serving frameworks like vLLM.
+
+We practically demonstrate consistent end-to-end throughput improvements measured in output tokens per second, not merely expert sparsity reductions. Algorithm
+4
+with
+(k_{0}{=}1,m{=}0,m_{r}{=}4)
+achieves 13–14% OTPS improvement across several datasets while maintaining competitive accuracy (GPT-OSS 120B). On DeepSeek-R1 with EP, we cut the number of active experts by 73% and cut peak GPU load 3x while preserving the accuracy.
+
+These results establish that (sub-) modular optimization can achieve practical efficiency gains in production MoE serving without compromising model quality.
+
+Appendix A
+Experimental setup details
+
+Models:
+We evaluate on two state-of-the-art MoE models: (i) DeepSeek-R1 with 1 shared expert, and 256 routing experts of which 8 are activated per token (
+4
+), and (ii) GPT-OSS 120B with 128 routing experts of which 4 are activated. (
+15
+) Both models represent production-scale architectures with different numbers of experts and routing strategies.
+
+Hardware and frameworks:
+
+All inference experiments were conducted on a single p5en.48xlarge EC2 instance equipped with NVIDIA H100 GPUs. We used the vLLM inference engine for all models (
+8
+). For GPT-OSS-120B, we ran tensor parallelism with
+TP=1
+, while for DeepSeek-R1 we used
+TP=8
+. DeepSeek-R1 was evaluated without speculative decoding. For GPT-OSS-120B, when speculative decoding is reported, we used the EAGLE-3 head with speculation length
+3
+(
+10
+).
+
+Datasets:
+
+We evaluate on a diverse suite of established benchmarks spanning complementary LLM capabilities. AIME2025 (
+21
+) measures advanced mathematical reasoning via competition-style problems requiring multi-step symbolic derivations. GPQA (
+16
+) evaluates graduate-level scientific knowledge across physics, chemistry, and biology, with questions designed to be resistant to surface-level pattern matching and to require expert-level reasoning. MMLU-Pro (
+18
+) tests broad language understanding across a large collection of multilingual and domain-diverse tasks, emphasizing robust generalization beyond narrow benchmarks. IFEval (
+22
+) assesses instruction-following fidelity by verifying whether model outputs satisfy explicit natural language constraints. AA-LCR (
+2
+) targets long-context reasoning, requiring models to integrate and retrieve information across extended inputs with complex dependency structures.
+
+Baselines:
+We use the original top-
+k
+routing of GPT-OSS 120B and DSR1 as baselines. For GPT-OSS 120B, we compare with the baseline on standard batching (Algorithm
+2
+) and speculative decoding scenarios (Algorithm
+4
+). For DeepSeek-R1, we compare baseline with GPU-aware expert selection (Algortihm
+6
+), since DSR1 has to be served on multiple GPUs.
+
+Appendix B
+Additional experiments artifacts
+
+B.1
+Minimal Settings - Single GPU, No Speculation
+
+•
+
+For all the data points used in Section
+6.1
+refer to table
+3
+.
+
+•
+
+For tradeoff on activated experts vs. OTTPS refer to table Figure
+7
+
+Baseline
+
+(0,1)
+
+(12,1)
+
+(16,1)
+
+(24,1)
+
+(32,1)
+
+(0,2)
+
+(12,2)
+
+(24,0)
+
+OTPS
+
+AIME2025
+
+85.83
+
+128.72
+
+102.35
+
+96.85
+
+91.97
+
+89.23
+
+106.49
+
+91.04
+
+107.09
+
++50.0%
+
++19.2%
+
++12.8%
+
++7.1%
+
++4.0%
+
++24.1%
+
++6.1%
+
++24.8%
+
+GPQA
+
+75.48
+
+114.65
+
+92.81
+
+87.70
+
+85.05
+
+81.60
+
+92.71
+
+80.36
+
+102.49
+
++51.9%
+
++23.0%
+
++16.2%
+
++12.7%
+
++8.1%
+
++22.8%
+
++6.5%
+
++35.8%
+
+MMLUPro
+
+81.40
+
+120.49
+
+98.03
+
+93.21
+
+88.33
+
+85.53
+
+99.88
+
+87.37
+
+104.84
+
++48.0%
+
++20.4%
+
++14.5%
+
++8.5%
+
++5.1%
+
++22.7%
+
++7.3%
+
++28.8%
+
+Accuracy
+
+AIME2025
+
+87.50
+
+76.67
+
+83.33
+
+83.33
+
+86.67
+
+83.33
+
+83.33
+
+90.00
+
+-
+
+Drop
+
+-10.83
+
+-4.17
+
+-4.17
+
+-0.83
+
+-4.17
+
+-4.17
+
++2.50
+
+-
+
+GPQA
+
+76.26
+
+75.25
+
+77.27
+
+72.22
+
+75.25
+
+76.77
+
+76.77
+
+77.78
+
+-
+
+Drop
+
+-1.01
+
++1.01
+
+-4.04
+
+-1.01
+
++0.51
+
++0.51
+
++1.52
+
+-
+
+MMLUPro
+
+80.69
+
+79.15
+
+79.76
+
+79.87
+
+80.12
+
+80.01
+
+80.00
+
+80.80
+
+-
+
+Drop
+
+-1.54
+
+-0.93
+
+-0.82
+
+-0.57
+
+-0.68
+
+-0.69
+
++0.11
+
+-
+
+Table 3:
+Trade-off between OTPS improvement and accuracy degradation across three datatsets for GPT-OSS 120B (BS=16, speculations off). Each datapoint is defined by the algorithm settings (budget ml, warm-up k0). For related info refer to Section
+6.1
+
+Figure 7
+:
+Trade-off between OTPS and # of activated experts for GPT-OSS 120B (BS=16, speculations off). Each datapoint is defined by the algorithm settings (batch budget
+m_{l}
+, request budget
+m_{r}
+, warm-up
+k_{0}
+). For related info refer to Section
+6.1
+
+B.2
+Speculative Decoding Settings
+
+•
+
+For all the data points used in Section
+6.2
+refer to table
+4
+.
+
+•
+
+For tradeoff on activated experts vs. OTTPS refer to table Figure
+8
+
+Baseline
+
+(0,16,4)
+
+(1,0,4)
+
+(1,0,5)
+
+(2,0,4)
+
+(1,24,0)
+
+(1,32,0)
+
+(2,10,0)
+
+(0,0,8)
+
+OTPS
+
+AIME2025
+
+173.07
+
+185.38
+
+197.78
+
+191.23
+
+181.35
+
+177.41
+
+175.28
+
+181.10
+
+186.06
+
++7.1%
+
++14.3%
+
++10.5%
+
++4.8%
+
++2.5%
+
++1.3%
+
++4.6%
+
++7.5%
+
+IFBench
+
+163.82
+
+180.60
+
+191.51
+
+178.91
+
+171.15
+
+172.67
+
+170.21
+
+170.32
+
+178.04
+
++10.2%
+
++16.9%
+
++9.2%
+
++4.5%
+
++5.4%
+
++3.9%
+
++4.0%
+
++8.7%
+
+LCBench
+
+174.01
+
+179.23
+
+197.19
+
+188.96
+
+184.75
+
+181.80
+
+175.37
+
+177.97
+
+176.72
+
++3.0%
+
++13.3%
+
++8.6%
+
++6.2%
+
++4.5%
+
++0.8%
+
++2.3%
+
++1.6%
+
+MMLUPro
+
+170.07
+
+182.06
+
+195.34
+
+188.03
+
+177.05
+
+177.59
+
+174.40
+
+183.73
+
+177.05
+
++7.1%
+
++14.9%
+
++10.6%
+
++4.1%
+
++4.4%
+
++2.5%
+
++8.0%
+
++4.1%
+
+GPQA
+
+159.52
+
+175.06
+
+180.91
+
+173.20
+
+165.44
+
+168.50
+
+161.47
+
+167.24
+
+174.48
+
++9.7%
+
++13.4%
+
++8.6%
+
++3.7%
+
++5.6%
+
++1.2%
+
++4.8%
+
++9.3%
+
+Accuracy
+
+AIME2025
+
+87.50
+
+65.00
+
+91.67
+
+87.50
+
+86.67
+
+85.00
+
+89.17
+
+89.17
+
+87.50
+
+Drop
+
+-22.50
+
++4.17
+
+0.00
+
+-0.83
+
+-2.50
+
++1.67
+
++1.67
+
+0.00
+
+GPQA
+
+76.26
+
+71.59
+
+76.77
+
+78.28
+
+77.90
+
+74.37
+
+74.75
+
+76.89
+
+76.64
+
+Drop
+
+-4.67
+
++0.51
+
++2.02
+
++1.64
+
+-1.89
+
+-1.51
+
++0.63
+
++0.38
+
+AALCR
+
+48.86
+
+29.25
+
+43.25
+
+48.50
+
+48.50
+
+41.25
+
+38.00
+
+45.50
+
+44.75
+
+Drop
+
+-19.61
+
+-5.61
+
+-0.36
+
+-0.36
+
+-7.61
+
+-10.86
+
+-3.36
+
+-4.11
+
+Table 4:
+Trade-off between OTPS improvement and accuracy degradation across three datatsets for GPT-OSS 120B (BS=4, speculation length 3). Each datapoint is defined by the algorithm settings ( warm-up
+k_{0}
+, batch budget
+m_{l}
+, request budget
+m_{r}
+). For related info refer to Section
+6.2
+.
+
+Figure 8
+:
+Trade-off between OTPS and # of activated experts for GPT-OSS 120B (BS=4, speculation length 3). Each datapoint is defined by the algorithm settings (warm-up
+k_{0}
+, batch budget
+m_{l}
+, request budget
+m_{r}
+). For related info refer to Section
+6.2
+

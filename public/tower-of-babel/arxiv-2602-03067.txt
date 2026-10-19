@@ -1,0 +1,6309 @@
+FlashSinkhorn: IO-Aware Entropic Optimal Transport
+Felix X.-F. Ye, Xingjie Li, An Yu, Ming-Ching Chang, Linsong Chu, Davis Wertheimer
+
+Abstract
+Entropic optimal transport (EOT) via Sinkhorn iterations is widely used in modern machine learning, yet GPU solvers remain inefficient at scale. Tensorized implementations suffer quadratic HBM traffic from dense n × m n\times m interactions, while existing online backends avoid storing dense matrices but still rely on generic tiled map-reduce reduction kernels with limited fusion. We present FlashSinkhorn , an IO-aware EOT solver for squared Euclidean cost that rewrites stabilized log-domain Sinkhorn updates as row-wise LogSumExp reductions of biased dot-product scores, the same normalization as transformer attention. This enables FlashAttention-style fusion and tiling: fused Triton kernels stream tiles through on-chip SRAM and update dual potentials in a single pass, substantially reducing HBM IO per iteration while retaining linear-memory operations. We further provide streaming kernels for transport application, enabling scalable first- and second-order optimization. On A100 GPUs, FlashSinkhorn achieves up to 32 × 32\times forward-pass and 161 × 161\times end-to-end speedups over state-of-the-art online baselines on point-cloud OT, improves scalability on OT-based downstream tasks. For reproducibility, we release an open-source implementation at https://github.com/ot-triton-lab/flash-sinkhorn .
+
+
+
+1
+Introduction
+
+Optimal transport (OT) is a principled way to compare probability measures and has become a standard tool across modern machine learning, from distributional objectives in generative modeling
+5
+to alignment and matching problems
+45
+;
+42
+;
+9
+.
+Entropic regularization
+13
+makes OT differentiable and computationally tractable via Sinkhorn iterations, and GPU implementations of Sinkhorn-based losses are now widely used
+19
+;
+12
+.
+However, scalability remains a persistent challenge in practice: OT is often considered too expensive to use extensively at evaluation time.
+For instance,
+26
+omit confidence intervals for their Sinkhorn setting due to computational cost, and
+28
+note that repeatedly evaluating Sinkhorn divergence at MNIST scale (
+n\approx 70000
+) can be computationally prohibitive.
+These observations point to a systems bottleneck.
+Tensorized GPU Sinkhorn solvers are dominated by quadratic HBM traffic: materializing and repeatedly traversing the
+n\times m
+interaction structure across iterations induce large reads/writes.
+Online backends avoid
+O(nm)
+storage by evaluating interactions on-the-fly via generic GPU map-reduce
+10
+, but can still be slow because each Sinkhorn update is executed as generic reduction kernels with limited fusion/tiling and limited opportunity to exploit tensor-core GEMM structure.
+As a result, OT often fails to scale to repeated large point-cloud solves in downstream pipelines, especially in high dimensions.
+
+We address this bottleneck with a systems-level observation: for squared Euclidean cost, stabilized log-domain Sinkhorn updates can be rewritten as row-wise LogSumExp (LSE) reductions of a biased dot-product score matrix—the same normalization that underlies scaled dot-product attention.
+FlashAttention
+15
+;
+16
+showed that this normalization can be computed exactly with substantially fewer HBM accesses by streaming tiles through on-chip SRAM and maintaining online max/sumexp statistics.
+We introduce
+FlashSinkhorn
+, which transfers this IO-aware strategy to EOT: fused Triton kernels stream tiles, compute costs on-the-fly, and write only updated dual potentials—avoiding
+n\times m
+intermediates while, crucially, reducing HBM IO volume via fusion and tiling.
+Our contributions are:
+
+•
+
+Attention-form Sinkhorn Update.
+
+We express stabilized Sinkhorn updates as biased dot-product LSE reductions with an iteration-dependent dual bias, enabling exact FlashAttention-style streaming.
+
+•
+
+IO-aware EOT.
+
+We fused Triton kernels for streamed Sinkhorn iterations, along with transport matrix-free streaming operators for differentiation of an EOT loss.
+
+•
+
+Large-scale Evaluation.
+
+We demonstrate substantial speedups for forward, backward, and HVP computations, improving scalability on point-cloud OT and OT-based workloads including OTDD and shuffled regression.
+
+2
+Background
+
+2.1
+EOT and Sinkhorn Algorithm
+
+Given source points (row vectors)
+X=\{\mathbf{x}_{i}\}_{i=1}^{n}\subset\mathbb{R}^{d}
+with weights
+\mathbf{a}\in\Delta^{n}
+and target points (row vectors)
+
+Y=\{\mathbf{y}_{j}\}_{j=1}^{m}\subset\mathbb{R}^{d}
+with weights
+\mathbf{b}\in\Delta^{m}
+, define discrete distributions
+\bm{\mu}=\sum_{i=1}^{n}a_{i}\delta_{\mathbf{x}_{i}}
+and
+\bm{\nu}=\sum_{j=1}^{m}b_{j}\delta_{\mathbf{y}_{j}}
+, where
+\delta_{\mathbf{x}}
+denotes the Dirac measure at
+\mathbf{x}
+.
+Entropic optimal transport (EOT)
+38
+is
+
+\mathrm{OT}_{\varepsilon}(\bm{\mu},\bm{\nu})=\min_{P\in\Pi(\mathbf{a},\mathbf{b})}\;\langle C,P\rangle+\varepsilon\textrm{KL}\left(P\middle\|\mathbf{a}\otimes\mathbf{b}\right),
+
+(1)
+
+where
+
+\Pi(\mathbf{a},\mathbf{b})=\{P\in\mathbb{R}_{\geq 0}^{n\times m}:P\mathbbm{1}_{m}=\mathbf{a},P^{\top}\mathbbm{1}_{n}=\mathbf{b}\}
+is the transport polytope,
+
+C\in\mathbb{R}^{n\times m}
+is the cost matrix with entries
+C_{ij}=\|\mathbf{x}_{i}-\mathbf{y}_{j}\|_{2}^{2}
+, i.e., the squared Euclidean distance, and
+
+\textrm{KL}\left(P\middle\|\mathbf{a}\otimes\mathbf{b}\right):=\sum_{i=1}^{n}\sum_{j=1}^{m}\left(P_{ij}\log\frac{P_{ij}}{a_{i}b_{j}}-P_{ij}+a_{i}b_{j}\right)
+,
+denotes the relative entropy with
+\varepsilon>0
+the regularization strength.
+
+Let
+\mathbf{f}\in\mathbb{R}^{n}
+and
+\mathbf{g}\in\mathbb{R}^{m}
+be the dual potentials. In the stabilized log-domain, Sinkhorn’s
+fixed-point alternating iterations update
+(\mathbf{f},\mathbf{g})
+via log-sum-exp reductions
+2
+;
+43
+;
+21
+:
+
+\displaystyle f_{i}
+
+\displaystyle\leftarrow-\varepsilon\,\mathrm{LSE}_{j}\left[\frac{\left(g_{j}-C_{ij}\right)}{\varepsilon}+\log b_{j}\right],
+
+(2)
+
+\displaystyle g_{j}
+
+\displaystyle\leftarrow-\varepsilon\,\mathrm{LSE}_{i}\left[\frac{\left(f_{i}-C_{ij}\right)}{\varepsilon}+\log a_{i}\right],
+
+(3)
+
+where
+\mathrm{LSE}(x)=\log\sum_{k}\exp(x_{k})
+and
+\mathrm{LSE}_{j}(\cdot)
+(resp.
+\mathrm{LSE}_{i}(\cdot)
+) denotes reduction over
+
+j
+(resp.
+i
+). The optimal transport matrix is recovered as
+
+P^{*}_{ij}=a_{i}b_{j}\exp\left[\frac{\left(f_{i}^{*}+g_{j}^{*}-C_{ij}\right)}{\varepsilon}\right].
+
+A common symmetrized variant computes the two half-steps in parallel from the same
+
+(\mathbf{f}^{\rm old},\mathbf{g}^{\rm old})
+and then averages
+21
+:
+
+\displaystyle f_{i}^{\text{new}}
+
+\displaystyle\leftarrow\frac{f_{i}^{\text{old}}}{2}-\frac{\varepsilon}{2}\,\mathrm{LSE}_{j}\left[\frac{(g_{j}^{\text{old}}-C_{ij})}{\varepsilon}+\log b_{j}\right],
+
+(4)
+
+\displaystyle g_{j}^{\text{new}}
+
+\displaystyle\leftarrow\frac{g_{j}^{\text{old}}}{2}-\frac{\varepsilon}{2}\,\mathrm{LSE}_{i}\left[\frac{(f_{i}^{\text{old}}-C_{ij})}{\varepsilon}+\log a_{i}\right].
+
+(5)
+
+Unlike the alternating updates
+eq.
+
+2
+–(
+3
+), the two reductions are independent and therefore more amenable to parallel evaluation. Detailed derivation is in appendix
+B
+.
+
+2.2
+Differentiation of EOT with respect to data
+
+The gradient of the EOT loss with respect to source points is
+19
+;
+39
+:
+
+\displaystyle\nabla_{\mathbf{x}_{i}}\mathrm{OT}_{\varepsilon}(\bm{\mu},\bm{\nu})=2a_{i}\Big(\mathbf{x}_{i}-T_{\varepsilon}(\mathbf{x}_{i})\Big),\qquad T_{\varepsilon}(\mathbf{x}_{i})=\frac{1}{a_{i}}\sum_{j=1}^{m}P_{ij}^{*}\mathbf{y}_{j}.
+
+where
+T_{\varepsilon}
+is the barycentric projection.
+
+The Hessian
+\nabla^{2}_{X}\mathrm{OT}_{\varepsilon}(\bm{\mu},\bm{\nu})
+can be viewed as a 4th-order tensor
+
+\mathcal{T}\in\mathbb{R}^{n\times d\times n\times d}
+with entries
+30
+,
+
+\mathcal{T}_{ktsl}=\frac{1}{\varepsilon}\sum_{i,j=1}^{n+m}\mathcal{R}_{ikt}\,H^{*\dagger}_{ij}\,\mathcal{R}_{jsl}\;+\;\mathcal{E}_{ktsl},
+
+(6)
+
+where
+H^{*\dagger}
+denotes the Moore-Penrose pseudoinverse of the sensitivity matrix
+
+H^{*}=\begin{pmatrix}\mathrm{diag}(\mathbf{a})&P^{*}\\
+(P^{*})^{\top}&\mathrm{diag}(\mathbf{b})\end{pmatrix}\in\mathbb{R}^{(n+m)\times(n+m)}.
+
+Define
+\mathcal{B}\in\mathbb{R}^{n\times d\times m}
+by
+\mathcal{B}_{ktj}:=2(x_{kt}-y_{jt})\,P^{*}_{kj}
+, and
+
+\mathcal{R}\in\mathbb{R}^{(n+m)\times n\times d}
+slice-wise by
+
+\mathcal{R}_{:,:,t}:=\begin{pmatrix}\operatorname{Diag}\big(\mathcal{B}_{:,t,:}\mathbbm{1}_{m}\big)\\[2.84526pt]
+(\mathcal{B}_{:,t,:})^{\top}\end{pmatrix}.
+
+The term
+\mathcal{E}
+is block-diagonal across points:
+\mathcal{E}_{k,:,s,:}=0
+for
+k\neq s
+, and
+
+\mathcal{E}_{k,:,k,:}=2a_{k}\mathbbm{I}_{d}-\frac{4}{\varepsilon}\sum_{j=1}^{m}P^{*}_{kj}\,(\mathbf{x}_{k}-\mathbf{y}_{j})^{\top}(\mathbf{x}_{k}-\mathbf{y}_{j}).
+
+(7)
+
+If Sinkhorn is terminated before full convergence, the resulting coupling
+\tilde{P}
+typically satisfies the marginal constraints only approximately. Let
+\tilde{\mathbf{a}}:=\tilde{P}\mathbbm{1}_{m}
+and
+\tilde{\mathbf{b}}:=\tilde{P}^{\top}\mathbbm{1}_{n}
+be its actual marginals. Then the expressions above remain exact when interpreted as derivatives of
+\mathrm{OT}_{\varepsilon}(\tilde{\bm{\mu}},\tilde{\bm{\nu}})
+with
+\tilde{\bm{\mu}}=\sum_{i=1}^{n}\tilde{a}_{i}\delta_{\mathbf{x}_{i}}
+and
+\tilde{\bm{\nu}}=\sum_{j=1}^{m}\tilde{b}_{j}\delta_{\mathbf{y}_{j}}
+21
+. The detailed derivation is in appendix
+C
+.
+
+2.3
+FlashAttention and Online LSE
+
+Modern GPUs feature a memory hierarchy where on-chip static random-access memory (SRAM) offers an order of magnitude higher bandwidth than high-bandwidth memory (HBM), but with far smaller capacity.
+As computing speeds have outpaced memory bandwidth, many operations, including softmax and reductions, are memory-bound: their runtime is dominated by HBM accesses rather than arithmetic. Kernel fusion addresses this by loading inputs once from HBM and performing multiple operations in SRAM before writing final outputs to HBM.
+
+FlashAttention
+15
+applies this principle to attention by avoiding materialization of the
+n\times n
+score matrix
+S=QK^{\top}
+. The key is online log-sum-exp (LSE)
+37
+. The detailed derivation is in appendix
+D.3
+. This fuses “score
+\rightarrow
+softmax
+\rightarrow
+aggregation” into one kernel that updates per-row and output accumulator tile-by-tile, writing only final results to HBM.
+
+3
+FlashSinkhorn: Algorithm and Analysis
+
+3.1
+Streaming Sinkhorn Iterations
+
+Figure 1
+:
+FlashSinkhorn kernels via IO-aware tiling.
+
+Left:
+streaming
+\hat{\mathbf{f}}
+update (
+Algorithm
+
+1
+).
+In the outer loop (blue arrow), each thread block stages a tile
+Q_{I}
+in on-chip SRAM and maintains per-row online log-sum-exp statistics.
+In the inner loop (orange arrow), it streams tiles
+K_{J}
+from HBM, adds a broadcast bias row vector, computes the score tile on-the-fly, and updates the running statistics to write
+\hat{\mathbf{f}}_{I}
+back to HBM.
+
+Middle:
+streaming
+\hat{\mathbf{g}}
+update with the roles of
+Q
+and
+K
+swapped.
+
+Right:
+streaming transport application
+P^{*}V
+(
+Algorithm
+
+2
+).
+At convergence, it reuses the same streaming row-softmax while additionally streaming tiles of
+V
+alongside
+K
+to accumulate and write
+P^{*}V
+without materializing
+P^{*}
+.
+Hatched blocks denote tiles staged in on-chip SRAM; solid-color blocks denote tensors resident in HBM; black arrows indicate HBM
+\leftrightarrow
+SRAM transfers.
+
+Algorithm 1
+
+FlashSinkhorn: streaming
+\hat{\mathbf{f}}
+-update
+
+1:
+
+Input:
+
+X\in\mathbb{R}^{n\times d}
+,
+Y\in\mathbb{R}^{m\times d}
+,
+\hat{\mathbf{g}}\in\mathbb{R}^{m}
+,
+\mathbf{b}\in\Delta^{m}
+
+2:
+
+Output:
+
+\hat{\mathbf{f}}\in\mathbb{R}^{n}
+
+3:
+
+\bm{\delta}\leftarrow\varepsilon\log\mathbf{b}
+
+// scale on load
+
+4:
+
+for
+each row block
+I
+of size
+B_{N}
+
+do
+
+5:
+
+Load
+X_{I}
+to on-chip SRAM
+
+6:
+
+\mathbf{m}_{I}\leftarrow-\infty
+,
+\mathbf{s}_{I}\leftarrow 0
+
+// running max / sumexp
+
+7:
+
+for
+each column block
+J
+of size
+B_{M}
+
+do
+
+8:
+
+Load
+Y_{J}
+,
+\hat{\mathbf{g}}_{J}
+and
+\bm{\delta}_{J}
+to on-chip SRAM
+
+9:
+
+S\leftarrow(2X_{I}Y_{J}^{\top}+\hat{\mathbf{g}}_{J}+\bm{\delta}_{J})/\varepsilon
+
+// score tile + bias
+
+10:
+
+\tilde{\mathbf{m}}\leftarrow\mathrm{rowmax}(S)
+
+// tile max
+
+11:
+
+\mathbf{m}_{\mathrm{new}}\leftarrow\max(\mathbf{m}_{I},\tilde{\mathbf{m}})
+
+// update max row-wise
+
+12:
+
+\mathbf{s}_{I}\leftarrow e^{\mathbf{m}_{I}-\mathbf{m}_{\mathrm{new}}}\odot\mathbf{s}_{I}+\mathrm{rowsum}\!\left(e^{S-\mathbf{m}_{\mathrm{new}}}\right)
+
+13:
+
+\mathbf{m}_{I}\leftarrow\mathbf{m}_{\mathrm{new}}
+
+14:
+
+end
+
+for
+
+15:
+
+\hat{\mathbf{f}}_{I}\leftarrow-\varepsilon\,\big(\mathbf{m}_{I}+\log\mathbf{s}_{I}\big)
+
+//
+\hat{\mathbf{f}}=-\varepsilon\,\mathrm{LSE}_{\rm row}
+
+16:
+
+Write
+\hat{\mathbf{f}}_{I}
+to HBM
+
+17:
+
+end
+
+for
+
+For EOT with squared Euclidean cost, the log-domain Sinkhorn updates can be written as row-wise LSE reductions of a biased dot-product score matrix. This is exactly the same per-row normalization statistic that underlies scaled dot-product attention. As a result, each Sinkhorn iteration can be computed by FlashAttention-style streaming without materializing the cost matrix
+C\in\mathbb{R}^{n\times m}.
+
+Proposition 1
+
+(Sinkhorn iteration as biased dot-product LSE)
+.
+
+Define
+\bm{\alpha}\in\mathbb{R}^{n}
+,
+\bm{\beta}\in\mathbb{R}^{m}
+by
+\alpha_{i}=\|\mathbf{x}_{i}\|_{2}^{2}
+and
+\beta_{j}=\|\mathbf{y}_{j}\|_{2}^{2}
+.
+Set
+Q:=\sqrt{2}X
+and
+K:=\sqrt{2}Y
+and define
+the precomputable row vectors
+
+\bm{\delta}:=\varepsilon\log\mathbf{b}\in\mathbb{R}^{m},\bm{\gamma}:=\varepsilon\log\mathbf{a}\in\mathbb{R}^{n}
+. Define the shifted potentials
+
+\hat{\mathbf{f}}:=\mathbf{f}-\bm{\alpha}
+and
+\hat{\mathbf{g}}:=\mathbf{g}-\bm{\beta}
+.
+Define the row-logits and column-logits
+
+\displaystyle S_{X}(\hat{\mathbf{g}}):=\left(QK^{\top}+\mathbbm{1}_{n}(\hat{\mathbf{g}}+\bm{\delta})\right)/\varepsilon,
+
+(8)
+
+\displaystyle S_{Y}(\hat{\mathbf{f}}):=\left(KQ^{\top}+\mathbbm{1}_{m}(\hat{\mathbf{f}}+\bm{\gamma})\right)/\varepsilon.
+
+(9)
+
+Then the stabilized log-domain alternating Sinkhorn updates in
+eq.
+
+2
+–(
+3
+) are equivalently
+
+\displaystyle\hat{\mathbf{f}}
+
+\displaystyle\leftarrow-\varepsilon\,\mathrm{LSE}_{\rm row}\!\left(S_{X}(\hat{\mathbf{g}})\right),
+
+(10)
+
+\displaystyle\hat{\mathbf{g}}
+
+\displaystyle\leftarrow-\varepsilon\,\mathrm{LSE}_{\rm row}\!\left(S_{Y}(\hat{\mathbf{f}})\right).
+
+(11)
+
+The proof is in appendix
+D.1
+.
+Consequently, Proposition
+1
+reduces each stabilized Sinkhorn half-step to a LSE of a biased dot-product score matrix. This is the same normalization that appears in IO-aware exact attention kernels: a tiled GEMM produces blocks of logits, while online LSE accumulators update per-row statistics on the fly, so the full
+n\times m
+score
+matrix never needs to be materialized in high-bandwidth memory (HBM)
+16
+.
+
+To make this precise, we adopt a two-level memory model: inputs reside in slow HBM; each thread block
+has fast on-chip SRAM of size
+M
+; and we measure cost by the number of scalars transferred between HBM and SRAM. Under this model, a materialized Sinkhorn half-step writes the score matrix to HBM and then applies a row-wise LSE,
+incurring
+\Theta(nd+md+nm)
+HBM accesses.
+
+Theorem 2
+.
+
+We consider the exact update in
+eq.
+
+10
+and
+assume a tiling with row blocks of size
+B_{N}
+and column blocks of size
+B_{M}
+fits in SRAM with
+B_{M}d+B_{N}d+(B_{M}+2B_{N})\ \lesssim\ M
+,
+then Algorithm
+1
+achieves
+
+\Theta\Big(nd+md+\frac{nmd^{2}}{M}\Big)\text{ HBM accesses for }d\leq M\leq\min\{n,m\}d
+,
+and
+\Theta(nd+md)
+for
+M\geq\min\{n,m\}d
+.
+
+The full proof is in appendix
+D.2
+.
+The key idea is that SRAM of size
+M
+allows us cache only
+B_{N}=\Theta(M/d)
+rows of
+Q
+at a time, hence we must make
+\Theta(n/B_{N})=\Theta(nd/M)
+passes over
+K
+, each streaming
+\Theta(md)
+scalars from HBM, which yields the dominant
+\Theta(nmd^{2}/M)
+HBM-access term.
+
+We implement each stabilized Sinkhorn update
+eq.
+
+10
+–(
+11
+) as a single fused Triton GPU kernel that streams tiles of
+Q
+and
+K
+, forms the biased scores, and maintains online row-wise
+\mathrm{LSE}
+statistics on chip, writing only the updated potentials back to HBM. This mirrors FlashAttention’s IO-aware online-softmax machinery. In FlashAttention, the forward pass streams blocks of
+(K,V)
+and revisits all query blocks
+Q
+, writing intermediate row statistics/output blocks to HBM; in FlashSinkhorn we flip the nesting (row-stationary
+Q
+-outer,
+K/V
+-inner) so each row block retains its running
+\mathrm{LSE}
+statistics on chip across all key/value blocks and is written out only once, which better matches Sinkhorn’s row-wise reductions. The kernels are detailed in
+algorithms
+
+1
+and
+3
+and illustrated in
+Figure
+
+1
+(left, middle), with further implementation details in Appendix
+G
+. The kernels above implement the stabilized
+alternating
+schedule in
+eq.
+
+2
+–(
+3
+); for apples-to-apples comparison to libraries that default to a different schedule, we also fuse the
+symmetric
+updates
+eq.
+
+4
+–(
+5
+) in the same
+single-kernel
+streaming form.
+
+3.2
+Streaming Transport Matrix Application
+
+The entropic barycentric projection admits an attention form: it is a row-wise softmax-weighted
+average of target data. As a result,
+\nabla_{X}\mathrm{OT}_{\varepsilon}(\bm{\mu},\bm{\nu})
+is a weighted residual between
+the source data and an attention output at optimality.
+
+Proposition 3
+
+(Transport matrix application as an attention output)
+.
+
+Given any shifted potentials
+\hat{\mathbf{f}}
+and
+\hat{\mathbf{g}}
+, define the transport matrix
+
+P_{ij}(\hat{\mathbf{f}},\hat{\mathbf{g}}):=a_{i}b_{j}\exp\!\left(\frac{\hat{f}_{i}+\hat{g}_{j}+(QK^{\top})_{ij}}{\varepsilon}\right).
+
+(12)
+
+Let
+
+\hat{\mathbf{f}}^{+}=-\varepsilon\mathrm{LSE}_{\rm row}(S_{X}(\hat{\mathbf{g}})),\hat{\mathbf{g}}^{+}=-\varepsilon\mathrm{LSE}_{\rm row}(S_{Y}(\hat{\mathbf{f}}))
+, and define the row-mass vector and column-mass vector,
+
+\displaystyle\mathbf{r}:=P\mathbbm{1}_{m}=\mathbf{a}\odot\exp\left(\frac{\hat{\mathbf{f}}-\hat{\mathbf{f}}^{+}}{\varepsilon}\right),
+
+(13)
+
+\displaystyle\mathbf{c}:=P^{\top}\mathbbm{1}_{n}=\mathbf{b}\odot\exp\left(\frac{\hat{\mathbf{g}}-\hat{\mathbf{g}}^{+}}{\varepsilon}\right).
+
+(14)
+
+Then for any
+V\in\mathbb{R}^{m\times p}
+and any
+U\in\mathbb{R}^{n\times p}
+,
+
+\displaystyle P\,V=\mathrm{diag}(\mathbf{r})\,\rm{Softmax}(S_{X}(\hat{\mathbf{g}}))\,V,
+
+(15)
+
+\displaystyle P^{\top}\,U=\mathrm{diag}(\mathbf{c})\,\rm{Softmax}(S_{Y}(\hat{\mathbf{f}}))\,U,
+
+(16)
+
+where softmax is applied row-wise.
+Moreover, if
+(\hat{\mathbf{f}}^{*},\hat{\mathbf{g}}^{*})
+are the Sinkhorn fixed points, then
+\mathbf{r}=\mathbf{a}
+,
+\mathbf{c}=\mathbf{b}
+and
+P(\hat{\mathbf{f}}^{*},\hat{\mathbf{g}}^{*})
+in
+eq.
+
+12
+recovers the optimal transport
+P^{*}
+.
+
+The proof is in Appendix
+E.1
+. Algorithm
+2
+computes
+\mathrm{out}=P(\hat{\mathbf{f}},\hat{\mathbf{g}})V
+with a FlashAttention-style fused
+matmul–softmax–matmul
+kernel: it streams tiles to form biased dot-product scores, applies a row-wise softmax via online normalization, and accumulates values in a single pass. The identity holds for arbitrary potentials, so early stopping applies the induced coupling (with marginals
+\mathbf{r},\mathbf{c}
+), while at convergence it recovers
+P^{*}V
+. Under the HBM/SRAM model, the IO cost is
+\Theta\!\big((n+m)(d+p)+\tfrac{nm(d+p)^{2}}{M}\big)
+HBM accesses
+15
+.
+
+Corollary 4
+.
+
+Let
+(\hat{\mathbf{f}}^{*},\hat{\mathbf{g}}^{*})
+be converged shifted potentials of
+eq.
+
+10
+–(
+11
+). The barycentric projection
+T_{\varepsilon}(X):=\mathrm{diag}(\mathbf{a})^{-1}P^{*}Y
+admits the attention form
+
+T_{\varepsilon}(X)=\mathrm{Softmax}_{\rm row}(S_{X}^{*})\,Y,\qquad T_{\varepsilon}(\mathbf{x}_{i})=[T_{\varepsilon}(X)]_{i},
+
+and the gradient of EOT with respect to the source data has the residual-attention expression
+
+\nabla_{X}\mathrm{OT}_{\varepsilon}(\bm{\mu},\bm{\nu})=2\mathrm{diag}(\mathbf{a})\Big(X-\rm{Softmax}(S_{X}^{*})Y\Big).
+
+(17)
+
+The proof is in Appendix
+E.2
+;
+Table
+
+1
+summarizes the EOT–attention correspondence. Since both
+P^{*}Y
+and (
+17
+) reduce to the same row-wise online softmax normalization and value accumulation as attention, they can be computed with the same FlashAttention-style streaming kernels.
+
+EOT
+
+Attention
+
+Source
+X
+
+Queries
+Q=\sqrt{2}X
+
+Target
+Y
+
+Keys
+K=\sqrt{2}Y
+
+Values
+V=Y
+
+Reg.
+\varepsilon
+
+Scaling
+\sqrt{d}
+
+\hat{\mathbf{g}}^{*}+\varepsilon\log\mathbf{b}
+
+Key bias
+
+Bary. proj.
+T_{\varepsilon}(X)
+
+Attn. output
+\mathrm{Softmax}(S^{*})V
+
+Table 1
+:
+EOT to Attention Correspondence.
+
+Algorithm 2
+
+Apply Transport from Potentials,
+P\,V
+
+1:
+
+Input:
+
+X\in\mathbb{R}^{n\times d}
+,
+Y\in\mathbb{R}^{m\times d}
+,
+\hat{\mathbf{f}}\in\mathbb{R}^{n}
+,
+\hat{\mathbf{g}}\in\mathbb{R}^{m}
+,
+\mathbf{a}\in\Delta^{n}
+,
+
+\mathbf{b}\in\Delta^{m}
+,
+V\in\mathbb{R}^{m\times p}
+
+2:
+
+Output:
+
+\mathrm{out}=P\,V\in\mathbb{R}^{n\times p}
+
+3:
+
+\bm{\delta}\leftarrow\varepsilon\log\mathbf{b}
+
+// absorb marginal into bias
+
+4:
+
+for
+each row block
+I
+of size
+B_{N}
+
+do
+
+5:
+
+Load
+X_{I}
+,
+\hat{\mathbf{f}}_{I}
+,
+\mathbf{a}_{I}
+to on-chip SRAM
+
+6:
+
+\mathbf{m}_{I}\leftarrow-\infty
+,
+O_{I}\leftarrow 0
+
+7:
+
+for
+each column block
+J
+of size
+B_{M}
+
+do
+
+8:
+
+Load
+Y_{J}
+,
+\hat{\mathbf{g}}_{J}
+,
+\bm{\delta}_{J}
+,
+V_{J}
+to on-chip SRAM
+
+9:
+
+S\leftarrow(2\,X_{I}Y_{J}^{\top}+\hat{\mathbf{g}}_{J}+\bm{\delta}_{J})/\varepsilon
+
+// score tile + target bias
+
+10:
+
+\tilde{\mathbf{m}}\leftarrow\mathrm{rowmax}(S)
+
+// tile max
+
+11:
+
+\mathbf{m}_{\mathrm{new}}\leftarrow\max(\mathbf{m}_{I},\tilde{\mathbf{m}})
+
+// running max
+
+12:
+
+O_{I}\leftarrow e^{\mathbf{m}_{I}-\mathbf{m}_{\mathrm{new}}}\odot O_{I}+e^{S-\mathbf{m}_{\mathrm{new}}}\,V_{J}
+
+// online weighted sum
+
+13:
+
+\mathbf{m}_{I}\leftarrow\mathbf{m}_{\mathrm{new}}
+
+14:
+
+end
+
+for
+
+15:
+
+\mathrm{out}_{I}\leftarrow\mathbf{a}_{I}\odot\exp\!\left(\hat{\mathbf{f}}_{I}/\varepsilon+\mathbf{m}_{I}\right)\odot O_{I}
+
+// source marginal
+correction
+
+16:
+
+Write
+\mathrm{out}_{I}
+to HBM
+
+17:
+
+end
+
+for
+
+3.3
+Streaming Hessian-Vector Products
+
+Second-order information is central to large-scale optimization
+44
+;
+8
+;
+46
+, gradient flows
+51
+, and implicit layers
+18
+.
+Although the full Hessian
+\mathcal{T}=\nabla_{X}^{2}\mathrm{OT}_{\varepsilon}(\bm{\mu},\bm{\nu})
+is infeasible to form for large
+(n,m)
+,
+many downstream routines only require Hessian–vector products (HVPs), e.g., Newton-CG, trust-region
+methods and Krylov eigenvalue estimation
+48
+. We derive streaming HVPs that decompose into
+transport-vector, transport-matrix, and Hadamard-weighted transport applications
+(P^{*}\odot AY^{\top})\,Y
+, avoiding materialization
+of both the Hessian tensor and the transport matrix. This reduces working memory from
+
+O(n^{2}d^{2}+nm)
+to
+O((n+m)d)
+.
+
+Theorem 5
+
+(Streaming HVP oracle)
+.
+
+Consider EOT with squared Euclidean cost. For any
+A\in\mathbb{R}^{n\times d}
+, the Hessian–vector product
+
+G=\mathcal{T}\,A
+can be evaluated by streaming over the optimal coupling
+P^{*}
+using
+
+(2K_{CG}+3)
+transport–vector products,
+3
+transport–matrix products, and
+1
+Hadamard-weighted transport,
+where
+K_{CG}
+is the CG iteration count used to solve the Schur-complement linear system
+
+H^{*}\mathbf{w}=\mathcal{R}\,A
+.
+Consequently,
+
+\mathrm{flops}=O\!\big((K_{CG}+1)\,nmd\big),\mathrm{memory}=O\!\big((n+m)d\big)
+.
+
+Proof sketch.
+
+We start from the decomposition
+
+G=\mathcal{T}\,A=\frac{1}{\varepsilon}\,\mathcal{R}^{\top}\mathbf{w}+\mathcal{E}\,A,\qquad\mathbf{w}=H^{*\dagger}(\mathcal{R}\,A).
+
+Partition
+\mathbf{w}=\binom{\mathbf{w}_{1}}{\mathbf{w}_{2}}\in\mathbb{R}^{n+m}
+and
+\mathbf{r}:=\mathcal{R}\,A=\binom{\mathbf{r}_{1}}{\mathbf{r}_{2}}\in\mathbb{R}^{n+m}
+with
+
+\mathbf{w}_{1},\mathbf{r}_{1}\in\mathbb{R}^{n}
+and
+\mathbf{w}_{2},\mathbf{r}_{2}\in\mathbb{R}^{m}
+.
+
+(i) Explicit term.
+
+The term
+\mathcal{E}\,A
+reuses the cached transport-matrix product
+P^{*}Y
+and requires one Hadamard-weighted transport application
+(P^{*}\odot(AY^{\top}))\,Y
+.
+
+(ii) Implicit term.
+
+We form
+\mathbf{r}=\mathcal{R}\,A
+using
+(P^{*})^{\top}A
+(one transport–vector product) and eliminate
+\mathbf{w}_{1}
+to obtain the Schur system
+
+S\,\mathbf{w}_{2}=\mathrm{rhs},\qquad S:=\mathrm{diag}(\mathbf{b})-(P^{*})^{\top}\mathrm{diag}(\mathbf{a})^{-1}P^{*}.
+
+We solve this system by CG. Each CG iteration applies
+S
+once, which amounts to one application of
+P^{*}
+and one of
+(P^{*})^{\top}
+
+to vectors, plus diagonal scalings. After CG converges, we recover
+
+\mathbf{w}_{1}=\mathrm{diag}(\mathbf{a})^{-1}\!\big(\mathbf{r}_{1}-P^{*}\mathbf{w}_{2}\big),
+
+which requires one additional transport–vector product. Finally, we apply
+\mathcal{R}^{\top}\mathbf{w}
+, which uses one transport–matrix product
+together with the cached
+P^{*}Y
+.
+∎
+
+In practice, we solve a damped Schur system
+S_{\tau}:=S+\tau I
+and stop CG at relative residual
+\eta
+, yielding a regularized HVP;
+the Moore–Penrose solution is recovered as
+\tau\downarrow 0
+and
+\eta\downarrow 0
+(see appendix
+H.2.3
+). For SPD
+S_{\tau}
+, standard CG bounds give
+
+K_{CG}=O\!\big(\sqrt{\kappa(S_{\tau})}\,\log(1/\eta)\big)
+with
+\kappa(S_{\tau})
+being the condition number of
+S_{\tau}
+.
+The streaming algorithm for the Hadamard-weighted transport
+
+(P^{*}\odot(AY^{\top}))\,Y
+from potentials is given in
+Algorithm
+
+5
+;
+full derivations and operation counts appear in Appendix
+F
+.
+
+4
+Experiments
+
+We evaluate FlashSinkhorn across three dimensions: computational speed, memory efficiency, and scalability. Our experiments span synthetic benchmarks of kernel performance comparing against GeomLoss and OTT-JAX, and two downstream tasks: (1)
+OTDD
+for computing distances between labeled datasets, and (2)
+OT-based shuffled regression
+, where our streaming HVP enables saddle detection and Newton acceleration.
+
+4.1
+Synthetic Benchmarks
+
+We benchmark FlashSinkhorn against two widely used GPU implementations: GeomLoss
+20
+(tensorized and KeOps) and OTT-JAX
+12
+(online) on synthetic point clouds (Figure
+2
+and
+Table
+
+3
+). OTT-JAX is built on JAX/XLA and implements the stabilized log-sum-exp Sinkhorn solver via the standard alternating fixed-point updates (
+eq.
+
+2
+–(
+3
+))
+12
+. GeomLoss provides PyTorch operators with multiple backends: its core Sinkhorn solver uses a symmetric update schedule (
+eq.
+
+4
+–(
+5
+)); its tensorized mode materializes dense interactions, while its online mode represents cost and kernel matrices symbolically with KeOps LazyTensors
+10
+and evaluates them via tiled map-reduce reductions.
+
+We evaluate three computational regimes:
+forward pass
+measures time to compute dual potentials and OT cost;
+forward + backward
+reports end-to-end differentiation time for OT-based losses; and
+Hessian-vector product (HVP)
+benchmarks second-order computation via our streaming operators. Full experimental details are in Appendix
+H.2
+.
+
+Figure 2
+:
+FlashSinkhorn performance benchmarks.
+
+(Top) Forward and forward+backward timing versus
+n
+at
+d{=}64
+and versus
+d
+at
+n{=}20k
+.
+(Bottom left) Memory scaling at
+d{=}1024
+: FlashSinkhorn maintains
+O(n)
+while tensorized methods scale as
+O(n^{1.7}\text{--}n^{1.9})
+.
+(Bottom right) HVP timing; FlashSinkhorn alone scales to
+n{=}50k
+and
+d{\geq}256
+. A100-80GB,
+\varepsilon{=}0.1
+.
+
+Tensor.
+
+KeOps
+
+Flash
+
+HBM R/W (GB)
+
+98
+
+0.14
+
+0.08
+
+Runtime (ms)
+
+54.0
+
+125.5
+
+8.2
+
+SM Util. (%)
+
+98
+
+49
+
+74
+
+Mem. Stalls (%)
+
+79
+
+8
+
+3
+
+Bottleneck
+
+Mem.
+
+Comp.
+
+Comp.
+
+Table 2
+:
+NCU profiling of forward pass (
+n
+=
+m
+=10,000,
+d
+=64, 10 Sinkhorn iterations, A100-80GB).
+
+Speed.
+
+FlashSinkhorn is the fastest method in our GPU baselines (
+Table
+
+3
+): it achieves
+9
+–
+32\times
+speedup over KeOps on the forward pass (and up to
+161\times
+end-to-end at
+d{=}512
+), and up to
+5.1\times
+over OTT-JAX.
+Compared to tensorized baselines, FlashSinkhorn is
+1.7
+–
+3.5\times
+faster on the settings shown in
+Table
+
+3
+; across a broader sweep where tensorized fits in memory, the speedup can be larger (up to
+12\times
+Appendix
+H.2.1
+).
+Tensorized variants become impractical once
+n
+grows to tens of thousands due to
+O(nm)
+materialization.
+These gains come from kernel-level specialization rather than algorithmic differences.
+FlashSinkhorn fuses each update into a small number of streaming kernels that compute pairwise costs on-the-fly and maintain online LSE statistics, reducing intermediate writes and kernel-launch overhead.
+
+On the backward pass, the gap widens at high
+d
+.
+While KeOps provides analytical gradients, realizing them entails additional all-pairs reductions and multiple kernel launches that re-evaluate the interaction kernel.
+In contrast, FlashSinkhorn reuses cached normalization statistics and fuses gradient accumulation into a small number of streamed passes, yielding
+100
+–
+200\times
+speedups at
+d\geq 512
+when KeOps completes (
+Table
+
+8
+).
+
+We report two FlashSinkhorn variants:
+symmetric
+(single fused update) is best at small
+n
+due to fewer launches, while
+alternating
+(two simpler half-steps) wins at large
+n
+and high
+d
+where reduced register pressure improves efficiency.
+See Appendix
+H.2.1
+and
+H.2.2
+for full profiling and scaling analyses.
+
+Profiling insight.
+
+Table
+2
+explains these trends.
+Tensorized appears busy (98% SM utilization) yet is bandwidth-limited: it moves 98 GB through HBM and spends 79% of cycles stalled on memory, dominated by repeatedly traversing dense
+n\times m
+interactions across iterations.
+KeOps avoids dense storage and drastically reduces HBM traffic (0.14 GB), but its generic map-reduce reductions achieve low utilization (49% SM) and high runtime (125.5 ms).
+FlashSinkhorn combines low HBM traffic (0.08 GB) with substantially fewer memory stalls (3%) and higher SM utilization (74%), yielding a
+15.3\times
+lower runtime than KeOps in this setting (8.2 vs. 125.5 ms).
+The full NCU breakdown (
+Tables
+
+5
+and
+6
+) shows that FlashSinkhorn issues fewer instructions, consistent with the benefits of fused streaming kernels.
+
+Memory.
+
+Tensorized implementations store dense
+n\times m
+intermediates, incurring
+O(nm)
+memory and eventually OOM as
+n
+grows.
+In contrast, FlashSinkhorn maintains only
+O((n{+}m)d)
+resident state (points and dual potentials) and streams the interactions, enabling runs at
+n{=}50
+k where tensorized baselines OOM and KeOps becomes out-of-time at high
+d
+(
+Tables
+
+3
+and
+7
+).
+
+Fwd
+
+Fwd+Bwd
+
+n
+
+d
+
+KeOps
+
+Tensor.
+
+Jax
+
+KeOps
+
+Tensor.
+
+Jax
+
+10k
+
+128
+
+9.4
+
+3.2
+
+2.0
+
+10.3
+
+3.5
+
+2.0
+
+10k
+
+512
+
+31.7
+
+1.7
+
+1.3
+
+161
+
+1.7
+
+1.2
+
+40k
+
+128
+
+12.5
+
+OOM
+
+3.0
+
+13.5
+
+OOM
+
+2.9
+
+40k
+
+512
+
+OOT
+
+OOM
+
+1.6
+
+OOT
+
+OOM
+
+1.6
+
+Table 3
+:
+Speedup vs GeomLoss and OTT-JAX on A100. KeOps/Tensorized compared to flash(sym); JAX to flash(alt). OOM/OOT = out of memory/time (10 mins).
+
+Hessian–vector products.
+
+All methods compute HVPs using the same matrix-free Schur-complement/CG oracle from
+Theorem
+
+5
+; differences come solely from the efficiency of the underlying transport-application operators inside the CG loop. As shown in the HVP panels of
+Figure
+
+2
+, FlashSinkhorn achieves
+3
+–
+6\times
+speedups at
+d{=}64
+and up to
+25\times
+at
+d{=}128
+; at
+n{=}m{=}50{,}000
+,
+d{=}64
+, FlashSinkhorn completes in
+4.2
+s versus
+14.5
+s for KeOps, while OTT-JAX does not complete within the time budget, making Newton–CG practical at previously infeasible scales.
+
+4.2
+Downstream Tasks
+
+Figure 3
+:
+Scaling OTDD to large datasets (MNIST
+\leftrightarrow
+Fashion-MNIST, d=512). FlashSinkhorn vs tensorized baseline for (a,b) time and (c,d) memory on OTDD
+distance computation and gradient flow.
+
+Figure 4
+:
+Saddle escape trajectory comparison: Adam vs Newton
+n=40000,\varepsilon=0.1
+(a) Loss: Adam decay slowly in saddle region; post-escape Newton converges in 7
+steps vs 90 for Adam continuation. (b) Gradient norm: Adam stalls near 0.1; Newton breaks through rapidly. (c) Minimum Hessian eigenvalue via Lanczos; negative
+\leftarrow
+positive transition at step 200 triggers Newton switch. (d) Wall time:
+Adam+Newton (2423s) vs Adam-only (2785s), 2.8× speedup after escape.
+
+OTDD Application.
+We evaluate FlashSinkhorn on Optimal Transport Dataset Distance (OTDD)
+4
+;
+3
+, which compares labeled datasets using a feature–label cost
+
+C(\mathbf{x}_{i},\mathbf{y}_{j})=\lambda_{1}\|\mathbf{x}_{i}-\mathbf{y}_{j}\|_{2}^{2}+\lambda_{2}\,W[\ell_{i},\ell_{j}],
+
+where
+W\in\mathbb{R}^{V\times V}
+stores class-to-class Wasserstein distances.
+OTDD uses the debiased Sinkhorn divergence
+19
+, requiring three OT solves per evaluation.
+This workload is computationally demanding at scale due to repeated OT solves including the precomputation of
+W
+; in particular, OTDD’s analysis notes that a fully nonparametric construction of the label–label ground distances requires solving many inner OT problems and can have worst-case
+O(n^{5}\log n)
+complexity in the dataset size
+n
+
+3
+.
+
+FlashSinkhorn supports OTDD’s label-augmented cost by caching the small
+V\times V
+matrix
+W
+and performing the lookup
+W[\ell_{i},\ell_{j}]
+on-the-fly inside the streamed kernels.
+This adds a modest per-iteration overhead relative to pure Euclidean cost due to increased register pressure, but avoids dense
+n\times m
+score matrix materialization.
+In contrast, KeOps-style online backends express costs as coordinate-only formulas and do not directly support the discrete table-lookup term
+W[\ell_{i},\ell_{j}]
+, so OTDD is typically run with tensorized backends.
+
+We benchmark MNIST
+\leftrightarrow
+Fashion-MNIST
+17
+;
+49
+using ResNet18 embeddings (
+d{=}512
+) in two settings: (i) OTDD distance (forward pass), and (ii) OTDD gradient flow (forward+backward) for dataset adaptation.
+As shown in
+Figure
+
+3
+, FlashSinkhorn matches tensorized runtime up to the tensorized memory limit (a,b), while its peak memory grows linearly and remains under 1 GB at
+n{=}60000
+(c,d), whereas the tensorized baseline exhibits
+O(n^{2})
+memory growth and OOMs beyond
+n{=}20000
+.
+Full details are in Appendix
+H.3
+.
+
+Detect Saddle Escape in OT-Based Regression.
+
+We demonstrate a practical application of our streaming HVP oracle: detecting when saddle points are escaped in OT-based
+optimization,
+providing clear guidance on when second-order methods are beneficial.
+
+We consider shuffled linear regression given
+(X,\widetilde{Y})
+where
+\widetilde{Y}=\Pi^{*}(XW^{*}+E)
+for unknown permutation
+\Pi^{*}
+, where
+W^{*}\in\mathbb{R}^{d\times d}
+is the ground-truth linear map, and
+E\in\mathbb{R}^{n\times d}
+is additive noise. Given only
+(X,\widetilde{Y})
+, the goal is to estimate
+W^{*}
+by minimizing an EOT objective
+30
+;
+50
+;
+18
+,
+
+\mathcal{L}(W)=\mathrm{OT}_{\varepsilon}\left(\frac{1}{n}\sum_{i}\delta_{\mathbf{y}_{i}},\frac{1}{n}\sum_{j}\delta_{\widetilde{\mathbf{y}}_{j}}\right),\quad\mathbf{y}_{i}=\mathbf{x}_{i}\,W.
+
+We use a standard flow cytometry dataset with
+n=40000
+single cells and
+d=5
+fluorescence channels (CD4, CD8, CD19, CD45, CD3), routinely used for lymphocyte immunophenotyping
+6
+. We synthetically remove cell-level correspondences by applying an unknown permutation,
+modeling scenarios where two measurement sets are available only as unordered collections. Here
+W^{*}
+represents the calibration matrix
+between measurement modalities.
+
+While the parameter Hessian
+H_{W}\in\mathbb{R}^{25\times 25}
+is small, computing it requires the
+
+\mathcal{T}=\nabla_{Y}^{2}\text{OT}_{\varepsilon}(\frac{1}{n}\sum_{i}\delta_{\mathbf{y}_{i}},\frac{1}{n}\sum_{j}\delta_{\widetilde{\mathbf{y}}_{j}}).
+
+Prior methods
+30
+materialize this Hessian, while streaming HVP computes
+H_{W}\,\mathbf{v}=X^{\top}\,\mathcal{T}\,(X\,\mathbf{v})
+in
+O(nd)
+memory, enabling Lanczos eigenvalue analysis at
+n=40000
+scale.
+
+The objective
+\mathcal{L}(W)
+is non-convex with saddle points that dominate random initializations
+1
+. Newton fails in saddle regions (minimum eigenvalue of the Hessian
+\lambda_{\min}(H_{W})<0
+), and trust-region methods are prohibitively expensive at scale. The challenge is knowing when to switch. Our streaming HVP makes Lanczos cheap enough to monitor
+\lambda_{\min}(H_{W})
+every 5 steps throughout optimization, enabling a simple rule: full-batch adam while
+\lambda_{\min}<0.001
+; Newton once
+\lambda_{\min}\geq 0.001
+. As shown in
+Figure
+
+4
+, once escape is detected, Newton converges rapidly. Across 72 random initializations (
+n=40000
+,
+\varepsilon\in 0.1,0.25,0.5
+),
+all started in saddle regions and full-batch adam successfully escaped 71 out of 72. Post-escape, Newton converged in a median of 11 steps.
+The full experiment details are in appendix
+H.4
+.
+
+5
+Related Work
+
+Attention as EOT.
+
+33
+derives scaled dot-product attention (SDPA) as the exact solution of a one-sided EOT problem, i.e., a degenerate transport formulation that constrains only the row marginal and admits a closed-form of softmax solution.
+
+32
+generalize this view by replacing the implicit uniform attention prior with a learnable prior,
+while remaining compatible with optimized SDPA kernels.
+Our Sinkhorn half-steps share the algebraic pattern of a biased softmax/LSE, but the bias plays a different role: it is an iteration-dependent dual term updated to enforce the missing
+marginals into two-sided EOT.
+Accordingly, we focus on computation rather than interpretation: we target standard two-marginal EOT and show how stabilized Sinkhorn half-steps can be executed exactly via IO-aware streaming without materializing the
+n\times m
+score matrix.
+
+Sinkhorn-style attention and online EOT.
+
+Several transformer variants replace row-softmax with Sinkhorn balancing to impose global constraints on attention, e.g., doubly-stochastic attention in Sinkformers
+41
+and latent-permutation/sorting-based sparsification in Sparse Sinkhorn Attention
+47
+.
+More broadly, Sinkhorn scaling is used as a differentiable relaxation of matchings, with Gumbel–Sinkhorn
+35
+framing Sinkhorn as a temperature-controlled matrix analog of softmax.
+Online Sinkhorn
+36
+addresses a complementary regime, estimating regularized OT between continuous distributions from sample streams, using stochastic-approximation updates with fresh samples and a growing nonparametric kernel-mixture representation, and can serve as a warm-start while constructing a discrete cost matrix.
+FlashSinkhorn assumes fixed discrete measures and speeds up stabilized Sinkhorn updates and transport applications by adopting FlashAttention’s IO-aware tiling and online normalization, without ever materializing the
+n\times m
+score matrix
+15
+;
+16
+.
+
+6
+Conclusion
+
+We introduced FlashSinkhorn, an IO-aware GPU implementation of stabilized Sinkhorn for EOT that avoids materializing the
+n\times m
+matrices.
+By rewriting each Sinkhorn half-step as a biased dot-product LSE reduction, we leverage FlashAttention-style streaming to execute the iterations exactly while substantially reducing HBM traffic. We gain up to
+32\times
+forward-pass and
+161\times
+end-to-end speedups over state-of-the-art online baselines.
+So, large-scale EOT becomes practical in the memory-bound regime. A current limitation is that FlashSinkhorn targets the squared-Euclidean structure; extending comparable fused-kernel benefits to more general costs will be future work.
+
+Appendix A
+Notation
+
+Table 4
+:
+Notation used throughout the paper.
+
+Symbol
+
+Meaning
+
+Discrete measures and cost
+
+X=[\mathbf{x}_{1};\dots;\mathbf{x}_{n}]\in\mathbb{R}^{n\times d}
+
+Source points (rows),
+\mathbf{x}_{i}\in\mathbb{R}^{d}
+.
+
+Y=[\mathbf{y}_{1};\dots;\mathbf{y}_{m}]\in\mathbb{R}^{m\times d}
+
+Target points (rows),
+\mathbf{y}_{j}\in\mathbb{R}^{d}
+.
+
+n,m,d
+
+#source points, #target points, ambient dimension.
+
+\mathbf{a}\in\Delta^{n},\ \mathbf{b}\in\Delta^{m}
+
+Probability weights on
+X
+and
+Y
+(simplex).
+
+\bm{\mu}
+,
+\bm{\nu}
+
+Discrete measures induced by
+(X,\mathbf{a})
+and
+(Y,\mathbf{b})
+.
+
+\delta_{\mathbf{x}}
+
+Dirac measure at
+\mathbf{x}
+.
+
+c(\mathbf{x}_{i},\mathbf{y}_{j})
+
+Ground cost; in this paper
+c(\mathbf{x}_{i},\mathbf{y}_{j})=\|\mathbf{x}_{i}-\mathbf{y}_{j}\|_{2}^{2}
+.
+
+C\in\mathbb{R}^{n\times m}
+
+Cost matrix,
+C_{ij}=c(\mathbf{x}_{i},\mathbf{y}_{j})
+.
+
+\varepsilon>0
+
+Entropic regularization parameter.
+
+Entropic OT and Sinkhorn
+
+\mathrm{OT}_{\varepsilon}(\bm{\mu},\bm{\nu})
+
+EOT objective between
+\bm{\mu}
+and
+\bm{\nu}
+.
+
+\mathbf{f}\in\mathbb{R}^{n},\ \mathbf{g}\in\mathbb{R}^{m}
+
+Dual potentials (log-domain).
+
+\bm{\alpha}\in\mathbb{R}^{n},\ \bm{\beta}\in\mathbb{R}^{m}
+
+Squared norms,
+\alpha_{i}=\|\mathbf{x}_{i}\|_{2}^{2}
+,
+\beta_{j}=\|\mathbf{y}_{j}\|_{2}^{2}
+.
+
+\hat{\mathbf{f}}:=\mathbf{f}-\bm{\alpha},\ \hat{\mathbf{g}}:=\mathbf{g}-\bm{\beta}
+
+Shifted (stabilized) potentials used in kernels.
+
+\bm{\gamma}:=\varepsilon\log\mathbf{a}
+,
+\bm{\delta}:=\varepsilon\log\mathbf{b}
+
+Precomputable log-weight biases.
+
+P(\hat{\mathbf{f}},\hat{\mathbf{g}})\in\mathbb{R}^{n\times m}
+
+Coupling induced by potentials;
+P^{*}
+denotes the converged/optimal coupling.
+
+\mathbf{r}:=P\mathbbm{1}_{m},\ \mathbf{c}:=P^{\top}\mathbbm{1}_{n}
+
+Induced row/column marginals of
+P
+.
+
+T_{\varepsilon}(X)=\mathrm{diag}(\mathbf{a})^{-1}P^{*}Y
+
+Entropic barycentric projection.
+
+Attention-form variables
+
+Q:=\sqrt{2}\,X,\ K:=\sqrt{2}\,Y
+
+Query/key matrices for squared-Euclidean dot-product form.
+
+S_{X}(\hat{\mathbf{g}})
+
+Biased score matrix for the
+\hat{\mathbf{f}}
+-update (row-wise reduction).
+
+S_{Y}(\hat{\mathbf{f}})
+
+Biased score matrix for the
+\hat{\mathbf{g}}
+-update (row-wise reduction).
+
+V\in\mathbb{R}^{m\times p}
+,
+U\in\mathbb{R}^{n\times p}
+
+“Values” used in transport application (
+PV
+,
+P^{\top}U
+).
+
+\mathrm{LSE}_{\rm row}(S)
+
+Row-wise LogSumExp:
+[\mathrm{LSE}_{\rm row}(S)]_{i}=\log\sum_{j}e^{S_{ij}}
+.
+
+\rm{Softmax}_{\rm row}(S)
+
+Row-wise softmax:
+[\rm{Softmax}_{\rm row}(S)]_{ij}=e^{S_{ij}}/\sum_{k}e^{S_{ik}}
+.
+
+Streaming kernels and IO model
+
+HBM / SRAM
+
+Off-chip high-bandwidth memory / on-chip shared memory (per thread block).
+
+M
+
+SRAM capacity (in scalars) available to a thread block.
+
+B_{N},\ B_{M}
+
+Row/column tile sizes used in streaming kernels.
+
+\mathbf{m}_{I},\ \mathbf{s}_{I}
+
+Running row-wise max and sumexp accumulators for row block
+I
+.
+
+O_{I}
+
+Output accumulator for row block
+I
+(e.g., for
+PV
+).
+
+Second-order operators (HVP)
+
+\mathcal{T}
+
+Data-space Hessian linear operator for EOT (used in
+G=\mathcal{T}A
+).
+
+A\in\mathbb{R}^{n\times d}
+
+Input perturbation for a Hessian–vector product.
+
+G=\mathcal{T}A\in\mathbb{R}^{n\times d}
+
+Hessian–vector product output.
+
+H^{*}\in\mathbb{R}^{(n+m)\times(n+m)}
+
+Linear system matrix arising in implicit differentiation;
+H^{*\dagger}
+its pseudoinverse.
+
+\mathcal{R}
+
+Linear map defining the right-hand side
+\mathcal{R}A
+in the implicit solve.
+
+S
+
+Schur complement system solved by CG in the HVP oracle.
+
+K_{CG}
+
+Number of CG iterations used for the Schur solve.
+
+\tau,\ \eta
+
+Schur damping (
+S_{\tau}=S+\tau I
+) and CG relative-residual tolerance.
+
+OTDD (label-augmented cost)
+
+\ell_{i},\ell_{j}\in\{1,\dots,V\}
+
+Class labels for samples.
+
+W\in\mathbb{R}^{V\times V}
+
+Class-to-class Wasserstein distances used in OTDD.
+
+\lambda_{1},\lambda_{2}
+
+Feature/label cost weights in OTDD.
+
+Appendix B
+Derivation of Sinkhorn algorithm
+
+Recall from (
+1
+) that the cost function for the entropic Optimal Transport (EOT) is given by
+
+\mathrm{OT}_{\varepsilon}(\bm{\mu},\bm{\nu})=\min_{P\in\Pi(\mathbf{a},\mathbf{b})}\;\langle C,P\rangle+\varepsilon\mathrm{KL}\left(P\|\mathbf{a}\otimes\mathbf{b}\right)
+
+where
+
+\Pi(\mathbf{a},\mathbf{b})=\{P\in\mathbb{R}_{\geq 0}^{n\times m}:P\mathbbm{1}_{m}=\mathbf{a},P^{\top}\mathbbm{1}_{n}=\mathbf{b}\}
+,
+
+C\in\mathbb{R}^{n\times m}
+is the cost matrix with entries
+C_{ij}=\|\mathbf{x}_{i}-\mathbf{y}_{j}\|^{2}_{2}
+, and
+
+\mathrm{KL}(P\|\mathbf{a}\otimes\mathbf{b})=\sum_{ij}\left(P_{ij}\log\frac{P_{ij}}{a_{i}b_{j}}-P_{ij}+a_{i}b_{j}\right)
+is the Kullback–Leibler (KL) divergence (also called relative entropy) and
+\varepsilon
+is the entropy regularization strength.
+
+We solve the EOT problem using its dual formulation, which is
+
+\displaystyle\mathcal{L}
+
+\displaystyle(C,{\mathbf{f}},{\mathbf{g}},P)=\sum_{ij}\Big[C_{ij}P_{ij}+\varepsilon P_{ij}\log\frac{P_{ij}}{a_{i}b_{j}}-\varepsilon P_{ij}-f_{i}(P_{ij}-a_{i})-g_{j}(P_{ij}-b_{j})\Big]+\epsilon.
+
+where
+\mathbf{f}
+and
+\mathbf{g}
+are the Lagrange multipliers, or the dual potentials. The strong duality holds, then
+\text{OT}_{\varepsilon}(\bm{\mu},\bm{\nu})=\max_{\mathbf{f},\mathbf{g}}\min_{P}\mathcal{L}(\mathbf{f},\mathbf{g},P)
+.
+
+The optimal
+P^{*}
+is determined by the first-order optimality condition
+\frac{\partial\mathcal{L}}{\partial P}=0
+, and can be expressed as a function of the dual potentials
+\mathbf{f}
+and
+\mathbf{g}
+,
+
+P_{ij}(\mathbf{f},\mathbf{g}):=a_{i}b_{j}\exp\left(\frac{f_{i}+g_{j}-C_{ij}}{\epsilon}\right).
+
+(18)
+
+Recall the marginal constraints of EOT
+
+\displaystyle\sum_{j}P^{*}_{ij}=a_{i},\quad\sum_{i}P^{*}_{ij}=b_{j},
+
+(19)
+
+The first-order optimality conditions of the outer problem yield,
+
+\displaystyle\sum_{j}a_{i}b_{j}\exp\left(\frac{f^{*}_{i}+g^{*}_{j}-C_{ij}}{\varepsilon}\right)=a_{i},\qquad\sum_{i}a_{i}b_{j}\exp\left(\frac{f^{*}_{i}+g^{*}_{j}-C_{ij}}{\varepsilon}\right)=b_{j}.
+
+If we solve the above marginal constraints for
+\mathbf{f}^{*}
+and
+\mathbf{g}^{*}
+by alternatively scaling
+\mathbf{f}^{(k)}
+and
+\mathbf{g}^{(k)}
+in the
+\log
+-domain, then we obtain the Sinkhorn algorithm with the LSE function. Then the optimal transport matrix is
+
+P^{*}_{ij}=a_{i}b_{j}\exp\left(\frac{f^{*}_{i}+g^{*}_{j}-C_{ij}}{\epsilon}\right).
+
+(20)
+
+Note that the marginal constraints are equivalent to
+
+\displaystyle\exp\left(\frac{f_{i}^{*}}{\varepsilon}\right)\sum_{j}\exp\left(\log(b_{j})+\frac{g_{j}^{*}-C_{ij}}{\varepsilon}\right)=1,
+
+\displaystyle\exp\left(\frac{g_{j}^{*}}{\varepsilon}\right)\sum_{i}\exp\left(\log(a_{i})+\frac{f_{i}^{*}-C_{ij}}{\varepsilon}\right)=1,
+
+so we take
+\log
+on both sides and get
+
+\displaystyle\frac{f_{i}^{*}}{\varepsilon}+\mathrm{LSE}_{j}\left(\log(b_{j})+\frac{g_{j}^{*}-C_{ij}}{\varepsilon}\right)=0,
+
+(21)
+
+\displaystyle\frac{g_{j}^{*}}{\varepsilon}+\mathrm{LSE}_{i}\left(\log(a_{i})+\frac{f_{i}^{*}-C_{ij}}{\varepsilon}\right)=0.
+
+If we apply iterative schemes to solve
+\mathbf{f}^{*}
+and
+\mathbf{g}^{*}
+, at the
+k
+-th iteration,
+
+•
+
+if we use the symmetric Sinkhorn with a half step Jacobi type update, which is adopted by the geomloss
+[
+21
+]
+, then the iteration reads
+
+\displaystyle f_{i}^{\rm{new}}=\frac{f_{i}^{(k)}}{2}-\frac{\varepsilon}{2}\mathrm{LSE}_{j}\left(\log(b_{j})+\frac{g_{j}^{\rm{old}}-C_{ij}}{\varepsilon}\right),
+
+\displaystyle g_{j}^{\rm{new}}=\frac{g_{j}^{(k)}}{2}-\frac{\varepsilon}{2}\mathrm{LSE}_{i}\left(\log(a_{i})+\frac{f_{i}^{\rm{old}}-C_{ij}}{\varepsilon}\right).
+
+•
+
+if we use the Gauss–Seidel type iteration which is adopted by the OTT
+[
+12
+]
+, then the update reads
+
+\displaystyle f_{i}^{\rm{new}}=-\varepsilon\mathrm{LSE}_{j}\left(\log(b_{j})+\frac{g_{j}^{\rm{old}}-C_{ij}}{\varepsilon}\right),
+
+\displaystyle g_{j}^{\rm{new}}=-\varepsilon\mathrm{LSE}_{i}\left(\log(a_{i})+\frac{f_{i}^{\rm{new}}-C_{ij}}{\varepsilon}\right).
+
+Note that Jacobi-type updates allow fully parallel updates, whereas Gauss–Seidel type updates require sequential updates. For small datasets (i.e., when
+n,m=O(10^{3})
+or smaller), Jacobi-type iterations are typically more efficient; in contrast, for large-scale problems, Gauss–Seidel-type iterations tend to be faster.
+
+Appendix C
+Differentiation of EOT with respect to data
+
+In this section, we derive the first- and second-order derivatives of EOT with respect to the source data
+X
+. The expressions of derivatives with respect to the target data
+Y
+will be similar. These closed-form expressions enable optimization without implicit differentiation, substantially improving memory efficiency, computational speed, and numerical robustness.
+
+Assume the squared Euclidean cost
+c_{ij}=\|\mathbf{x}_{i}-\mathbf{y}_{j}\|_{2}^{2}
+, and let
+
+P^{*}\in\mathbb{R}^{n\times m}
+be the optimal transport matrix with marginals
+
+\mathbf{a}\in\Delta^{n},\mathbf{b}\in\Delta^{m}
+, and optimal dual potentials
+\mathbf{f}^{*}\in\mathbb{R}^{n},\mathbf{g}^{*}\in\mathbb{R}^{m}
+.
+
+The first-order derivative.
+
+Suppose the optimal
+({\mathbf{f}}^{*},{\mathbf{g}}^{*})
+is a single element of the dual problem
+\mathcal{L}(\mathbf{f},\mathbf{g},P)
+, then by simply applying the Danskin’s theorem
+[
+7
+,
+11
+]
+to the dual formulation, we obtain the first-order derivatives with respect to the source dataset
+\mathbf{X}
+.
+
+\displaystyle\frac{d\mathrm{OT}_{\varepsilon}(\bm{\mu},\bm{\nu})}{d\mathbf{x}_{k}}=\frac{\partial\mathcal{L}(C,\mathbf{f},\mathbf{g},P^{*}(\mathbf{f},\mathbf{g}))}{\partial\mathbf{x}_{k}}=\sum_{j=1}^{m}P_{kj}^{*}\frac{\partial C_{kj}}{\partial\mathbf{x}_{k}}=2\sum_{j=1}^{m}P_{kj}^{*}\big(\mathbf{x}_{k}-\mathbf{y}_{j}\big)=2a_{k}\Big(\mathbf{x}_{k}-T_{\varepsilon}(\mathbf{x}_{k})\Big),
+
+(22)
+
+where
+T_{\varepsilon}
+is the barycentric projection defined as
+T_{\varepsilon}(\mathbf{x}_{i})=\frac{1}{a_{i}}\sum_{j=1}^{m}P_{ij}^{*}\mathbf{y}_{j}
+.
+
+The second-order derivative.
+
+This section derives the Hessian of the entropic optimal transport (EOT) objective
+
+\mathrm{OT}_{\varepsilon}(\bm{\mu},\bm{\nu})
+with respect to the source support
+X
+in
+eq.
+
+6
+.
+
+Define the sensitivity matrix
+H^{*}
+,
+
+H^{*}\;:=\;\begin{pmatrix}\mathrm{diag}(\mathbf{a})&P^{*}\\
+(P^{*})^{\top}&\mathrm{diag}(\mathbf{b})\end{pmatrix}\in\mathbb{R}^{(n+m)\times(n+m)}.
+
+For each
+k\in[n]
+, define
+B_{k}\in\mathbb{R}^{d\times m}
+by
+
+(B_{k})_{tj}\;:=\;2(x_{k,t}-y_{j,t})\,P^{*}_{kj},\qquad t\in[d],\ j\in[m].
+
+Lemma 6
+.
+
+For each
+k\in[n]
+, the Jacobians of the optimal potentials with respect to
+\mathbf{x}_{k}
+,
+
+\frac{\partial\mathbf{f}^{*}}{\partial\mathbf{x}_{k}}\in\mathbb{R}^{n\times d},\qquad\frac{\partial\mathbf{g}^{*}}{\partial\mathbf{x}_{k}}\in\mathbb{R}^{m\times d},\qquad\Big(\frac{\partial\mathbf{f}^{*}}{\partial\mathbf{x}_{k}}\Big)_{it}:=\frac{\partial f_{i}^{*}}{\partial x_{k,t}},\ \Big(\frac{\partial\mathbf{g}^{*}}{\partial\mathbf{x}_{k}}\Big)_{jt}:=\frac{\partial g_{j}^{*}}{\partial x_{k,t}},
+
+solve the linear system
+
+H^{*}\begin{pmatrix}\dfrac{\partial\mathbf{f}^{*}}{\partial\mathbf{x}_{k}}\\[2.84526pt]
+\dfrac{\partial\mathbf{g}^{*}}{\partial\mathbf{x}_{k}}\end{pmatrix}\;=\;\begin{pmatrix}\mathbf{e}_{k}\,(B_{k}\mathbbm{1}_{m})^{\top}\\[2.84526pt]
+B_{k}^{\top}\end{pmatrix},
+
+(23)
+
+where
+\mathbf{e}_{k}\in\mathbb{R}^{n}
+is the
+k
+-th standard basis vector.
+
+Proof.
+
+Differentiate the marginal constraints
+\sum_{j=1}^{m}P^{*}_{ij}=a_{i}
+and
+
+\sum_{i=1}^{n}P^{*}_{ij}=b_{j}
+with respect to
+x_{k,t}
+. Since
+\mathbf{a},\mathbf{b}
+are fixed,
+
+\sum_{j=1}^{m}\frac{\partial P^{*}_{ij}}{\partial x_{k,t}}=0,\qquad\sum_{i=1}^{n}\frac{\partial P^{*}_{ij}}{\partial x_{k,t}}=0.
+
+Using the optimality form (log-domain) of
+P^{*}
+(cf. (
+20
+)),
+
+\frac{\partial P^{*}_{ij}}{\partial x_{k,t}}=\frac{P^{*}_{ij}}{\varepsilon}\Big(\frac{\partial f_{i}^{*}}{\partial x_{k,t}}+\frac{\partial g_{j}^{*}}{\partial x_{k,t}}-\frac{\partial c_{ij}}{\partial x_{k,t}}\Big),\qquad\frac{\partial c_{ij}}{\partial x_{k,t}}=2(x_{i,t}-y_{j,t})\,\delta_{ik}.
+
+Plugging in and using
+\sum_{j}P^{*}_{ij}=a_{i}
+,
+\sum_{i}P^{*}_{ij}=b_{j}
+yields
+
+a_{i}\frac{\partial f_{i}^{*}}{\partial x_{k,t}}+\sum_{j=1}^{m}P^{*}_{ij}\frac{\partial g_{j}^{*}}{\partial x_{k,t}}=\delta_{ik}\sum_{j=1}^{m}2(x_{k,t}-y_{j,t})P^{*}_{kj},\qquad i\in[n],
+
+\sum_{i=1}^{n}P^{*}_{ij}\frac{\partial f_{i}^{*}}{\partial x_{k,t}}+b_{j}\frac{\partial g_{j}^{*}}{\partial x_{k,t}}=2(x_{k,t}-y_{j,t})P^{*}_{kj},\qquad j\in[m].
+
+Stacking these identities over
+t=1,\dots,d
+gives (
+23
+).
+∎
+
+Define
+\mathcal{B}\in\mathbb{R}^{n\times d\times m}
+by
+\mathcal{B}_{ktj}:=2(x_{k,t}-y_{j,t})P^{*}_{kj}
+, and
+define
+\mathcal{R}\in\mathbb{R}^{(n+m)\times n\times d}
+slice-wise (for each
+t\in[d]
+) as
+
+\mathcal{R}_{:,:,t}:=\begin{pmatrix}\mathrm{diag}\!\big(\mathcal{B}_{:,t,:}\mathbbm{1}_{m}\big)\\[2.84526pt]
+(\mathcal{B}_{:,t,:})^{\top}\end{pmatrix}.
+
+Note that
+\mathcal{R}_{:,k,:}\in\mathbb{R}^{(n+m)\times d}
+coincides with the right-hand side of
+(
+23
+).
+
+Theorem 7
+.
+
+Let
+\mathcal{T}=\nabla^{2}_{X}\mathrm{OT}_{\varepsilon}(\bm{\mu},\bm{\nu})\in\mathbb{R}^{n\times d\times n\times d}
+.
+Its entries decompose as
+
+\mathcal{T}_{ktsl}=\frac{1}{\varepsilon}\sum_{i,j=1}^{n+m}\mathcal{R}_{ikt}\,H^{*\dagger}_{ij}\,\mathcal{R}_{jsl}\;+\;\mathcal{E}_{ktsl},
+
+(24)
+
+where
+H^{*\dagger}
+is the Moore–Penrose pseudoinverse of
+H^{*}
+, and
+
+\mathcal{E}
+is block-diagonal across source points:
+
+\mathcal{E}_{k,:,s,:}=0\quad(k\neq s),\qquad\mathcal{E}_{k,:,k,:}=2a_{k}I_{d}-\frac{4}{\varepsilon}\sum_{j=1}^{m}P^{*}_{kj}\,(\mathbf{x}_{k}-\mathbf{y}_{j})^{\top}(\mathbf{x}_{k}-\mathbf{y}_{j}).
+
+Proof.
+
+For the squared Euclidean cost,
+
+\frac{\partial\mathrm{OT}_{\varepsilon}(\bm{\mu},\bm{\nu})}{\partial\mathbf{x}_{k}}=2\sum_{j=1}^{m}P^{*}_{kj}(\mathbf{x}_{k}-\mathbf{y}_{j})\in\mathbb{R}^{1\times d}.
+
+Fix
+s\in[n]
+. Differentiating entry-wise gives, for
+t,l\in[d]
+,
+
+\frac{\partial^{2}\mathrm{OT}_{\varepsilon}(\bm{\mu},\bm{\nu})}{\partial x_{s,l}\,\partial x_{k,t}}=2\sum_{j=1}^{m}(x_{k,t}-y_{j,t})\frac{\partial P^{*}_{kj}}{\partial x_{s,l}}\;+\;2\delta_{ks}\sum_{j=1}^{m}P^{*}_{kj}\,\delta_{tl}.
+
+The second term equals
+2a_{k}\delta_{ks}\delta_{tl}
+.
+Using
+
+\frac{\partial P^{*}_{kj}}{\partial x_{s,l}}=\frac{P^{*}_{kj}}{\varepsilon}\Big(\frac{\partial f_{k}^{*}}{\partial x_{s,l}}+\frac{\partial g_{j}^{*}}{\partial x_{s,l}}-\frac{\partial c_{kj}}{\partial x_{s,l}}\Big),\qquad\frac{\partial c_{kj}}{\partial x_{s,l}}=2(x_{k,l}-y_{j,l})\delta_{ks},
+
+yields
+
+\frac{\partial^{2}\mathrm{OT}_{\varepsilon}(\bm{\mu},\bm{\nu})}{\partial x_{s,l}\,\partial x_{k,t}}=\frac{1}{\varepsilon}\sum_{j=1}^{m}\mathcal{B}_{ktj}\Big(\frac{\partial f_{k}^{*}}{\partial x_{s,l}}+\frac{\partial g_{j}^{*}}{\partial x_{s,l}}\Big)\;+\;2a_{k}\delta_{ks}\delta_{tl}\;-\;\frac{4}{\varepsilon}\delta_{ks}\sum_{j=1}^{m}P^{*}_{kj}(x_{k,t}-y_{j,t})(x_{k,l}-y_{j,l}).
+
+By Lemma
+6
+,
+\begin{pmatrix}\partial\mathbf{f}^{*}/\partial\mathbf{x}_{s}\\
+\partial\mathbf{g}^{*}/\partial\mathbf{x}_{s}\end{pmatrix}=H^{*\dagger}\mathcal{R}_{:,s,:}
+. Therefore,
+
+\frac{1}{\varepsilon}\sum_{j=1}^{m}\mathcal{B}_{ktj}\Big(\frac{\partial f_{k}^{*}}{\partial x_{s,l}}+\frac{\partial g_{j}^{*}}{\partial x_{s,l}}\Big)=\frac{1}{\varepsilon}\sum_{i,j=1}^{n+m}\mathcal{R}_{ikt}\,H^{*\dagger}_{ij}\,\mathcal{R}_{jsl},
+
+and the remaining
+\delta_{ks}
+-terms form
+\mathcal{E}_{ktsl}
+. This proves
+eq.
+
+6
+.
+∎
+
+Remark 8
+.
+
+For strictly positive couplings (as produced by entropy regularization),
+H^{*}
+is singular with a simple
+zero eigenvalue; the pseudoinverse is therefore required.
+Moreover, the smallest positive eigenvalue of
+H^{*}
+can be very small in low-
+\varepsilon
+regimes
+[
+30
+]
+, making Hessian-related
+computations numerically ill-conditioned. In practice, truncated SVD, Tikhonov regularization, or preconditioning may be necessary to ensure numerical stability
+[
+12
+,
+27
+]
+. Although these techniques yield approximations of the Hessian–vector product (HVP), they can still provide accurate estimates of the Hessian spectrum with respect to the dataset or feature variables, depending on the chosen stabilization strategy.
+
+Appendix D
+Proof in Section
+3.1
+
+D.1
+Proof of Proposition
+1
+
+Proof.
+
+Throughout we use the identity for squared Euclidean cost
+
+C_{ij}=\|\mathbf{x}_{i}-\mathbf{y}_{j}\|_{2}^{2}=\|\mathbf{x}_{i}\|_{2}^{2}+\|\mathbf{y}_{j}\|_{2}^{2}-2\langle\mathbf{x}_{i},\mathbf{y}_{j}\rangle=\alpha_{i}+\beta_{j}-(QK^{\top})_{ij},
+
+since
+QK^{\top}=(\sqrt{2}X)(\sqrt{2}Y)^{\top}=2XY^{\top}
+and
+(XY^{\top})_{ij}=\mathbf{x}_{i}\mathbf{y}_{j}^{\top}
+.
+We also recall that for any constant
+c
+,
+\mathrm{LSE}_{j}(z_{j}+c)=\mathrm{LSE}_{j}(z_{j})+c
+.
+
+Define
+\bm{\delta}=\varepsilon\log\mathbf{b}
+and
+\bm{\gamma}=\varepsilon\log\mathbf{a}
+, so that
+\log b_{j}=\delta_{j}/\varepsilon
+and
+
+\log a_{i}=\gamma_{i}/\varepsilon
+. Define shifted potentials
+\hat{f}_{i}=f_{i}-\alpha_{i}
+and
+\hat{g}_{j}=g_{j}-\beta_{j}
+.
+
+Starting from the stabilized update (
+2
+),
+
+\displaystyle f_{i}
+
+\displaystyle=-\varepsilon\,\mathrm{LSE}_{j}\!\left[\frac{g_{j}-C_{ij}}{\varepsilon}+\log b_{j}\right]
+
+\displaystyle=-\varepsilon\,\mathrm{LSE}_{j}\!\left[\frac{g_{j}-(\alpha_{i}+\beta_{j}-(QK^{\top})_{ij})}{\varepsilon}+\frac{\delta_{j}}{\varepsilon}\right]
+
+\displaystyle=-\varepsilon\,\mathrm{LSE}_{j}\!\left[\frac{(QK^{\top})_{ij}+(g_{j}-\beta_{j})+\delta_{j}-\alpha_{i}}{\varepsilon}\right]
+
+\displaystyle=-\varepsilon\left(-\frac{\alpha_{i}}{\varepsilon}+\mathrm{LSE}_{j}\!\left[\frac{(QK^{\top})_{ij}+\hat{g}_{j}+\delta_{j}}{\varepsilon}\right]\right)
+
+\displaystyle=\alpha_{i}-\varepsilon\,\mathrm{LSE}_{j}\!\left[\frac{(QK^{\top})_{ij}+\hat{g}_{j}+\delta_{j}}{\varepsilon}\right].
+
+Subtracting
+\alpha_{i}
+from both sides yields
+
+\hat{f}_{i}=-\varepsilon\,\mathrm{LSE}_{j}\!\left[\frac{(QK^{\top})_{ij}+\hat{g}_{j}+\delta_{j}}{\varepsilon}\right].
+
+In matrix form, the quantity inside
+\mathrm{LSE}_{j}
+is exactly the
+i
+th row of
+
+S_{X}(\hat{\mathbf{g}})=\frac{QK^{\top}+\mathbbm{1}_{n}(\hat{\mathbf{g}}+\bm{\delta})}{\varepsilon},
+
+hence
+\hat{\mathbf{f}}=-\varepsilon\,\mathrm{LSE}_{\rm row}(S_{X}(\hat{\mathbf{g}}))
+, which is (
+10
+).
+
+For
+\hat{\mathbf{g}}
+update,
+\hat{\mathbf{g}}=-\varepsilon\,\mathrm{LSE}_{\rm row}(S_{Y}(\hat{\mathbf{f}}))
+can be proved similarly. This proves the claimed equivalence.
+∎
+
+D.2
+Proof of Theorem
+2
+
+Proof.
+
+Fix one row block
+I
+of size
+B_{N}
+. Algorithm
+1
+loads
+Q_{I}\in\mathbb{R}^{B_{N}\times d}
+
+once from HBM and keeps it in SRAM. It maintains running vectors
+m_{I},s_{I}\in\mathbb{R}^{B_{N}}
+on-chip, and then
+scans over all column blocks
+J
+.
+Across the full scan over
+J
+, every element of
+K\in\mathbb{R}^{m\times d}
+is loaded exactly once (just partitioned
+into tiles) and contributes
+\Theta(md)
+HBM reads, and every element of the bias
+u\in\mathbb{R}^{m}
+is loaded once and
+contributes
+\Theta(m)
+. No logits tile is written to HBM; only the final
+\hat{\mathbf{f}}_{I}
+is written back,
+which results in a total cost
+\Theta(B_{N})
+.
+
+Recall
+\lceil\cdot\rceil
+ceiling and
+\lfloor\cdot\rfloor
+floor functions, and for a single row block,
+
+\text{HBM}(I)=\Theta(B_{N}d+md+m+B_{N}).
+
+There are
+T_{N}=\lceil n/B_{N}\rceil
+row blocks, so total HBM accesses are
+
+\Theta\!\Big(T_{N}(B_{N}d+md+m+B_{N})\Big)=\Theta\!\Big(nd+\frac{n}{B_{N}}(md+m)+n\Big).
+
+From the SRAM fit condition
+
+B_{M}d+B_{N}d+(B_{M}+2B_{N})\ \lesssim\ M,
+
+we obtain
+
+(d+1)B_{M}+(d+2)B_{N}\ \lesssim\ M.
+
+Hence
+(d+2)B_{N}\lesssim M
+and therefore
+B_{N}=O(M/d)
+.
+
+Conversely, to maximize
+B_{N}
+under
+(\star)
+we minimize
+B_{M}
+.
+Taking
+B_{M}:=1
+and
+
+B_{N}:=\left\lfloor\frac{M-(d+1)}{d+2}\right\rfloor
+
+(which is feasible whenever the tiling constraint is satisfiable) yields
+
+B_{N}=\Omega(M/d)
+.
+Therefore the largest feasible row tile size satisfies
+B_{N}=\Theta(M/d)
+.
+
+In the regime
+d\leq M\leq\min\{n,m\}d
+this yields
+
+\Theta\!\Big(nd+\frac{n}{M/d}\,md\Big)=\Theta\!\Big(nd+\frac{nmd^{2}}{M}\Big),
+
+with the
+\frac{n}{B_{N}}m
+term absorbed since
+d\geq 1
+.
+If
+M\geq\min\{n,m\}d
+, we can fit the smaller of
+Q
+or
+K
+entirely in SRAM and stream the other once,
+so the IO collapses to
+\Theta(nd+md)
+. ∎
+
+In addition, we can show there is no uniform asymptotic improvement over all
+M
+. This follows by the same endpoint argument as FlashAttention Proposition 3: when
+
+M=\Theta(\min\{n,m\}d)
+, we have
+\frac{nmd^{2}}{M}=\Theta(\max\{n,m\}d)=\Theta(nd+md)
+.
+But any exact algorithm must at least read the inputs once, which already costs
+\Omega(nd+md)
+HBM accesses.
+Therefore no algorithm can achieve
+o(nmd^{2}/M)
+HBM accesses for all
+M
+in
+
+[d,\min\{n,m\}d]
+.
+
+D.3
+Proof of Online LSE Correctness
+
+Proof.
+
+We prove correctness for a single row; the vectorized (row-wise) statement used in
+Algorithm
+1
+follows by applying the same argument independently to each row.
+
+Fix a row and let
+\{\mathbf{x}_{j}\}_{j=1}^{m}
+denote its full logits, i.e.
+bx_{j}=S_{ij}
+for that row.
+Partition the column indices into
+K
+blocks
+J_{1},\dots,J_{K}
+(the tiles streamed by the algorithm).
+For each block
+k
+, define the block maximum
+
+\tilde{\mathbf{m}}^{(k)}:=\max_{j\in J_{k}}\mathbf{x}_{j}.
+
+The online LSE maintains a running maximum
+\mathbf{m}^{(k)}
+and a running normalized sum
+\mathbf{s}^{(k)}
+via
+
+\displaystyle\mathbf{m}^{(k)}
+
+\displaystyle:=\max\!\big(\mathbf{m}^{(k-1)},\tilde{\mathbf{m}}^{(k)}\big),
+
+\displaystyle\mathbf{s}^{(k)}
+
+\displaystyle:=e^{\,\mathbf{m}^{(k-1)}-\mathbf{m}^{(k)}}\,\mathbf{s}^{(k-1)}\;+\;\sum_{j\in J_{k}}e^{\,\mathbf{x}_{j}-\mathbf{m}^{(k)}},
+
+initialized with
+\mathbf{m}^{(0)}=-\infty
+and
+\mathbf{s}^{(0)}=0
+.
+We claim the following invariant holds for every
+k\in\{1,\dots,K\}
+:
+
+\mathbf{s}^{(k)}\;=\;\sum_{j\in J_{1}\cup\cdots\cup J_{k}}\exp\!\big(\mathbf{x}_{j}-\mathbf{m}^{(k)}\big).
+
+(25)
+
+In the base case
+k=1
+,
+since
+\mathbf{m}^{(1)}=\tilde{\mathbf{m}}^{(1)}=\max_{j\in J_{1}}\mathbf{x}_{j}
+and
+\mathbf{s}^{(0)}=0
+, the update gives
+
+\mathbf{s}^{(1)}=\sum_{j\in J_{1}}e^{\mathbf{x}_{j}-\mathbf{m}^{(1)}},
+
+which is exactly (
+25
+) for
+k=1
+.
+
+Assume (
+25
+) holds for
+k-1
+. Then
+
+\displaystyle\mathbf{s}^{(k)}
+
+\displaystyle=e^{\mathbf{m}^{(k-1)}-\mathbf{m}^{(k)}}\mathbf{s}^{(k-1)}+\sum_{j\in J_{k}}e^{\mathbf{x}_{j}-\mathbf{m}^{(k)}}
+
+\displaystyle=e^{\mathbf{m}^{(k-1)}-\mathbf{m}^{(k)}}\sum_{j\in J_{1}\cup\cdots\cup J_{k-1}}e^{\mathbf{x}_{j}-\mathbf{m}^{(k-1)}}+\sum_{j\in J_{k}}e^{\mathbf{x}_{j}-\mathbf{m}^{(k)}}
+
+\displaystyle=\sum_{j\in J_{1}\cup\cdots\cup J_{k-1}}e^{\mathbf{x}_{j}-\mathbf{m}^{(k)}}+\sum_{j\in J_{k}}e^{\mathbf{x}_{j}-\mathbf{m}^{(k)}}=\sum_{j\in J_{1}\cup\cdots\cup J_{k}}e^{\mathbf{x}_{j}-\mathbf{m}^{(k)}},
+
+proving the invariant for
+k
+.
+
+At the end of the stream (
+k=K
+), we have
+
+\mathbf{m}^{(K)}=\max_{1\leq j\leq m}\mathbf{x}_{j},\qquad\mathbf{s}^{(K)}=\sum_{j=1}^{m}e^{\mathbf{x}_{j}-\mathbf{m}^{(K)}}.
+
+Therefore,
+
+\mathbf{m}^{(K)}+\log\mathbf{s}^{(K)}=\mathbf{m}^{(K)}+\log\!\left(\sum_{j=1}^{K}e^{\mathbf{x}_{j}-\mathbf{m}^{(K)}}\right)=\log\!\left(\sum_{j=1}^{m}e^{\mathbf{x}_{j}}\right)=\mathrm{LSE}(\mathbf{x}).
+
+Applying this row-wise yields
+\mathrm{LSE}_{\rm row}(S)=m+\log s
+, and hence the algorithm computes
+
+\hat{\mathbf{f}}=-\varepsilon\,\mathrm{LSE}_{\rm row}(S_{X}(\hat{\mathbf{g}}))
+as claimed.
+∎
+
+Appendix E
+Proof in Section
+3.2
+
+E.1
+Proof of Proposition
+3
+
+Proof.
+
+Fix shifted potentials
+(\hat{\mathbf{f}},\hat{\mathbf{g}})
+. With
+a_{i}=\exp(\gamma_{i}/\varepsilon)
+and
+b_{j}=\exp(\delta_{j}/\varepsilon)
+,
+the transport matrix entry rewrites as
+
+P_{ij}=a_{i}\exp\!\left(\frac{\hat{f}_{i}}{\varepsilon}\right)\exp\!\big(S_{X}(\hat{\mathbf{g}})_{ij}\big).
+
+For the matrix-vector product
+(PV)_{i}=\sum_{j}P_{ij}V_{j}
+, we have
+
+(PV)_{i}=a_{i}\exp\!\left(\frac{\hat{f}_{i}}{\varepsilon}\right)\sum_{j=1}^{m}\exp\!\big(S_{X}(\hat{\mathbf{g}})_{ij}\big)\,V_{j}.
+
+For numerical stability, let
+m_{i}:=\max_{j}S_{X}(\hat{\mathbf{g}})_{ij}
+and factor out
+\exp(m_{i})
+:
+
+\displaystyle(PV)_{i}=a_{i}\exp\!\left(\frac{\hat{f}_{i}}{\varepsilon}+m_{i}\right)\sum_{j=1}^{m}\exp\!\big(S_{X}(\hat{\mathbf{g}})_{ij}-m_{i}\big)\,V_{j}.
+
+(26)
+
+This formulation admits online (streaming) computation:
+as we iterate over column blocks
+J
+, we maintain a running maximum
+m_{i}
+and accumulate
+
+O_{i}:=\sum_{j}\exp(S_{ij}-m_{i})V_{j}
+using the recurrence
+
+O_{i}\leftarrow\exp(m_{i}^{\mathrm{old}}-m_{i}^{\mathrm{new}})\cdot O_{i}+\exp(S_{iJ}-m_{i}^{\mathrm{new}})\,V_{J}.
+
+After processing all blocks, the final output is
+a_{i}\exp(\hat{f}_{i}/\varepsilon+m_{i})\cdot O_{i}
+.
+
+Define
+s_{i}:=\sum_{j}\exp(S_{X}(\hat{\mathbf{g}})_{ij}-m_{i})
+. Then
+
+\hat{f}_{i}^{+}=-\varepsilon\,\mathrm{LSE}_{j}(S_{X}(\hat{\mathbf{g}})_{ij})=-\varepsilon(m_{i}+\log s_{i}),
+
+and the row marginal satisfies
+
+r_{i}=a_{i}\exp\!\left(\frac{\hat{f}_{i}-\hat{f}_{i}^{+}}{\varepsilon}\right)=a_{i}\exp\!\left(\frac{\hat{f}_{i}}{\varepsilon}+m_{i}+\log s_{i}\right)=a_{i}\exp\!\left(\frac{\hat{f}_{i}}{\varepsilon}+m_{i}\right)\cdot s_{i}.
+
+Hence the formula
+eq.
+
+15
+equals
+
+\displaystyle(PV)_{i}=\frac{r_{i}}{s_{i}}\cdot O_{i}=r_{i}\cdot\frac{O_{i}}{s_{i}}=r_{i}\cdot\mathrm{Softmax}(S_{X}(\hat{\mathbf{g}}))_{i}\,V,
+
+(27)
+
+confirming
+PV=\mathrm{diag}(\mathbf{r})\,\mathrm{Softmax}(S_{X}(\hat{\mathbf{g}}))\,V
+.
+
+The streaming formulation
+eq.
+
+26
+is preferable for implementation because
+the normalizing sum
+s_{i}
+cancels algebraically and need not be computed explicitly.
+This saves one accumulator per row and one reduction operation per tile.
+
+The transpose case
+eq.
+
+16
+follows by symmetry, exchanging source and target roles.
+
+At the Sinkhorn fixed point,
+\hat{\mathbf{f}}^{*}=\hat{\mathbf{f}}^{*+}
+and
+\hat{\mathbf{g}}^{*}=\hat{\mathbf{g}}^{*+}
+,
+so
+r_{i}=a_{i}
+and
+c_{j}=b_{j}
+. Thus
+P(\hat{\mathbf{f}}^{*},\hat{\mathbf{g}}^{*})
+has the prescribed marginals
+
+\mathbf{a}
+and
+\mathbf{b}
+, recovering the optimal transport matrix.
+∎
+
+E.2
+Proof of Corollary
+4
+
+Proof.
+
+By Proposition
+3
+(row form) with
+V=Y
+, we have
+
+P(\hat{\mathbf{f}}^{*},\hat{\mathbf{g}}^{*})\,Y=\mathrm{diag}(r)\,\rm{Softmax}_{\rm row}(S_{X}^{*})\,Y.
+
+At a Sinkhorn fixed point, the transport matrix has the prescribed row marginal, i.e.
+r=\mathbf{a}
+,
+and
+P(\hat{\mathbf{f}}^{*},\hat{\mathbf{g}}^{*})=P^{*}
+. Therefore
+
+P^{*}Y=\mathrm{diag}(\mathbf{a})\,\rm{Softmax}_{\rm row}(S_{X}^{*})\,Y,\qquad T_{\varepsilon}(X)=\mathrm{diag}(\mathbf{a})^{-1}P^{*}Y=\rm{Softmax}_{\rm row}(S_{X}^{*})\,Y,
+
+which proves the attention form of the barycentric projection.
+
+Finally, for squared Euclidean cost the gradient identity
+
+\nabla_{\mathbf{x}_{i}}\mathrm{OT}_{\varepsilon}(\bm{\mu},\bm{\nu})=2a_{i}\big(\mathbf{x}_{i}-T_{\varepsilon}(\mathbf{x}_{i})\big)
+holds.
+Stacking these
+n
+row-gradients gives
+
+\nabla_{X}\mathrm{OT}_{\varepsilon}(\bm{\mu},\bm{\nu})=2\mathrm{diag}(\mathbf{a})\big(X-T_{\varepsilon}(X)\big)=2\mathrm{diag}(\mathbf{a})\Big(X-\rm{Softmax}_{\rm row}(S_{X}^{*})Y\Big),
+
+which is (
+17
+).
+∎
+
+Appendix F
+Streaming Hessian-Vector Products Derivation and Proof of Theorem
+5
+
+Fix
+A\in\mathbb{R}^{n\times d}
+. Define the HVP
+G:=\mathcal{T}\,A\in\mathbb{R}^{n\times d}
+entrywise by
+
+G_{kt}\;:=\;\sum_{s=1}^{n}\sum_{l=1}^{d}\mathcal{T}_{ktsl}\,A_{sl}
+.
+
+Recall the Hessian decomposition
+\mathcal{T}=\frac{1}{\varepsilon}\,\mathcal{R}^{\top}H^{*\dagger}\mathcal{R}+\mathcal{E}
+in
+Equation
+
+6
+.
+Then the HVP splits into an implicit term (through
+H^{*\dagger}
+) and an explicit term:
+
+\mathcal{T}\,A\;=\;\frac{1}{\varepsilon}\,\mathcal{R}^{\top}\mathbf{w}\;+\;\mathcal{E}\,A,\qquad\mathbf{w}:=H^{*\dagger}(\mathcal{R}\,A),
+
+(28)
+
+where
+\mathcal{R}\,A\in\mathbb{R}^{n+m}
+is the contraction
+
+(\mathcal{R}\,A)_{i}=\sum_{s,l}\mathcal{R}_{isl}A_{sl},
+
+and
+\mathbf{w}
+is the minimum-norm solution of the consistent linear system
+
+H^{*}\mathbf{w}\;=\;\mathcal{R}\,A.
+
+(29)
+
+The matrix
+H^{*}
+is symmetric positive semidefinite with a simple zero eigenvalue under strictly positive couplings
+
+\,P^{*}_{kj}>0\,
+, hence the need for
+H^{*\dagger}
+; see
+[
+30
+]
+.
+
+Let
+\odot
+denote the Hadamard product and
+\mathbbm{1}_{d}
+the all-ones vector in
+\mathbb{R}^{d}
+.
+Define the rowwise dot-products
+
+\langle X,A\rangle\;:=\;(X\odot A)\mathbbm{1}_{d}\in\mathbb{R}^{n}.
+
+F.1
+Explicit term
+\mathcal{E}\,A
+
+Since
+\mathcal{E}
+is block-diagonal across source points,
+(\mathcal{E}\,A)_{kt}
+depends only on the
+k
+-th row
+A_{k:}
+:
+
+(\mathcal{E}\,A)_{kt}=\sum_{l=1}^{d}\mathcal{E}_{ktkl}\,A_{kl}=2a_{k}A_{kt}-\frac{4}{\varepsilon}\sum_{j=1}^{m}\sum_{l=1}^{d}P^{*}_{kj}\,(x_{kt}-y_{jt})(x_{kl}-y_{jl})\,A_{kl}.
+
+Introduce
+
+\mathbf{u}:=\langle X,A\rangle\in\mathbb{R}^{n},\qquad\mathbf{u}_{P}:=\langle PY,A\rangle\in\mathbb{R}^{n},\qquad W:=AY^{\top}\in\mathbb{R}^{n\times m}\quad(W_{kj}=\langle A_{k},y_{j}\rangle).
+
+Then the contraction
+\mathcal{E}\,A\in\mathbb{R}^{n\times d}
+admits the streaming-friendly decomposition
+
+\mathcal{E}\,A=B_{1}-\frac{4}{\varepsilon}\,(B_{2}-B_{3}-B_{4}+B_{5}),
+
+(30)
+
+with
+
+\displaystyle B_{1}
+
+\displaystyle=2\,\mathrm{diag}(\mathbf{a})\,A,
+
+(31)
+
+\displaystyle B_{2}
+
+\displaystyle=\mathrm{diag}(\mathbf{a}\odot\mathbf{u})\,X,
+
+\displaystyle B_{3}
+
+\displaystyle=\mathrm{diag}(\mathbf{u})\,(PY),
+
+\displaystyle B_{4}
+
+\displaystyle=\mathrm{diag}(\mathbf{u}_{P})\,X,
+
+\displaystyle B_{5}
+
+\displaystyle=(P^{*}\odot W)\,Y.
+
+Here
+B_{3},B_{4}
+use
+PY
+and rowwise dot-products, while
+B_{5}
+is a Hadamard-weighted transport
+
+(P^{*}\odot(AY^{\top}))Y
+; all can be implemented via streaming
+P^{*}
+-vector products without materializing
+P^{*}
+
+(or
+W
+).
+
+F.2
+Implicit term
+\mathcal{R}^{\top}\mathbf{w}
+
+Write
+\mathbf{w}=\begin{pmatrix}\mathbf{w}_{1}\\
+\mathbf{w}_{2}\end{pmatrix}
+with
+\mathbf{w}_{1}\in\mathbb{R}^{n}
+,
+\mathbf{w}_{2}\in\mathbb{R}^{m}
+.
+The implicit term in
+Equation
+
+28
+is evaluated in three steps.
+
+Step 1: build the right-hand side
+\mathbf{r}:=\mathcal{R}\ A
+.
+
+Using the definition of
+\mathcal{R}
+with
+\mathcal{B}_{ktj}=2(x_{kt}-y_{jt})P^{*}_{kj}
+, the contraction
+
+\mathbf{r}=\begin{pmatrix}\mathbf{r}_{1}\\
+\mathbf{r}_{2}\end{pmatrix}\in\mathbb{R}^{n+m}
+has blocks
+
+\boxed{\begin{aligned} \mathbf{r}_{1}&=2\Big(\mathbf{a}\odot\mathbf{u}-\mathbf{u}_{P}\Big)\in\mathbb{R}^{n},\\[2.84526pt]
+\mathbf{r}_{2}&=2\Big(P^{*\top}\mathbf{u}-\langle P^{*\top}A,\;Y\rangle\Big)\in\mathbb{R}^{m}.\end{aligned}}
+
+(32)
+
+Every term here is a vector product with
+P^{*}
+or
+P^{*\top}
+, plus elementwise operations.
+
+Step 2: solve
+H^{*}\mathbf{w}=\mathbf{r}
+via a (damped) Schur complement..
+
+Write
+\mathbf{w}=\binom{\mathbf{w}_{1}}{\mathbf{w}_{2}}
+and
+\mathbf{r}=\binom{\mathbf{r}_{1}}{\mathbf{r}_{2}}
+, so that
+
+\begin{pmatrix}\mathrm{diag}(\mathbf{a})&P^{*}\\
+(P^{*})^{\top}&\mathrm{diag}(\mathbf{b})\end{pmatrix}\binom{\mathbf{w}_{1}}{\mathbf{w}_{2}}=\binom{\mathbf{r}_{1}}{\mathbf{r}_{2}}.
+
+When
+P^{*}>0
+,
+H^{*}
+is symmetric positive semidefinite with a one-dimensional nullspace being
+
+H^{*}[\mathbbm{1}_{n};-\mathbbm{1}_{m}]=\mathbf{0}
+.
+Eliminating
+\mathbf{w}_{1}
+yields the Schur-complement system:
+
+\underbrace{\Big(\mathrm{diag}(\mathbf{b})-(P^{*})^{\top}\mathrm{diag}(\mathbf{a})^{-1}P^{*}\Big)}_{=:S\in\mathbb{R}^{m\times m}}\mathbf{w}_{2}\;=\;\mathbf{r}_{2}-(P^{*})^{\top}\mathrm{diag}(\mathbf{a})^{-1}\mathbf{r}_{1},\qquad\mathbf{w}_{1}=\mathrm{diag}(\mathbf{a})^{-1}(\mathbf{r}_{1}-P^{*}\mathbf{w}_{2}).
+
+(33)
+
+Moreover,
+S\succeq 0
+and
+S\mathbbm{1}_{m}=0
+(the same mass-shift mode), so one can either
+(i) project onto
+\mathbbm{1}_{m}^{\perp}
+and run CG there, or
+(ii) apply Tikhonov damping
+S_{\tau}:=S+\tau I
+to obtain an SPD system.
+In this work, we use damping and solve
+
+S_{\tau}\mathbf{w}_{2}=\mathbf{r}_{2}-(P^{*})^{\top}\mathrm{diag}(\mathbf{a})^{-1}\mathbf{r}_{1},\qquad S_{\tau}:=\Big(\mathrm{diag}(\mathbf{b})-(P^{*})^{\top}\mathrm{diag}(\mathbf{a})^{-1}P^{*}\Big)+\tau I.
+
+For a target relative residual
+\eta
+, CG satisfies the standard iteration bound
+
+K_{CG}=O\!\big(\sqrt{\kappa(S_{\tau})}\log(1/\eta)\big)
+for SPD systems
+[
+24
+]
+.
+Consequently, the transport-dominated HVP cost scales as
+
+O\!\Big(nm\big(d+\sqrt{\kappa(S_{\tau})}\log(1/\eta)\big)\Big).
+
+As
+\varepsilon\downarrow 0
+, conditioning can deteriorate:
+[
+30
+]
+show that the associated sensitivity matrix
+has a simple zero eigenvalue and can have a smallest positive eigenvalue as small as
+O(e^{-1/\varepsilon})
+,
+implying potentially large effective condition numbers at small
+\varepsilon
+.
+Damping enforces
+\lambda_{\min}(S_{\tau})\geq\tau
+, hence
+
+\kappa(S_{\tau})\leq(\lambda_{\max}(S)+\tau)/\tau
+, which stabilizes
+K
+.
+Finally, in the strictly SPD setting the Schur complement is not worse conditioned than the full system:
+if
+H\succ 0
+, then
+S(H)^{-1}
+is a principal submatrix of
+H^{-1}
+and eigenvalue interlacing
+implies
+\kappa_{2}(S(H))\leq\kappa_{2}(H)
+
+[
+24
+]
+.
+
+Step 3: apply
+\mathcal{R}^{\top}
+to
+\mathbf{w}
+.
+
+Given
+\mathbf{w}_{1},\mathbf{w}_{2}
+, the contraction
+\mathcal{R}^{\top}\mathbf{w}\in\mathbb{R}^{n\times d}
+simplifies to
+
+\boxed{\mathcal{R}^{\top}\mathbf{w}=2\Big(\mathrm{diag}(\mathbf{a}\odot\mathbf{w}_{1})\,X-\mathrm{diag}(\mathbf{w}_{1})\,(PY)+\mathrm{diag}(P^{*}\mathbf{w}_{2})\,X-P^{*}(\mathrm{diag}(\mathbf{w}_{2})\,Y)\Big).}
+
+(34)
+
+Again, only transport-like products
+P^{*}v
+,
+P^{*\top}u
+,
+PY
+, and
+P^{*}(\mathrm{diag}(\mathbf{w}_{2})Y)
+appear.
+
+Summary.
+
+Combining
+Equation
+
+28
+,
+Equation
+
+30
+–
+Equation
+
+31
+,
+and
+Equation
+
+32
+–
+Equation
+
+34
+, the full HVP reduces to
+(i) a small number of
+P^{*}
+/
+P^{*\top}
+transport vectors,
+(ii) transport matrices
+PY
+and
+P^{*}(\mathrm{diag}(\mathbf{w}_{2})Y)
+, and
+(iii) one Hadamard-weighted transport
+(P^{*}\odot(AY^{\top}))Y
+,
+all of which admit FlashAttention-style streaming implementations.
+
+Remark 9
+
+(Sign structure)
+.
+
+The implicit component
+\frac{1}{\varepsilon}\,\mathcal{R}^{\top}H^{*\dagger}\mathcal{R}
+is positive semidefinite because
+
+H^{*\dagger}\succeq 0
+and it appears as
+\mathcal{R}^{\top}(\cdot)\mathcal{R}
+.
+The explicit component
+\mathcal{E}
+is block-diagonal with blocks
+
+2a_{k}\mathbb{I}_{d}-\frac{4}{\varepsilon}\sum_{j}P^{*}_{kj}(\mathbf{x}_{k}-\mathbf{y}_{j})^{\top}(\mathbf{x}_{k}-\mathbf{y}_{j})
+,
+i.e.,
+2a_{k}\mathbb{I}_{d}
+minus a PSD term scaled by
+4/\varepsilon
+. Hence
+\mathcal{E}
+, and therefore
+\mathcal{T}
+is generally indefinite.
+
+F.3
+Computational complexity of one HVP
+
+We count operations that traverse the dense pairwise interactions. Since
+P^{*}
+is not materialized,
+each transport application is implemented from potentials by streaming tiles, forming biased dot-product
+scores, and applying online normalization
+[
+15
+,
+37
+]
+.
+
+Let a streamed transport application be
+P^{*}V
+or
+(P^{*})^{\top}U
+with
+V\in\mathbb{R}^{m\times p}
+,
+U\in\mathbb{R}^{n\times p}
+.
+One streamed pass costs
+
+\Theta\!\big(nm(d+p)\big)\ \text{flops}
+
+because it forms scores with
+\Theta(nmd)
+dot products and accumulates values with
+\Theta(nmp)
+multiply-adds
+(the remaining exp/LSE bookkeeping is
+O(nm)
+).
+In particular:
+(i) a
+transport–vector
+(
+p=1
+) costs
+\Theta(nm(d+1))=\Theta(nmd)
+flops;
+(ii) a
+transport–matrix
+with
+p=d
+costs
+\Theta(nm(2d))=\Theta(nmd)
+flops.
+A
+Hadamard-weighted transport
+
+(P^{*}\odot(AY^{\top}))Y
+is also
+\Theta(nmd)
+flops when fused,
+noting it requires an additional streamed dot product
+AY^{\top}
+but remains the same order.
+
+\mathcal{E}\,A
+.
+
+Using
+\mathcal{E}\,A=B_{1}-\frac{4}{\varepsilon}(B_{2}-B_{3}-B_{4}+B_{5})
+, the dense operations are:
+(i) one transport–matrix
+P^{*}Y
+, which is cacheable across repeated HVPs at fixed
+(\hat{\mathbf{f}}^{*},\hat{\mathbf{g}}^{*})
+,
+and (ii) one Hadamard-weighted transport
+B_{5}=(P^{*}\odot(AY^{\top}))Y
+.
+All remaining terms are rowwise scalings and dot-products, costing
+O((n+m)d)
+.
+Hence,
+\text{flops}(\mathcal{E}\,A)=\Theta(nmd)
+.
+
+\mathcal{R}^{\top}\mathbf{w}
+.
+
+Forming
+\mathbf{r}=\mathcal{R}\,A
+requires a transport–matrix
+(P^{*})^{\top}A
+plus a constant number of transport–vector products,
+hence
+\Theta(nmd)
+flops.
+Eliminating
+\mathbf{w}_{1}
+yields the Schur system
+S\,\mathbf{w}_{2}=\mathrm{rhs}
+, which we solve by CG.
+Each CG iteration applies
+S
+once, i.e., one
+P^{*}
+and one
+(P^{*})^{\top}
+transport–vector application,
+so
+K
+iterations cost
+\Theta(K_{CG}\,nmd)
+flops.
+Back-substitution and the final application of
+\mathcal{R}^{\top}\mathbf{w}
+contribute an additional
+\Theta(nmd)
+flops.
+Therefore,
+
+\text{flops}(\mathcal{R}^{\top}\mathbf{w})=\Theta\!\big((2K_{CG}+O(1))\,nmd\big).
+
+Total.
+
+Combining the above,
+
+\text{flops}(\mathcal{T}\,A)=\Theta\!\big((2K_{CG}+O(1))\,nmd\big)=O\!\big((K_{CG}+1)\,nmd\big),
+
+up to constant factors. The working memory stores
+X,Y,A
+and a constant number of
+n\times d
+or
+m\times d
+buffers
+(e.g.,
+P^{*}Y
+,
+(P^{*})^{\top}A
+) and
+O(n+m)
+vectors, hence in total
+O((n+m)d)
+memory without materializing
+P^{*}
+.
+
+Appendix G
+Implementation Details
+
+G.1
+Algorithms
+
+A direct implementation of (
+10
+) would invoke separate kernels to (i) compute the score
+tiles
+QK^{\top}
+, (ii) add biases, and (iii) perform a row-wise
+\mathrm{LSE}
+reduction, typically incurring extra
+HBM traffic and kernel-launch overhead due to intermediate score materialization.
+Instead, we fuse these stages into a single streaming kernel: each thread block loads a tile of
+Q
+and
+iterates over tiles of
+K
+, updates the running row-wise max and rescaled sum-exp statistics
+
+(\mathbf{m}_{I},\mathbf{s}_{I})
+(online
+\mathrm{LSE}
+), and emits
+\hat{\mathbf{f}}_{I}
+(or
+\hat{\mathbf{g}}_{I}
+) once per row block.
+For transport matrix application, we additionally
+maintain a weighted accumulator
+O_{I}:=\sum_{j}\exp(S_{ij}-m_{i})\,V_{j}
+in the same streaming pass.
+Crucially, the normalizing sum
+\mathbf{s}_{I}=\sum_{j}\exp(S_{ij}-m_{i})
+need not be tracked explicitly:
+it cancels algebraically in the final marginal correction
+
+\mathrm{out}_{I}=\mathbf{a}_{I}\odot\exp(\hat{\mathbf{f}}_{I}/\varepsilon+\mathbf{m}_{I})\odot O_{I}
+,
+saving one accumulator register per row and one reduction per tile compared to standard
+softmax-weighted attention.
+
+In addition to
+Algorithm
+
+1
+and
+Algorithm
+
+2
+, we will have three more algorithms: streaming
+\hat{\mathbf{g}}
+-update in
+algorithm
+
+3
+; apply adjoint transport from potentials
+P^{\top}\,V
+in
+algorithm
+
+4
+and Hadamard-weighted transport from potentials
+(P\odot W)\,V
+in
+algorithm
+
+5
+.
+
+To maintain mathematical consistency for the current transport matrix
+P
+(and hence for early-stopped Sinkhorn),
+our implementation uses induced marginals throughout:
+
+•
+
+Gradient.
+For squared Euclidean cost,
+
+\nabla_{X}\mathrm{OT}_{\varepsilon}(\bm{\mu},\bm{\nu})\;=\;2\big(\mathrm{diag}(\hat{\mathbf{a}})\,X-PY\big),
+
+i.e., the row-scaling term uses
+\hat{\mathbf{a}}=P\mathbbm{1}_{m}
+which is available for free from the same streaming
+normalizations used to evaluate
+PY
+.
+
+•
+
+HVP.
+The sensitivity matrix and its Schur complement are constructed using
+
+\hat{\mathbf{a}},\hat{\mathbf{b}}
+:
+
+H(P)\;=\;\begin{pmatrix}\mathrm{diag}(\hat{\mathbf{a}})&P\\
+P^{\top}&\mathrm{diag}(\hat{\mathbf{b}})\end{pmatrix},\qquad S(P)\;=\;\mathrm{diag}(\hat{\mathbf{b}})-P^{\top}\mathrm{diag}(\hat{\mathbf{a}})^{-1}P,
+
+This ensures that the gradient and HVP are consistent objects derived from the same transport matrix
+P
+, rather than the optimal coupling
+P^{*}
+with the target marginals
+(\mathbf{a},\mathbf{b})
+.
+When Sinkhorn is fully converged,
+\hat{\mathbf{a}}=\mathbf{a}
+and
+\hat{\mathbf{b}}=\mathbf{b}
+, and the distinction disappears.
+
+G.2
+Loop order
+
+Both FlashAttention and FlashSinkhorn rely on the same online-softmax/online-LSE recurrence (running row-wise max and rescaled exp-sums) to avoid materializing the score matrix in HBM. The difference is which operand is held stationary in SRAM. FlashAttention Algorithm 1 chooses a
+(K,V)
+-stationary traversal: it loops over key/value blocks
+j
+in the outer loop, loads
+(K_{j},V_{j})
+into on-chip SRAM once, and then sweeps over all query blocks
+Q_{i}
+to update
+(O_{i},\ell_{i},m_{i})
+, writing these intermediate quantities back to HBM each pass. This ordering is motivated by IO: with the block-size choice
+B_{r}
+, the number of query blocks can be large, and streaming
+(K,V)
+outermost avoids repeatedly reloading the same
+(K,V)
+blocks from HBM.
+
+In contrast, FlashSinkhorn’s half-steps are fundamentally row-wise reduction. We therefore adopt a row-stationary traversal: fix a query row block
+Q_{I}
+in SRAM, stream all key/value blocks
+(K_{J},V_{J})
+, and maintain the running statistics and accumulators
+(\mathbf{m}_{I},\mathbf{s}_{I})
+(and
+O_{I}
+when computing
+P\,V
+) on-chip until the row block is complete, then write out
+\hat{\mathbf{f}}_{I}
+or
+(P\,V)_{I}
+once. This strategy substantially reduces HBM traffic for intermediate accumulators and is particularly critical for OT transport‑matrix/vector products, where the column dimension of
+V
+, whenever it is a matrix or a vector ,can be much larger than an attention head, making standard FlashAttention‑style online normalization impractical.
+
+Algorithm 3
+
+FlashSinkhorn: streaming
+\hat{\mathbf{g}}
+-update
+
+1:
+
+Input:
+
+X\in\mathbb{R}^{n\times d}
+,
+Y\in\mathbb{R}^{m\times d}
+,
+\hat{\mathbf{f}}\in\mathbb{R}^{n}
+,
+\mathbf{a}\in\Delta^{n}
+
+2:
+
+Output:
+
+\hat{\mathbf{g}}\in\mathbb{R}^{m}
+
+3:
+
+\bm{\gamma}\leftarrow\varepsilon\log\mathbf{a}
+
+// scale on load
+
+4:
+
+for
+each row block
+J
+of size
+B_{M}
+
+do
+
+5:
+
+Load
+Y_{J}
+to on-chip SRAM
+
+6:
+
+\mathbf{m}_{J}\leftarrow-\infty
+,
+\mathbf{s}_{J}\leftarrow 0
+
+// running max / sumexp
+
+7:
+
+for
+each column block
+I
+of size
+B_{N}
+
+do
+
+8:
+
+Load
+X_{I}
+,
+\hat{\mathbf{f}}_{I}
+and
+\bm{\gamma}_{I}
+to on-chip SRAM
+
+9:
+
+S\leftarrow(2Y_{J}X_{I}^{\top}+\hat{\mathbf{f}}_{I}+\bm{\gamma}_{I})/\varepsilon
+
+// score tile + source bias
+
+10:
+
+\tilde{\mathbf{m}}\leftarrow\mathrm{rowmax}(S)
+
+// max over col
+
+11:
+
+\mathbf{m}_{\mathrm{new}}\leftarrow\max(\mathbf{m}_{J},\tilde{\mathbf{m}})
+
+// update elementwise
+
+12:
+
+\mathbf{s}_{J}\leftarrow e^{\mathbf{m}_{J}-\mathbf{m}_{\mathrm{new}}}\odot\mathbf{s}_{J}+\mathrm{rowsum}\!\left(e^{S-\mathbf{m}_{\mathrm{new}}}\right)
+
+13:
+
+\mathbf{m}_{J}\leftarrow\mathbf{m}_{\mathrm{new}}
+
+14:
+
+end
+
+for
+
+15:
+
+\hat{\mathbf{g}}_{J}\leftarrow-\varepsilon\cdot\big(\mathbf{m}_{J}+\log\mathbf{s}_{J}\big)
+
+//
+\hat{\mathbf{g}}=-\varepsilon\,\mathrm{LSE}_{\rm row}
+
+16:
+
+Write
+\hat{\mathbf{g}}_{J}
+to HBM
+
+17:
+
+end
+
+for
+
+Algorithm 4
+
+Apply Adjoint Transport from Potentials,
+P^{\top}\!V
+
+1:
+
+Input:
+
+X\in\mathbb{R}^{n\times d}
+,
+Y\in\mathbb{R}^{m\times d}
+,
+\hat{\mathbf{f}}\in\mathbb{R}^{n}
+,
+\hat{\mathbf{g}}\in\mathbb{R}^{m}
+,
+\mathbf{a}\in\Delta^{n}
+,
+
+\mathbf{b}\in\Delta^{m}
+,
+V\in\mathbb{R}^{n\times p}
+
+2:
+
+Output:
+
+\mathrm{out}=P^{\top}V\in\mathbb{R}^{m\times p}
+
+3:
+
+\bm{\gamma}\leftarrow\varepsilon\log\mathbf{a}
+// absorb marginal into bias
+
+4:
+
+for
+each row block
+J
+of size
+B_{M}
+
+do
+
+5:
+
+Load
+Y_{J}
+,
+\hat{\mathbf{g}}_{J}
+,
+\mathbf{b}_{J}
+to on-chip SRAM
+
+6:
+
+\mathbf{m}_{J}\leftarrow-\infty
+,
+O_{J}\leftarrow 0
+
+7:
+
+for
+each column block
+I
+of size
+B_{N}
+
+do
+
+8:
+
+Load
+X_{I}
+,
+\hat{\mathbf{f}}_{I}
+,
+\bm{\gamma}_{I}
+,
+V_{I}
+to on-chip SRAM
+
+9:
+
+S\leftarrow(2\,Y_{J}X_{I}^{\top}+\hat{\mathbf{f}}_{I}+\bm{\gamma}_{I})/\varepsilon
+
+// score tile + source bias
+
+10:
+
+\tilde{\mathbf{m}}\leftarrow\mathrm{rowmax}(S)
+
+// tile max
+
+11:
+
+\mathbf{m}_{\mathrm{new}}\leftarrow\max(\mathbf{m}_{J},\tilde{\mathbf{m}})
+
+// running max
+
+12:
+
+O_{J}\leftarrow e^{\mathbf{m}_{J}-\mathbf{m}_{\mathrm{new}}}\odot O_{J}+e^{S-\mathbf{m}_{\mathrm{new}}}\,V_{I}
+
+// online weighted sum
+
+13:
+
+\mathbf{m}_{J}\leftarrow\mathbf{m}_{\mathrm{new}}
+
+14:
+
+end
+
+for
+
+15:
+
+\mathrm{out}_{J}\leftarrow\mathbf{b}_{J}\odot\exp\!\left(\hat{\mathbf{g}}_{J}/\varepsilon+\mathbf{m}_{J}\right)\odot O_{J}
+
+// target marginal
+correction
+
+16:
+
+Write
+\mathrm{out}_{J}
+to HBM
+
+17:
+
+end
+
+for
+
+Algorithm 5
+
+Hadamard-Weighted Transport from Potentials,
+(P\odot W)\,V
+with
+W_{ij}=A_{i}B_{j}^{\top}
+
+1:
+
+Input:
+
+X\in\mathbb{R}^{n\times d}
+,
+Y\in\mathbb{R}^{m\times d}
+,
+A\in\mathbb{R}^{n\times r}
+,
+B\in\mathbb{R}^{m\times r}
+,
+
+\hat{\mathbf{f}}\in\mathbb{R}^{n}
+,
+\hat{\mathbf{g}}\in\mathbb{R}^{m}
+,
+\mathbf{a}\in\Delta^{n}
+,
+\mathbf{b}\in\Delta^{m}
+,
+V\in\mathbb{R}^{m\times p}
+
+2:
+
+Output:
+
+\mathrm{out}=(P\odot W)\,V\in\mathbb{R}^{n\times p}
+
+3:
+
+\bm{\delta}\leftarrow\varepsilon\log\mathbf{b}
+
+// absorb marginal into bias
+
+4:
+
+for
+each row block
+I
+of size
+B_{N}
+
+do
+
+5:
+
+Load
+X_{I}
+,
+A_{I}
+,
+\hat{\mathbf{f}}_{I}
+,
+\mathbf{a}_{I}
+to on-chip SRAM
+
+6:
+
+\mathbf{m}_{I}\leftarrow-\infty
+,
+O_{I}\leftarrow 0
+
+// running max, Hadamard-weighted accumulator
+
+7:
+
+for
+each column block
+J
+of size
+B_{M}
+
+do
+
+8:
+
+Load
+Y_{J}
+,
+B_{J}
+,
+\hat{\mathbf{g}}_{J}
+,
+\bm{\delta}_{J}
+,
+V_{J}
+to on-chip SRAM
+
+9:
+
+S\leftarrow(2\,X_{I}Y_{J}^{\top}+\hat{\mathbf{g}}_{J}+\bm{\delta}_{J})/\varepsilon
+
+// score tile + target bias
+
+10:
+
+W\leftarrow A_{I}B_{J}^{\top}
+
+// Hadamard weight tile
+
+11:
+
+\tilde{\mathbf{m}}\leftarrow\mathrm{rowmax}(S)
+
+// tile max
+
+12:
+
+\mathbf{m}_{\mathrm{new}}\leftarrow\max(\mathbf{m}_{I},\tilde{\mathbf{m}})
+
+// running max
+
+13:
+
+O_{I}\leftarrow e^{\mathbf{m}_{I}-\mathbf{m}_{\mathrm{new}}}\odot O_{I}+(e^{S-\mathbf{m}_{\mathrm{new}}}\odot W)\,V_{J}
+
+// online
+weighted sum
+
+14:
+
+\mathbf{m}_{I}\leftarrow\mathbf{m}_{\mathrm{new}}
+
+15:
+
+end
+
+for
+
+16:
+
+\mathrm{out}_{I}\leftarrow\mathbf{a}_{I}\odot\exp\!\left(\hat{\mathbf{f}}_{I}/\varepsilon+\mathbf{m}_{I}\right)\odot O_{I}
+
+// source marginal
+correction
+
+17:
+
+Write
+\mathrm{out}_{I}
+to HBM
+
+18:
+
+end
+
+for
+
+Appendix H
+Full Experiment Results
+
+H.1
+Experimental Setup
+
+All experiments were conducted on an NVIDIA A100-80GB GPU with CUDA 12.1. We use PyTorch 2.5.1+ with Triton 2.1+ for FlashSinkhorn. We benchmark against GeomLoss 0.2.6
+[
+19
+]
+
+with PyKeOps 2.3 backend and OTT-JAX 0.5.1
+[
+12
+]
+with JAX 0.8.2.
+
+H.2
+Synthetic Benchmarks
+
+We benchmark on balanced optimal transport with uniform marginals (
+\mathbf{a}=\mathbbm{1}_{n}/n
+,
+\mathbf{b}=\mathbbm{1}_{m}/m
+) and squared Euclidean cost
+C(\mathbf{x},\mathbf{y})=\|\mathbf{x}-\mathbf{y}\|^{2}_{2}
+. Points are sampled uniformly from
+[0,1]^{d}
+with
+n\in[5\text{k},50\text{k}]
+,
+d\in[4,1024]
+for forward/backward benchmarks and
+d\in[4,512]
+for HVP examples.
+All methods use regularization
+\varepsilon=0.1
+and 10 Sinkhorn iterations for forward/backward benchmarks, or 100 Sinkhorn iterations for HVP benchmarks. For HVP,
+the conjugate gradient solver uses
+K=50
+fixed iterations with damping
+\tau=10^{-5}
+
+and no early stopping (convergence tolerance disabled for fair comparison).
+
+For PyTorch and KeOps, we use CUDA events for precise GPU timing. For JAX, we use wall-clock time with
+block_until_ready()
+synchronization. All benchmarks include 10 warmup iterations before timing, with 50 repetitions for forward,
+30 for backward, and 20 for HVP. We report mean timing across repetitions.
+
+Methods Compared.
+
+•
+
+FlashSinkhorn
+: Our method with symmetric (GeomLoss-style) and alternating (OTT-style) updates
+
+•
+
+KeOps
+: GeomLoss with
+backend=’online’
+— streaming
+O(nd)
+memory
+
+•
+
+Tensorized
+: GeomLoss with
+backend=’tensorized’
+— dense
+O(n^{2})
+memory
+
+•
+
+OTT-JAX
+: OTT-JAX with
+use_danskin=True
+for gradients
+
+Another method
+POT
+: Python Optimal Transport toolbox (primarily for NumPy/SciPy CPU)
+[
+22
+]
+is not benchmarked here since our evaluation targets GPU implementations. GeomLoss also provides
+backend=’multiscale’
+, a fast octree-style multiscale routine intended for very large problems in low ambient dimension, but it is restricted to inputs in dimension
+d\in\{1,2,3\}
+; since our benchmarks focus on higher-dimensions, we do not include this mode, either.
+
+A closely related line is
+[
+31
+]
+, which proposes RDROT, a Douglas–Rachford splitting solver adapted to GPUs for regularized OT with a broad class of sparsity-promoting regularizers.
+However, our benchmarks focus on EOT, for which the optimal coupling is typically dense; notably,
+[
+31
+]
+explicitly excludes negative Shannon entropy from its target regularizer class.
+As a result, RDROT is not a like-for-like baseline for our setting, so we discuss it as complementary rather than including it in the timing comparisons.
+
+Benchmark Details
+
+To isolate implementation efficiency from algorithmic differences, all benchmarks use: (1) fixed iteration count with no early stopping; (2) fixed
+\varepsilon=0.1
+with no epsilon-scaling; (3) TF32 precision enabled for forward and backward benchmarks, and strict FP32 for HVP benchmarks due to higher numerical sensitivity of second-order computations; (4) no debiasing for simpler comparison. These settings ensure all methods perform identical arithmetic operations.
+
+We discard the first 10 runs to exclude JIT compilation and cache warm-up, then measure 50 repetitions using CUDA events with explicit synchronization.
+For Triton kernels, we run problem sizes from large to small to avoid autotuning cache pollution
+[
+15
+,
+40
+,
+29
+]
+, which can cause up to 50% performance
+degradation if sizes are run in ascending order.
+
+FlashSinkhorn and GeomLoss (same symmetric algorithm) differ by
+<0.1\%
+in loss values due to floating-point non-associativity in parallel
+reductions. FlashSinkhorn and OTT-JAX differ by
+\sim
+2% at 10 iterations due to different initial
+\mathbf{f}
+and
+\mathbf{g}
+, but converge to
+<0.1\%
+difference at 100
+iterations.
+
+H.2.1
+FlashSinkhorn vs Geomloss: Performance Analysis
+
+Table 5
+:
+NCU profiling of the forward pass (
+n
+=
+m
+=10000,
+d
+=64, 10 Sinkhorn iterations, A100-80GB).
+Note:
+Working set (5 MB) fits in A100 L2 cache (40 MB); HBM traffic reflects L2-resident execution.
+
+Metric
+
+Tensor.
+
+KeOps
+
+Flash
+
+Performance
+
+Runtime (ms)
+
+54.0
+
+125.5
+
+8.2
+
+Memory
+
+HBM Read
+
+59 GB
+
+140 MB
+
+79 MB
+
+HBM Write
+
+39 GB
+
+0
+
+0
+
+Shared Mem Traffic (GB)
+
+6
+
+23
+
+53
+
+L1 Hit (%)
+
+18
+
+82
+
+8
+
+L2 Hit (%)
+
+56
+
+97
+
+99
+
+Compute
+
+SM Util. (%)
+
+98
+
+49
+
+74
+
+Occupancy (%)
+
+89
+
+9
+
+11
+
+Instructions (B)
+
+10
+
+16
+
+7
+
+Stalls
+
+Memory (%)
+
+79
+
+8
+
+3
+
+Math (%)
+
+2
+
+8
+
+6
+
+Launch
+
+Regs/Thread
+
+16
+
+96
+
+255
+
+Bottleneck
+
+Memory
+
+Compute
+
+Compute
+
+Table 6
+:
+NCU profiling of the forward and backward pass (
+n
+=
+m
+=10000,
+d
+=128, 10 Sinkhorn iterations, A100-80GB).
+
+Metric
+
+Tensor.
+
+KeOps
+
+Flash
+
+Performance
+
+Runtime (ms)
+
+67.6
+
+197.0
+
+19.2
+
+Memory
+
+HBM Read
+
+65 GB
+
+250 MB
+
+199 MB
+
+HBM Write
+
+44 GB
+
+4 MB
+
+48 MB
+
+Shared Mem Traffic (GB)
+
+14
+
+330
+
+354
+
+L1 Hit (%)
+
+17
+
+85
+
+17
+
+L2 Hit (%)
+
+56
+
+98
+
+100
+
+Compute
+
+SM Util. (%)
+
+30
+
+38
+
+38
+
+Occupancy (%)
+
+84
+
+5
+
+11
+
+Instructions (B)
+
+11
+
+35
+
+18
+
+Stalls
+
+Memory (%)
+
+68.2
+
+0.8
+
+0.5
+
+Math (%)
+
+2.0
+
+0.0
+
+0.5
+
+Launch
+
+Regs/Thread
+
+122
+
+255
+
+255
+
+Bottleneck
+
+Memory
+
+Compute
+
+Compute
+
+Table 7
+:
+Speedup of FlashSinkhorn over KeOps (forward pass only, averaged over 50 runs). OOT indicates exceeded time limit of 10 mins. Bold indicates at least 10x speed up.
+
+n
+
+d{=}4
+
+d{=}8
+
+d{=}16
+
+d{=}32
+
+d{=}64
+
+d{=}128
+
+d{=}256
+
+d{=}512
+
+d{=}1024
+
+50000
+
+1.2
+
+1.9
+
+4.1
+
+8.2
+
+9.9
+
+12.8
+
+17.8
+
+OOT
+
+OOT
+
+40000
+
+1.0
+
+1.7
+
+3.5
+
+6.4
+
+8.3
+
+12.5
+
+16.2
+
+OOT
+
+OOT
+
+30000
+
+1.4
+
+2.2
+
+4.7
+
+8.4
+
+11.0
+
+11.4
+
+18.7
+
+OOT
+
+OOT
+
+20000
+
+1.6
+
+2.6
+
+4.2
+
+9.7
+
+9.4
+
+10.8
+
+19.3
+
+17.6
+
+14.4
+
+10000
+
+2.7
+
+4.3
+
+5.5
+
+17.0
+
+15.4
+
+9.4
+
+23.3
+
+32.0
+
+24.2
+
+5000
+
+3.4
+
+5.6
+
+7.3
+
+19.2
+
+14.7
+
+14.3
+
+32.8
+
+46.6
+
+32.7
+
+Table 8
+:
+Speedup of FlashSinkhorn over KeOps (forward+backward, averaged over 30 runs). OOT indicates exceeded time limit of 10 mins. Bold indicates at least 10x speed up.
+
+n
+
+d{=}4
+
+d{=}8
+
+d{=}16
+
+d{=}32
+
+d{=}64
+
+d{=}128
+
+d{=}256
+
+d{=}512
+
+d{=}1024
+
+50000
+
+1.2
+
+2.0
+
+4.1
+
+8.5
+
+10.5
+
+13.6
+
+32.4
+
+OOT
+
+OOT
+
+40000
+
+1.1
+
+1.7
+
+3.6
+
+6.7
+
+8.9
+
+13.5
+
+30.9
+
+OOT
+
+OOT
+
+30000
+
+1.4
+
+2.3
+
+4.7
+
+8.6
+
+10.3
+
+12.0
+
+31.4
+
+OOT
+
+OOT
+
+20000
+
+1.5
+
+2.6
+
+4.1
+
+9.7
+
+8.5
+
+11.5
+
+33.3
+
+OOT
+
+OOT
+
+10000
+
+2.8
+
+4.3
+
+5.6
+
+17.1
+
+12.3
+
+10.3
+
+32.8
+
+161.4
+
+212.3
+
+5000
+
+3.8
+
+4.9
+
+6.0
+
+17.6
+
+15.0
+
+13.5
+
+40.9
+
+136.7
+
+188.6
+
+Table 9
+:
+Speedup of FlashSinkhorn over Tensorized (forward pass only). Tensorized OOMs at
+n\geq 30000
+. Values
+<1
+indicate Tensorized is faster. Bold indicates at least 10x speed up.
+
+n
+
+d{=}4
+
+d{=}8
+
+d{=}16
+
+d{=}32
+
+d{=}64
+
+d{=}128
+
+d{=}256
+
+d{=}512
+
+d{=}1024
+
+20000
+
+9.9
+
+9.9
+
+12.3
+
+10.5
+
+8.1
+
+4.6
+
+3.0
+
+1.7
+
+0.7
+
+10000
+
+7.4
+
+7.6
+
+7.6
+
+9.1
+
+6.6
+
+3.2
+
+2.1
+
+1.7
+
+0.7
+
+5000
+
+3.8
+
+4.5
+
+4.8
+
+5.4
+
+3.3
+
+2.6
+
+1.6
+
+1.4
+
+0.5
+
+Table 10
+:
+Speedup of FlashSinkhorn over Tensorized (forward+backward, averaged over 30 runs). Tensorized OOMs at
+n\geq 30{,}000
+. Values
+
+<1
+indicate Tensorized is faster.
+
+n
+
+d{=}4
+
+d{=}8
+
+d{=}16
+
+d{=}32
+
+d{=}64
+
+d{=}128
+
+d{=}256
+
+d{=}512
+
+d{=}1024
+
+20000
+
+10.6
+
+10.7
+
+12.8
+
+11.5
+
+7.9
+
+4.9
+
+3.1
+
+1.4
+
+0.9
+
+10000
+
+8.1
+
+8.3
+
+8.3
+
+10.0
+
+5.6
+
+3.5
+
+2.2
+
+1.7
+
+0.7
+
+5000
+
+4.5
+
+4.3
+
+4.2
+
+5.3
+
+3.6
+
+2.5
+
+1.9
+
+1.4
+
+0.5
+
+Tables
+
+7
+and
+8
+show that KeOps speedup scales with
+d
+: At small
+d
+(
+\leq 16
+), KeOps’ lazy evaluation is competitive (1-7×). At large
+d
+(
+\geq 64
+), FlashSinkhorn’s fused kernels dominate (9-47×). Peak speedup occurs at
+d=512
+where FlashSinkhorn achieves 32-47× speedup. KeOps backward is extremely slow: FlashSinkhorn achieves 137-212× speedup at
+d
+=512-1024 because KeOps must recompute the kernel matrix
+for gradient computation, while FlashSinkhorn uses custom analytical gradient kernels.
+
+Tables
+
+9
+and
+10
+show that FlashSinkhorn beats Tensorized at small-to-medium d: At
+d\leq 256
+, FlashSinkhorn is 2-12× faster because Tensorized’s
+O(n^{2})
+cost matrix
+allocation dominates. Tensorized wins at
+d=1024
+: FlashSinkhorn is 0.5-0.7× slower because the on-the-fly recomputation overhead exceeds Tensorized’s memory
+bandwidth cost when
+d
+is very large. The real advantage is memory: Even when Tensorized is faster (
+d=1024
+), it uses 39-71× more memory and OOMs at
+n\geq 30
+k. FlashSinkhorn trades
+some speed at large
+d
+for dramatically better scalability.
+
+We profile FlashSinkhorn, GeomLoss KeOps, and GeomLoss Tensorized using NVIDIA Nsight Compute.
+Table
+5
+reports the
+forward
+pass (
+n{=}m{=}10000
+,
+d{=}64
+, 10 Sinkhorn iterations, A100-80GB). Table
+6
+reports the
+forward+backward
+pass (
+n{=}m{=}10000
+,
+d{=}128
+, 10 Sinkhorn iterations, A100-80GB).
+They reveal fundamentally different execution regimes.
+
+Forward: Tensorized is memory-bound despite high SM utilization.
+Tensorized achieves 98% SM utilization and 89% occupancy—metrics that would typically indicate efficient GPU usage. However, 79% of cycles are spent stalled on memory. The root cause is the
+O(n^{2})
+memory footprint: Tensorized transfers 98 GB through HBM, repeatedly reading and writing the
+n\times n
+cost matrix across iterations. High SM utilization here is misleading, the SMs are active but stalled, waiting for data.
+
+Forward: FlashSinkhorn and KeOps are compute-bound, but FlashSinkhorn is 3
+\times
+more efficient.
+Both online methods shift the bottleneck from memory to compute. However, FlashSinkhorn executes 2.3
+\times
+fewer instructions (7B vs 16B) due to fused
+kernels that perform distance computation, log-sum-exp reduction, and potential updates in a single pass.
+
+Forward: FlashSinkhorn trades occupancy for fusion.
+FlashSinkhorn uses 255 registers per thread—the GPU maximum—enabling complex fused operations within a single kernel launch. This limits occupancy to 11% (vs Tensorized’s 89%), but the reduced memory traffic more than compensates. FlashSinkhorn transfers only 0.08 GB through HBM, a
+1225
+\times
+reduction
+versus Tensorized, by streaming intermediate
+results through 53 GB of shared memory. Memory stalls drop from 79% to just 3%. Streaming methods show zero HBM write because the
+O(nd)
+working set fits entirely in L2 cache, whereas Tensorized must
+write 39GB to materialize the cost matrix.
+
+Backward: The memory bottleneck intensifies for Tensorized.
+The backward pass requires computing gradients with respect to both point clouds, amplifying Tensorized’s memory problem. HBM traffic reaches 109 GB for forward+backward at
+d=128
+, with 68% of cycles stalled on memory. In contrast, FlashSinkhorn transfers only 0.25 GB through HBM, a 444
+\times
+reduction, by fusing the gradient computation into a single streaming kernel that recomputes the transport matrix on-the-fly rather than materializing it.
+
+Backward: FlashSinkhorn achieves 10
+\times
+speedup over KeOps.
+Both online methods are compute-bound, yet FlashSinkhorn is
+10.3
+\times
+faster
+(19.2 ms vs 197.0 ms). The key difference is instruction efficiency: FlashSinkhorn executes 1.9
+\times
+fewer instructions (18B vs 35B) through kernel fusion. KeOps suffers from extremely low occupancy (5%) due to its 255 registers per thread and fine-grained kernel launch patterns, preventing the GPU from hiding latency across warps. FlashSinkhorn uses the same register count but achieves 2
+\times
+higher occupancy (11%) through aggressive kernel fusion, demonstrating that even compute-bound kernels benefit dramatically from reduced instruction count and improved warp-level parallelism.
+
+OTT-JAX profiling limitations.
+We exclude OTT-JAX from NCU profiling because XLA’s kernel fusion produces opaque CUDA kernels that
+conflict with NCU’s replay mechanism, returning incomplete metrics. Wall-clock benchmarks show FlashSinkhorn achieves 2-4
+\times
+speedup
+over OTT-JAX.
+
+H.2.2
+FlashSinkhorn vs OTT-JAX: Performance Analysis
+
+Both FlashSinkhorn and OTT-JAX implement online Sinkhorn with
+O(nd)
+memory complexity,
+never materializing the
+n\times m
+cost matrix. We analyze why FlashSinkhorn achieves 1.1–5.1
+\times
+speedup despite identical algorithmic complexity.
+
+Table
+11
+and
+12
+report the ratio of OTT-JAX to FlashSinkhorn wall-clock time on an NVIDIA A100-80GB GPU. Both methods use identical convergence thresholds and iteration counts.
+
+Table 11
+:
+Speedup of FlashSinkhorn over OTT-JAX (forward pass only, averaged over 50 runs).
+
+n
+
+d{=}4
+
+d{=}8
+
+d{=}16
+
+d{=}32
+
+d{=}64
+
+d{=}128
+
+d{=}256
+
+d{=}512
+
+d{=}1024
+
+50000
+
+3.9
+
+3.9
+
+4.5
+
+5.1
+
+4.2
+
+3.4
+
+2.3
+
+2.0
+
+1.5
+
+40000
+
+3.7
+
+3.7
+
+4.2
+
+4.4
+
+3.6
+
+3.0
+
+2.2
+
+1.6
+
+1.4
+
+30000
+
+2.8
+
+2.7
+
+3.1
+
+3.4
+
+2.8
+
+2.3
+
+1.7
+
+1.3
+
+1.2
+
+20000
+
+3.2
+
+3.3
+
+3.6
+
+4.3
+
+3.6
+
+3.0
+
+2.4
+
+1.6
+
+1.2
+
+10000
+
+2.4
+
+2.5
+
+2.8
+
+3.2
+
+2.5
+
+2.0
+
+1.6
+
+1.3
+
+0.8
+
+5000
+
+1.7
+
+1.7
+
+1.8
+
+1.9
+
+1.9
+
+1.4
+
+1.1
+
+0.9
+
+0.6
+
+Table 12
+:
+Speedup of FlashSinkhorn over OTT-JAX (forward+backward, averaged over 30 runs).
+
+n
+
+d{=}4
+
+d{=}8
+
+d{=}16
+
+d{=}32
+
+d{=}64
+
+d{=}128
+
+d{=}256
+
+d{=}512
+
+d{=}1024
+
+50000
+
+3.8
+
+3.9
+
+4.9
+
+5.0
+
+4.0
+
+3.0
+
+2.3
+
+1.6
+
+1.0
+
+40000
+
+4.1
+
+4.2
+
+5.3
+
+5.2
+
+4.2
+
+3.1
+
+2.2
+
+1.6
+
+1.2
+
+30000
+
+3.9
+
+4.0
+
+5.1
+
+5.2
+
+3.7
+
+2.7
+
+2.2
+
+1.7
+
+1.0
+
+20000
+
+3.7
+
+3.9
+
+4.8
+
+4.7
+
+3.6
+
+2.7
+
+2.2
+
+1.8
+
+1.1
+
+10000
+
+3.4
+
+3.7
+
+3.6
+
+4.8
+
+2.9
+
+2.1
+
+1.6
+
+1.8
+
+1.1
+
+5000
+
+2.9
+
+2.6
+
+2.7
+
+3.6
+
+2.7
+
+1.9
+
+1.7
+
+1.7
+
+0.9
+
+The speedup ratio can be modeled as:
+
+\text{Speedup}(n,d)\approx\frac{\alpha(n)}{\beta(d)}
+,
+where
+\alpha(n)
+captures FlashSinkhorn’s advantage and
+\beta(d)
+captures OTT-JAX’s advantage.
+
+Factor 1: Kernel fusion (
+\alpha
+increases with
+n
+).
+
+FlashSinkhorn’s Triton kernels fuse distance computation, log-sum-exp, and potential updates into a single GPU kernel. This eliminates intermediate memory writes and enables: online softmax accumulation without materializing the
+n\times m
+logits matrix; coalesced memory access patterns optimized for streaming; reduced kernel launch overhead (one launch vs. multiple XLA kernels).
+These advantages scale with
+n
+due to better GPU occupancy and amortized overhead.
+
+Factor 2: cuBLAS efficiency (
+\beta
+increases with
+d
+).
+
+OTT-JAX computes pairwise distances via matrix multiplication. The dominant
+XY^{\top}
+
+term is dispatched to cuBLAS GEMM, which achieves near-peak TFLOPS for large inner dimension
+d
+and benefits from highly optimized tiling and register allocation.
+The speedup peaks at
+d=32
+due to GPU hardware alignment: the warp size is 32 threads, and Triton’s default
+BLOCK_K
+{}=32
+or 64. At
+d=32
+, the inner reduction loop perfectly fills one warp, maximizing parallelism.
+The breakeven line (speedup
+\approx 1
+) follows approximately
+n\propto d^{2}
+.
+
+H.2.3
+HVP: Parity and Performance Analysis
+
+HVP Parity.
+
+We first validate the streaming HVP (damped Schur solve + CG tolerance
+\eta
+) against a dense
+reference
+G_{\star}
+computed with the Moore–Penrose pseudoinverse. We report the relative error
+
+\|G_{\tau,\eta}-G_{\star}\|_{F}/\|G_{\star}\|_{F}
+.
+
+We test the configurations
+n=m=512
+,
+d=4
+,
+X,Y\sim\mathcal{N}(0,I)
+,
+\mathbf{a},\mathbf{b}
+are random simplex weights, and
+\varepsilon\in\{0.1,0.25,0.5\}
+. We form
+P^{*}
+from converged Sinkhorn potentials.
+The reference uses an eigendecomposition-based pseudoinverse (threshold
+10^{-10}
+). The streaming implementation solves the damped Schur system
+S_{\tau}\mathbf{w}_{2}=\mathrm{rhs}
+with
+
+S_{\tau}=S+\tau I
+and CG tolerance
+\eta
+. From
+Table
+
+13
+, small
+\tau
+yields high-fidelity parity; tightening
+\eta
+improves accuracy until reaching a
+
+\tau
+-dependent bias floor.
+
+Table 13
+:
+Parity summary: best achievable error (no damping, tight CG) and error at the default setting.
+
+\varepsilon
+
+\tau=0,\ \eta=10^{-7}
+
+\tau=10^{-7},\ \eta=10^{-7}
+
+default
+\tau=10^{-5},\ \eta=10^{-6}
+
+0.10
+
+1.20\times 10^{-5}
+
+5.02\times 10^{-5}
+
+4.59\times 10^{-3}
+
+0.25
+
+8.33\times 10^{-6}
+
+4.39\times 10^{-5}
+
+4.24\times 10^{-3}
+
+0.50
+
+6.74\times 10^{-6}
+
+5.08\times 10^{-5}
+
+4.89\times 10^{-3}
+
+For high-precision verification, use
+\tau=10^{-7}
+with
+\eta=10^{-7}
+. For standard optimization where
+\sim 0.5\%
+error is acceptable, the default
+\tau=10^{-5}
+with
+\eta=10^{-6}
+provides a good balance between numerical stability and accuracy.
+
+Performance
+
+FlashSinkhorn’s streaming HVP kernel achieves consistent speedups over both OTT-JAX and OTT-PyTorch/KeOps baselines, with gains increasing at
+higher feature dimensions. At moderate dimensions (
+d=64
+), FlashSinkhorn is 4–6
+\times
+faster than both baselines. At high dimensions (
+d=128
+), the gap widens: FlashSinkhorn achieves 7
+\times
+speedup over OTT-JAX and 17–27
+\times
+over
+KeOps. At
+d=256
+, FlashSinkhorn reaches 10–12
+\times
+over JAX and 35–52
+\times
+over KeOps at moderate problem sizes (
+n\leq 7000
+); beyond this, the baselines exceed the 10-minute time limit.
+
+FlashSinkhorn’s fused Triton kernels compute the HVP without materializing the
+n\times n
+transport matrix, achieving O
+(nd)
+memory
+complexity. As shown in Figure
+5
+, peak memory scales linearly with problem size: from 30 MB at
+n=5{,}000
+to just 219 MB at
+
+n=50000
+(with
+d=64
+).
+
+Figure 5
+:
+FlashSinkhorn HVP peak memory vs. problem size (
+d=64
+).
+Linear scaling confirms O
+(nd)
+memory complexity.
+
+Table 14
+:
+Speedup of FlashSinkhorn HVP over OTT-JAX Hessian (50 CG iterations, averaged over 50 runs). OOT indicates exceeded time limit of 10 mins.
+
+n
+
+d{=}4
+
+d{=}8
+
+d{=}16
+
+d{=}32
+
+d{=}64
+
+d{=}128
+
+d{=}256
+
+d{=}512
+
+10000
+
+1.5
+
+1.6
+
+2.2
+
+3.6
+
+4.6
+
+7.0
+
+OOT
+
+OOT
+
+9000
+
+1.4
+
+1.5
+
+2.1
+
+3.4
+
+4.2
+
+6.5
+
+OOT
+
+OOT
+
+8000
+
+1.2
+
+1.3
+
+2.0
+
+3.1
+
+3.9
+
+6.0
+
+OOT
+
+OOT
+
+7000
+
+1.2
+
+1.3
+
+1.9
+
+2.8
+
+3.6
+
+5.5
+
+9.9
+
+OOT
+
+6000
+
+1.1
+
+1.2
+
+1.7
+
+2.6
+
+4.5
+
+7.0
+
+12.5
+
+OOT
+
+5000
+
+1.0
+
+1.0
+
+1.5
+
+2.2
+
+3.7
+
+5.7
+
+10.3
+
+OOT
+
+Table 15
+:
+Speedup of FlashSinkhorn HVP over OTT-PyTorch/KeOps (50 CG iterations, averaged over 50 runs). OOT indicates exceeded time limit of 10 mins.
+
+n
+
+d{=}4
+
+d{=}8
+
+d{=}16
+
+d{=}32
+
+d{=}64
+
+d{=}128
+
+d{=}256
+
+d{=}512
+
+10000
+
+0.7
+
+1.0
+
+2.0
+
+3.8
+
+4.0
+
+17.0
+
+OOT
+
+OOT
+
+9000
+
+0.7
+
+1.0
+
+2.0
+
+3.9
+
+4.1
+
+17.2
+
+OOT
+
+OOT
+
+8000
+
+0.8
+
+1.0
+
+2.1
+
+3.9
+
+4.2
+
+17.7
+
+OOT
+
+OOT
+
+7000
+
+0.8
+
+1.1
+
+2.2
+
+4.0
+
+4.2
+
+18.0
+
+35.6
+
+OOT
+
+6000
+
+0.9
+
+1.2
+
+2.3
+
+4.1
+
+6.2
+
+26.7
+
+52.2
+
+OOT
+
+5000
+
+1.0
+
+1.2
+
+2.3
+
+4.1
+
+6.1
+
+25.3
+
+45.4
+
+OOT
+
+H.2.4
+Symmetric vs Alternating Sinkhorn: Performance Analysis
+
+We compare two update strategies for the Sinkhorn iteration:
+
+•
+
+Symmetric (GeomLoss-style):
+A single fused kernel computes both
+\mathbf{f}
+and
+\mathbf{g}
+updates per iteration with symmetric averaging.
+
+•
+
+Alternating (OTT-style):
+Two separate kernels update
+\mathbf{f}
+then
+\mathbf{g}
+sequentially.
+
+We profile both strategies at
+n{=}10000
+with
+d=1024
+on an NVIDIA A100 using NVIDIA Nsight Compute (NCU). Table
+16
+reports kernel-level metrics.
+
+Table 16
+:
+NCU profiling of symmetric vs. alternating kernels (
+n
+=
+m
+=10,000,
+d
+=1024, 10 iterations, A100-80GB).
+
+Symmetric
+
+Alternating
+\hat{\mathbf{f}}
+
+Alternating
+\hat{\mathbf{g}}
+
+Alternating total
+
+Occupancy (%)
+
+8.3
+
+6.2
+
+12.5
+
+9.4 (avg)
+
+Mem. stalls (%)
+
+3.0
+
+5.4
+
+0.3
+
+3.2 (avg)
+
+Runtime (ms)
+
+1531
+
+758
+
+558
+
+1316
+
+Both strategies saturate the register file at 255 registers per thread, yielding identical theoretical occupancy of 12.5%. However, achieved occupancy and memory stall rates differ across kernels. The symmetric kernel achieves 8.3% occupancy with 3.0% memory stalls. For alternating, the
+\hat{\mathbf{f}}
+-update kernel performs worse (6.2% occupancy, 5.4% stalls), but the
+\hat{\mathbf{g}}
+-update kernel achieves full theoretical occupancy (12.5%) with near-zero stalls (0.3%). This efficient
+\hat{\mathbf{g}}
+kernel, which uses a larger block size (256 vs. 128) and exploits a more streaming-friendly memory access pattern, compensates for the weaker
+\hat{\mathbf{f}}
+kernel. Despite launching twice as many kernels (80 vs. 48), alternating is 1.16
+\times
+faster at
+n{=}10{,}000
+.
+
+Table
+17
+shows wall-clock performance across problem sizes. The crossover occurs around
+n\approx 15000
+at
+d=1024
+.
+
+Table 17
+:
+Wall-clock comparison of symmetric vs. alternating (10 iterations). Ratio
+>
+1 favors alternating.
+
+d
+
+n
+
+Symmetric (ms)
+
+Alternating (ms)
+
+Ratio
+
+Winner
+
+64
+
+10k
+
+14.0
+
+17.2
+
+0.81
+
+Sym.
+
+20k
+
+37.4
+
+39.6
+
+0.94
+
+Sym.
+
+50k
+
+188.1
+
+192.2
+
+0.98
+
+Sym.
+
+1024
+
+10k
+
+103.7
+
+134.6
+
+0.77
+
+Sym.
+
+20k
+
+377.5
+
+303.7
+
+1.24
+
+Alt.
+
+50k
+
+2248.2
+
+1647.0
+
+1.36
+
+Alt.
+
+The crossover is governed by two competing factors:
+
+•
+
+Kernel launch overhead:
+Alternating requires
+2\times
+more kernel launches. At small
+n
+, this overhead dominates total runtime.
+
+•
+
+Memory throughput:
+The alternating kernel sustains near-zero memory stalls (0.3%) due to a more streaming-friendly access pattern.
+
+At small
+n
+where kernel time is modest (
+<
+20 ms), launch overhead dominates and symmetric wins. At large
+n
+where kernel time exceeds hundreds of milliseconds, the throughput advantage of outweighs the launch overhead, and alternating wins by up to 1.36
+\times
+.
+
+H.3
+OTDD Benchmarks
+
+We evaluate FlashSinkhorn on Optimal Transport Dataset Distance (OTDD)
+[
+3
+]
+, which measures distances between labeled datasets using a combined feature-label cost.
+
+Table 18
+:
+Method support for OTDD benchmarks.
+Label-augmented cost requires custom cost function support:
+C(x_{i},y_{j})=\lambda_{1}\|x_{i}-y_{j}\|^{2}_{2}+\lambda_{2}W[\ell_{i},\ell_{j}]
+. GeomLoss (KeOps) does not support custom cost functions, limiting it to no-label experiments. Prior methods run out of memory (OOM) beyond
+n=20{,}000
+on a 40 GB A100 GPU.
+
+Method
+
+With Labels
+
+Without Labels
+
+Memory
+
+Max
+n
+
+FlashSinkhorn
+
+✓
+
+✓
+
+O(nd)
+
+\geq 60{,}000
+
+GeomLoss (KeOps)
+
+✗
+
+✓
+
+O(nd)
+
+20{,}000
+
+GeomLoss (Tensorized)
+
+✓
+
+✓
+
+O(n^{2})
+
+20{,}000
+
+OTDD uses a label-augmented cost combining Euclidean feature distance and class-to-class Wasserstein distance:
+
+C(x_{i},y_{j})=\lambda_{1}\|\mathbf{x}_{i}-\mathbf{y}_{j}\|_{2}^{2}+\lambda_{2}W[\ell_{i},\ell_{j}]
+
+(35)
+
+where
+\mathbf{x}_{i},\mathbf{y}_{j}\in\mathbb{R}^{d}
+are feature embeddings,
+\ell_{i},\ell_{j}\in\{1,\ldots,V\}
+are class labels, and
+W\in\mathbb{R}^{V\times V}
+is the matrix of class-to-class Wasserstein distances. We use
+\lambda_{1}=\lambda_{2}=1/2
+.
+
+For debiased Sinkhorn divergence,
+W
+must include both within-dataset and cross-dataset class distances. Given datasets with
+V_{1}
+and
+V_{2}
+classes respectively,
+W
+is constructed as:
+
+W=\begin{pmatrix}W_{11}&W_{12}\\
+W_{12}^{\top}&W_{22}\end{pmatrix}\in\mathbb{R}^{(V_{1}+V_{2})\times(V_{1}+V_{2})},
+
+(36)
+
+where
+W_{11}
+contains within-dataset distances for dataset 1,
+W_{22}
+for dataset 2, and
+W_{12}
+contains cross-dataset distances. For MNIST and Fashion-MNIST (
+V_{1}=V_{2}=10
+), this yields a
+20\times 20
+matrix (1.6 KB).
+
+FlashSinkhorn supports this custom cost by storing
+W
+and computing the combined cost on-the-fly within the Triton kernel: (1) Load labels
+\ell_{i}
+,
+\ell_{j}
+for the current block; (2) Gather
+W[\ell_{i},\ell_{j}]
+via indexed lookup; (3) Combine:
+C_{ij}=\lambda_{1}\cdot C_{\text{euclidean}}+\lambda_{2}\cdot W[\ell_{i},\ell_{j}]
+. This per-iteration lookup incurs at most
+\sim
+30% overhead compared to pure Euclidean cost due to register pressure forcing smaller thread blocks (
+BLOCK_M
+=64 vs 128). However, tensorized backends must materialize the full
+n\times n
+augmented cost matrix, requiring
+O(n^{2})
+memory.
+FlashSinkhorn trades per-iteration overhead for
+O(nd+V^{2})
+memory.
+
+Dataset and Embeddings.
+
+We use MNIST as the source dataset and Fashion-MNIST as the target, with
+V=10
+classes each. Images (grayscale,
+28\times 28
+) are preprocessed by replicating the single channel to 3-channel RGB (required by ResNet18’s ImageNet-pretrained weights), resizing to
+224\times 224
+, and normalizing with ImageNet statistics. We extract
+d=512
+-dimensional embeddings from ResNet18’s penultimate layer. Sample sizes range from
+n=5000
+to
+n=60000
+, with entropy regularization
+\varepsilon=0.1
+and debiased Sinkhorn divergence
+(requiring 3 OT computations per evaluation).
+We compare against the official OTDD implementation
+[
+3
+]
+, which uses GeomLoss’s tensorized backend. The OTDD library has a hardcoded
+GPU_LIMIT=20000
+; beyond this threshold it falls back to CPU computation. For fair comparison at
+n\leq 20000
+: (1) both methods use the same pre-computed label cost matrix
+W
+; (2) timing measures only the outer OT computation, excluding
+W
+computation; and (3) we set
+maxsamples=n
+to ensure no subsampling (OTDD defaults to 10000).
+
+Gradient Flow Setup
+
+We evaluate gradient-based dataset adaptation, where the source dataset is moved toward the target distribution by following the Sinkhorn gradient:
+
+X^{(t+1)}=X^{(t)}-\eta\cdot\nabla_{X}S_{\varepsilon}(X^{(t)},Y).
+
+(37)
+
+We run 20 optimization steps with learning rate
+\eta=0.1
+using the OTDD label-augmented cost. Each gradient flow step consists of three phases:
+(1) a
+forward pass
+that computes the debiased Sinkhorn divergence
+S_{\varepsilon}(X,Y)
+via three Sinkhorn solves; (2) a
+backward pass
+that computes
+\nabla_{X}S_{\varepsilon}
+using our custom Triton gradient kernel; and (3) an
+update
+
+X\leftarrow X-\eta\cdot\nabla_{X}S_{\varepsilon}
+. We report both total wall-clock time and per-step time (ms/step).
+
+Additional Experiment.
+
+To isolate the kernel performance from label cost overhead, we benchmark pure Euclidean cost (no labels) using the same MNIST
+\leftrightarrow
+Fashion-MNIST
+dataset. This enables comparison with GeomLoss’s online backend (KeOps), which only supports Euclidean cost. The results are summarized in
+Figure
+
+6
+.
+
+Figure 6
+:
+
+No-label Sinkhorn divergence benchmark.
+
+Comparison of FlashSinkhorn against GeomLoss with KeOps (online) and Tensorized backends
+on MNIST (
+d=784
+, debiased Sinkhorn,
+\varepsilon=0.1
+).
+
+(a,b)
+Forward pass: FlashSinkhorn matches Tensorized speed while using 38
+\times
+less memory.
+KeOps is 14-26
+\times
+slower.
+
+(c,d)
+Gradient flow (forward + backward per step): FlashSinkhorn scales to
+n=60000
+
+while KeOps and Tensorized run out of memory beyond
+n=20000
+(gray dashed line).
+Tensorized’s
+O(n^{2})
+memory grows to 16 GB at
+n=20000
+,
+whereas FlashSinkhorn’s
+O(nd)
+memory stays below 1.1 GB even at
+n=60000
+.
+
+H.4
+Detect Saddle Escape in OT-Based Regression
+
+Experiment Setup
+
+We use the Cornell Flow Cytometry dataset
+[
+6
+]
+, containing 40,000 single cells with 5 fluorescent markers (FITC/CD4,
+PE/CD8, ECD/CD19, PC5/CD45, PC7/CD3). Each marker measures the expression level of a cell surface antigen, commonly used in immunophenotyping.
+
+Given normalized features
+X\in\mathbb{R}^{n\times 5}
+, we generate:
+
+1.
+
+Ground truth transformation:
+W^{*}\in\mathbb{R}^{5\times 5}
+with entries
+W^{*}_{ij}\sim\mathcal{N}(0,1/5)
+.
+
+2.
+
+Clean targets:
+Y_{\text{clean}}=XW^{*}
+.
+
+3.
+
+Noisy targets:
+Y=Y_{\text{clean}}+E
+, where
+E_{ij}\sim\mathcal{N}(0,\sigma^{2})
+with
+\sigma=0.05\cdot\text{std}(Y_{\text{clean}})
+.
+
+4.
+
+Shuffled observations:
+\widetilde{Y}=\Pi^{*}(Y)
+for unknown permutation
+\Pi^{*}
+.
+
+The optimization objective is
+\min_{W}\mathcal{L}(W)
+, where
+
+\displaystyle\mathcal{L}(W)=\text{OT}_{\varepsilon}\left(\frac{1}{n}\sum_{i=1}^{n}\delta_{\mathbf{y}_{i}},\frac{1}{n}\sum_{j=1}^{n}\delta_{\widetilde{\mathbf{y}}_{j}}\right)=\min_{P\in\Pi(\frac{1}{n}\mathbbm{1}_{n},\frac{1}{n}\mathbbm{1}_{n})}\;\langle C(W),P\rangle+\varepsilon\mathrm{KL}\left(P\|\left(\frac{\mathbbm{1}_{n}}{n}\otimes\frac{\mathbbm{1}_{n}}{n}\right)\right)
+
+where
+\mathbf{y}_{i}=\mathbf{x}_{i}W
+and
+C_{ij}(W)=\|\mathbf{y}_{i}-\widetilde{\mathbf{y}}_{j}\|_{2}^{2}
+
+Optimizer Configuration
+
+We test three regularization strengths
+\varepsilon\in 0.1,0.25,0.5
+. The solver uses epsilon scaling with factor 0.9 (66 annealing steps from diameter to final
+
+\varepsilon
+), followed by 60 extra iterations at the final regularization for convergence.
+
+1.
+
+Adam phase.
+In the saddle region (
+\lambda_{\min}<0.001
+), we use full-batch Adam with learning rate 0.03 and momentum parameters
+(\beta_{1},\beta_{2})=(0.9,0.999)
+. Adam’s momentum helps traverse the flat regions near saddle points by accumulating gradient information over
+steps, while the adaptive per-parameter learning rates handle the ill-conditioned curvature typical of saddle neighborhoods.
+
+2.
+
+Newton phase.
+Once
+\lambda_{\min}\geq 0.001
+confirms a local minimum, we switch to Newton with initial step size 10.0 and Armijo backtracking
+line search (reduction factor
+\beta=0.5
+, sufficient decrease constant
+c=0.1
+). The Newton direction is computed via conjugate gradient with maximum 100 iterations and tolerance
+10^{-6}
+. The inner Hessian (Schur complement) uses Tikhonov regularization
+\tau=10^{-5}
+for numerical stability.
+
+Optimization terminates when the gradient norm falls below
+5\times 10^{-3}
+, with early stopping patience of 3
+consecutive steps without improvement.
+
+Why full-batch Adam?
+
+We use full-batch Adam to obtain a deterministic optimization trajectory and a stable curvature signal for saddle-escape detection.
+Minibatch SGD introduces gradient noise that can itself facilitate escape from strict saddles—stochastic gradients exhibit variance aligned with negative-curvature directions and can effectively replace explicit perturbations—which would confound our goal of detecting when the full OT objective becomes locally convex via
+\lambda_{\min}(H_{W})
+monitoring
+[
+14
+,
+23
+,
+25
+]
+.
+Moreover, our detector relies on repeated Hessian–vector products at the same iterate, and in the full-batch setting we can amortize the Sinkhorn solve by reusing the current dual potentials and cached normalization statistics across many HVP evaluations; changing minibatches would require repeatedly recomputing these operators and yields a noisier
+\lambda_{\min}(H_{W})
+signal.
+This mirrors standard practice in CG-based second-order methods, where multiple
+Hv
+queries at fixed parameters benefit from caching shared computations
+[
+34
+]
+.
+
+Lanczos Iteration for Minimum Eigenvalue
+
+We estimate the smallest eigenvalue of the parameter Hessian
+H_{W}\in\mathbb{R}^{25\times 25}
+using ARPACK’s implicitly restarted Lanczos method as implemented by
+scipy.sparse.linalg.eigsh
+. Lanczos requires only matrix–vector products
+v\mapsto H_{W}v
+and avoids explicit Hessian construction. We expose
+H_{W}
+as a LinearOperator whose matvec is a streaming HVP, and call
+eigsh
+with
+which=’SA’
+(smallest algebraic) and a small Krylov subspace (
+ncv
+=6). Each Krylov step triggers one HVP, so an eigenvalue check costs
+O(N_{\mathrm{mv}}\mathrm{cost}(\mathrm{HVP}))
+time and
+O(nd)
+memory—independent of storing the
+n\times n
+transport matrix or the data-space Hessian. At
+n=40{,}000
+, this adds
+\approx 11
+seconds per check, whereas materializing the data-space Hessian
+\nabla_{Y}^{2}\mathrm{OT}_{\varepsilon}(\bm{\mu},\bm{\nu})
+would require
+O((nd)^{2})
+storage (
+>100
+GB at this scale). Since our HVP oracle is inexact (about
+0.5\%
+relative error due to damping and early stopping of the inner solve), we use a modest eigensolver tolerance and treat
+\lambda_{\min}
+as a coarse diagnostic (sign/margin) rather than a high-precision estimate, consistent with inexact projection methods for eigencomputation. So we set the threshold of
+\lambda_{\min}
+switching at 0.001.
+
+Additional Experiment: Multi-Saddle Escape Trajectory
+
+Figure 7
+:
+
+Multi-saddle escape in shuffled regression
+(
+n{=}40{,}000
+,
+\varepsilon{=}0.25
+, seed=0).
+(a) loss, (b) gradient norm, (c) estimated
+\lambda_{\min}(H)
+.
+Green dashed lines mark escapes (
+\lambda_{\min}{>}0.001
+; switch to Newton) and orange dotted lines mark re-entries (
+\lambda_{\min}{<}0.001
+; fallback to Adam).
+Overall: 3 escapes, 2 re-entries; loss
+3.76\!\to\!1.77
+.
+
+Figure
+7
+shows a configuration (
+n=40{,}000
+,
+\varepsilon=0.25
+, seed=0) that reveals the complex landscape of the shuffled regression objective, characterized by numerous shallow saddle points and local minima in close proximity.
+
+Starting from loss 3.76, the optimization traverses multiple saddle-local transitions before converging at loss 1.77:
+
+1.
+
+Steps 0-105 (Adam):
+Descends through a saddle region until
+\lambda_{\min}=+0.0047
+signals escape into a shallow
+local minimum.
+
+2.
+
+Steps 106-110 (Newton):
+Newton’s large steps cross into an adjacent shallow saddle (
+\lambda_{\min}=-0.0027
+), triggering
+fallback.
+
+3.
+
+Steps 111-145:
+The optimizer oscillates between shallow saddles and local minima, with two more escape-reentry cycles.
+
+4.
+
+Steps 155-164 (Newton):
+Finally reaches a deeper local minimum basin (
+\lambda_{\min}=+0.024
+), where Newton converges in 9 steps.
+
+Landscape interpretation. The small magnitude of eigenvalues at transition points (
+|\lambda_{\min}|<0.005
+for the first two escapes)
+suggests the optimizer navigates a region densely populated with shallow saddles and local minima separated by low barriers. Newton’s
+aggressive steps easily cross these barriers, while Adam’s smaller updates can remain within a basin. The final successful convergence
+occurs when the optimizer reaches a deeper basin with
+\lambda_{\min}=0.024
+, five times larger than earlier transitions, indicating
+stronger local convexity that contains Newton’s iterates.
+
+This behavior motivates the fallback mechanism: near shallow critical points, Newton may destabilize, but the
+eigenvalue-based switching rule automatically recovers by reverting to Adam until a more stable basin is found.
+

@@ -1,0 +1,868 @@
+SoftDTW-CUDA-Torch: Memory-Efficient GPU-Accelerated Soft Dynamic Time Warping for PyTorch
+Ron Shapira Weber, Oren Freifeld, The Faculty of Computer, Information Science
+
+Abstract
+We present softdtw-cuda-torch , an open-source PyTorch library for computing Soft Dynamic Time Warping (SoftDTW) on GPUs. Our implementation addresses three key limitations of existing GPU implementations of SoftDTW: a hard sequence-length cap of 1024, numerical instability in the backward pass for small smoothing parameters, and excessive GPU memory consumption from materializing pairwise distance tensors. We introduce (1) tiled anti-diagonal kernel execution that removes the sequence-length constraint, (2) a log-space backward pass that prevents floating-point overflow, and (3) a fused distance-computation mode that eliminates the 𝒪 ⁡ ( B ​ N ​ M ) \mathcal{O}(BNM) intermediate distance tensor, achieving up to 98% memory reduction compared to prior work. The library supports arbitrary sequence lengths, full PyTorch autograd integration, and Soft-DTW Barycenter computation. Code is available at https://github.com/BGU-CS-VIL/sdtw-cuda-torch .
+
+
+
+1
+Introduction
+
+Dynamic Time Warping (DTW)
+[
+7
+]
+is a classical algorithm for measuring similarity between temporal sequences under nonlinear alignment.
+While widely used in time-series classification, clustering, and retrieval, DTW is non-differentiable and therefore cannot serve directly as a training loss for neural networks.
+
+Cuturi and Blondel
+[
+2
+]
+introduced
+Soft-DTW
+, a differentiable relaxation that replaces the hard minimum in the DTW recurrence with a smooth minimum parameterized by a temperature
+\gamma>0
+.
+As
+\gamma\to 0
+, Soft-DTW recovers classical DTW; for
+\gamma>0
+it provides a smooth, differentiable loss suitable for gradient-based optimization.
+Soft-DTW has since been adopted for time-series forecasting, sequence-to-sequence training, metric learning, and differentiable alignment research
+[
+1
+]
+.
+
+Maghoumi
+[
+4
+]
+provided the first open-source CUDA implementation of SoftDTW for PyTorch, enabling GPU-accelerated computation.
+However, this implementation has three practical limitations that restrict its applicability: (1) sequences are limited to length 1024 due to CUDA thread-per-block constraints, (2) the backward pass operates in linear space and is prone to numerical overflow for small
+\gamma
+, and (3) the full pairwise distance matrix of shape
+(B,N,M)
+must be materialized in GPU memory, which becomes prohibitive for long or high-dimensional sequences.
+
+These limitations directly impeded our research on temporal alignment problems. Concretely, in our prior works on Diffeomorphic Temporal Alignment Networks (DTAN)
+[
+8
+]
+, Regularization-Free DTAN
+[
+9
+]
+, TimePoint
+[
+10
+]
+, and Synchronization of Multiple Videos
+[
+5
+]
+, we used SoftDTW primarily to compare it against our own methods on various benchmarks. However, even though our methods were more scalable, direct comparisons had to be limited, as SoftDTW’s GPU memory constraints forced us to either restrict sequence lengths, reduce batch sizes, or fall back to CPU implementations, severely hindering speed and scalability.
+
+In this work, we present
+softdtw-cuda-torch
+, a reimplementation that addresses all three limitations while maintaining full compatibility with PyTorch’s autograd system.
+
+Figure 1
+:
+Benchmark results for batch size
+B=32
+.
+Top row:
+Peak GPU memory (MB) as a function of sequence length
+L
+(left,
+D=128
+) and feature dimension
+D
+(right,
+L=256
+).
+Bottom row:
+Wall-clock runtime (ms) for the corresponding configurations. Maghoumi’s implementation is unavailable for
+L>1024
+(CUDA thread-block limit) and runs out of memory for large configurations; our unfused and fused modes remain operational throughout. The fused mode trades runtime for significant memory savings.
+
+2
+Background
+
+This section describes
+the original SoftDTW, based on
+[
+2
+]
+.
+
+Soft-DTW formulation.
+
+Given two sequences
+\mathbf{x}=(x_{1},\ldots,x_{N})
+and
+\mathbf{y}=(y_{1},\ldots,y_{M})
+with
+x_{i},y_{j}\in\mathbb{R}^{D}
+, and a pointwise cost
+d(x_{i},y_{j})
+(typically the squared Euclidean distance), Soft-DTW is defined via the recurrence
+
+\displaystyle R_{i,j}=d(x_{i},y_{j})+\mathrm{softmin}_{\gamma}\!\big(R_{i-1,j-1},\;R_{i-1,j},\;R_{i,j-1}\big)
+
+(1)
+
+where the soft-minimum is
+
+\displaystyle\mathrm{softmin}_{\gamma}(a,b,c)=-\gamma\log\!\Big(e^{-a/\gamma}+e^{-b/\gamma}+e^{-c/\gamma}\Big)
+
+(2)
+
+with boundary conditions
+R_{0,0}=0
+,
+R_{i,0}=+\infty
+for
+i\geq 1
+, and
+R_{0,j}=+\infty
+for
+j\geq 1
+.
+The Soft-DTW distance is
+
+\displaystyle\mathrm{sdtw}_{\gamma}(\mathbf{x},\mathbf{y})=R_{N,M}\,.
+
+(3)
+
+Backward pass.
+
+The gradient
+E_{i,j}=\partial R_{N,M}/\partial d(x_{i},y_{j})
+is computed by a reverse-direction Dynamic Programming (DP) over the same
+N\times M
+grid, starting from
+E_{N,M}=1
+.
+This gradient matrix
+E
+is then composed with the distance function’s own Jacobian to obtain gradients with respect to the input sequences.
+
+Complexity.
+
+Both the forward and backward passes require
+\mathcal{O}(NM)
+operations per sequence pair and
+\mathcal{O}(NM)
+storage for the DP table
+R
+.
+For a batch of
+B
+pairs, the total work is
+\mathcal{O}(BNM)
+.
+Additionally, the pairwise distance matrix
+D
+of shape
+(B,N,M)
+must be computed and stored, adding
+\mathcal{O}(BNMD)
+computation and
+\mathcal{O}(BNM)
+storage.
+
+3
+Limitations of Prior GPU Implementations
+
+Maghoumi’s
+pytorch-softdtw-cuda
+
+[
+4
+]
+was the first open-source CUDA implementation and pioneered the anti-diagonal parallelization strategy for SoftDTW.
+We build on this foundation but identify three limitations it suffers from:
+
+1. Sequence length cap at 1024.
+
+The implementation assigns one CUDA thread per row of the DP matrix and synchronizes threads within a single block using
+__syncthreads()
+.
+Since CUDA limits blocks to 1024 threads, sequences longer than 1024 cannot be processed on GPU.
+Thus, the code from
+[
+4
+]
+explicitly falls back to CPU for longer sequences.
+
+2. Numerical instability in the backward pass.
+
+The backward kernel computes transition weights in linear space:
+
+\displaystyle a=\exp\!\Big(\frac{R_{i+1,j}-R_{i,j}-d_{i+1,j}}{\gamma}\Big).
+
+(4)
+
+For a small
+\gamma
+(e.g.,
+\gamma<0.1
+), the exponent can be a large positive number, causing
+\exp(\cdot)
+to overflow and propagating
+NaN
+values through the gradient computation.
+
+3. Full distance tensor materialization.
+
+The distance matrix
+D\in\mathbb{R}^{B\times N\times M}
+is computed upfront via batched matrix multiplication and stored in GPU memory.
+For a typical configuration of
+B\!=\!32
+,
+N\!=\!M\!=\!512
+,
+D_{\mathrm{feat}}\!=\!64
+, this tensor alone occupies
+32\times 512\times 512\times 4~\text{bytes}\approx 32
+MB, while the total allocation (including the DP tables, padded copies, and PyTorch autograd overhead) reaches over 8 GB.
+
+4
+Our Contributions
+
+4.1
+Tiled Anti-Diagonal Execution
+
+Cells on the same anti-diagonal
+p=i+j
+are mutually independent: their three predecessors
+(i\!-\!1,j\!-\!1)
+,
+(i\!-\!1,j)
+, and
+(i,j\!-\!1)
+all lie on diagonals
+p\!-\!2
+and
+p\!-\!1
+, which are already complete. Rather than processing all
+N+M-1
+anti-diagonals within a single kernel launch (which requires
+\max(N,M)
+threads per block), we launch a separate kernel for each anti-diagonal, using the host-side sequential ordering of kernel launches as an implicit synchronization barrier (see
+Algorithm 1
+).
+
+Input:
+
+Distance matrix
+D
+(or sequences
+X,Y
+), parameters
+\gamma
+, bandwidth
+
+Output:
+
+DP matrix
+R
+, loss
+R_{:,N,M}
+
+Initialize
+R\in\mathbb{R}^{B\times(N+2)\times(M+2)}
+with boundary conditions;
+
+for
+
+p=0
+
+to
+
+N+M-2
+
+do
+
+i_{\min}\leftarrow\max(0,\,p-M+1)
+;
+
+i_{\max}\leftarrow\min(N-1,\,p)
+;
+
+\ell\leftarrow i_{\max}-i_{\min}+1
+;
+
+//
+diagonal length
+
+Launch kernel with grid
+=(\lceil\ell/256\rceil,\;B)
+, block
+=256
+;
+
+foreach
+
+thread
+
+t
+
+in kernel
+
+do
+
+i\leftarrow i_{\min}+t
+,
+j\leftarrow p-i
+;
+
+Compute
+R_{i,j}
+via Eq. (
+1
+);
+
+end foreach
+
+end for
+
+return
+
+R
+;
+
+Algorithm 1
+
+Tiled anti-diagonal forward pass. Each kernel launch processes one anti-diagonal across all batch elements.
+
+Each kernel is launched over a 2D grid of shape
+(\lceil\ell_{p}/256\rceil,B)
+, where
+\ell_{p}
+is the length of diagonal
+p
+.
+This allows anti-diagonals of arbitrary length to be tiled across multiple blocks, removing the 1024-thread constraint entirely.
+For sequences where
+\max(N,M)\leq 1024
+, we retain the original single-launch kernel as a fast path to avoid Python-level loop overhead.
+
+4.2
+Log-Space Backward Pass
+
+We reformulate the backward DP entirely in log-space.
+Let
+\bar{E}_{i,j}=\log E_{i,j}
+.
+The recurrence becomes
+
+\displaystyle\bar{E}_{i,j}=\mathrm{logsumexp}\!\big(\bar{E}_{i+1,j}+\alpha,\;\;\bar{E}_{i,j+1}+\beta,\;\;\bar{E}_{i+1,j+1}+\delta\big)
+
+(5)
+
+where
+\alpha=(R_{i+1,j}-R_{i,j}-d_{i+1,j})/\gamma
+and similarly for
+\beta
+,
+\delta
+.
+The numerically stable
+\mathrm{logsumexp}
+is
+
+\displaystyle\mathrm{logsumexp}(a,b,c)=m+\log\!\big(e^{a-m}+e^{b-m}+e^{c-m}\big),\quad m=\max(a,b,c).
+
+(6)
+
+The final
+\exp(\cdot)
+is applied only once after the full backward DP completes:
+E=\exp(\bar{E})
+.
+This ensures that all intermediate computations remain in log-space, where the max-shift trick keeps values numerically bounded regardless of
+\gamma
+.
+
+4.3
+Fused Distance Computation
+
+Both unfused and fused modes employ the algebraic identity to compute squared Euclidean distance:
+
+\|x_{i}-y_{j}\|^{2}=\|x_{i}\|^{2}-2\langle x_{i},y_{j}\rangle+\|y_{j}\|^{2},
+
+(7)
+
+This is substantially more efficient than materializing all
+(N\times M)
+pairwise squared differences directly.
+Precomputing squared norms (shapes
+B\times N
+and
+B\times M
+) and using batched matrix multiplication for dot products reduces computation compared to naive expansion.
+
+Fused vs. Unfused Trade-offs.
+
+The key difference lies in when the distance tensor is materialized:
+
+Unfused (standard) mode:
+Precomputes and
+stores
+the full distance matrix
+D\in\mathbb{R}^{B\times N\times M}
+upfront using Eq. (
+7
+).
+This enables
+O(1)
+distance lookups during DP kernel execution, resulting in minimal kernel runtime.
+However, the memory footprint is high: the distance tensor accounts for
+\approx 32
+MB to several GB depending on
+N
+,
+M
+, and
+B
+.
+
+Fused mode:
+Eliminates the stored distance tensor by
+recomputing
+distances on-the-fly within the CUDA kernel, also using Eq. (
+7
+).
+Each thread computes the cost for its assigned cell by directly reading from the input sequences
+X\in\mathbb{R}^{B\times N\times D}
+and
+Y\in\mathbb{R}^{B\times M\times D}
+.
+At each of the
+N+M-1
+anti-diagonal steps, neighboring distances are recomputed in the backward pass.
+This trade-off results in a
+10–15
+\times
+runtime increase
+(Table
+2
+) but a
+40–98% memory reduction
+compared to unfused, reducing distance-related storage from
+\mathcal{O}(BNM)
+to
+\mathcal{O}(B(N+M))
+.
+
+For typical research workflows, fused mode is the recommended default when GPU memory is constrained (common with large batch sizes or very long sequences); unfused mode may be preferred when runtime dominates and memory is plentiful.
+
+The backward kernel similarly recomputes the three neighboring costs needed for each cell’s gradient update, reading
+X
+and
+Y
+directly.
+The gradient with respect to the inputs is then obtained via efficient marginal reductions:
+
+\displaystyle\frac{\partial\,\mathrm{sdtw}}{\partial x_{i}}
+
+\displaystyle=2\Big(x_{i}\sum_{j}E_{i,j}-\sum_{j}E_{i,j}\,y_{j}\Big),
+
+(8)
+
+\displaystyle\frac{\partial\,\mathrm{sdtw}}{\partial y_{j}}
+
+\displaystyle=2\Big(y_{j}\sum_{i}E_{i,j}-\sum_{i}E_{i,j}\,x_{i}\Big),
+
+(9)
+
+which are computed as matrix multiplications in PyTorch without ever materializing
+D
+.
+
+4.4
+Barycenter Computation
+
+Figure 2
+:
+SoftDTW Barycenter on synthetic block-wave data.
+
+We additionally provide a gradient-based SoftDTW barycenter
+[
+2
+,
+6
+]
+for computing DTW-space averages of a time-series collection.
+The barycenter
+\bar{\mathbf{z}}
+minimizes
+\sum_{k=1}^{K}\mathrm{sdtw}_{\gamma}(\bar{\mathbf{z}},\mathbf{x}^{(k)})
+via Adam optimizer
+[
+3
+]
+.
+
+5
+Benchmarks
+
+All benchmarks were run on an NVIDIA GTX 1080 GPU with PyTorch and Numba CUDA.
+We report peak GPU memory (forward + backward) in Table
+Table 2
+and wall-clock runtime in Table
+Table 2
+, each averaged over 5 iterations after a warmup pass.
+Figure
+Figure 1
+visualizes these results as a function of sequence length (
+L
+) and feature dimension (
+D
+).
+We compare against Maghoumi’s
+pytorch-softdtw-cuda
+
+[
+4
+]
+.
+Parameters:
+\gamma=1.0
+, no bandwidth constraint, squared Euclidean distance.
+Note: the benchmark tables and figures use
+L
+for sequence length (with
+N\!=\!M\!=\!L
+); the preceding sections use
+N
+and
+M
+to denote the (potentially unequal) lengths of the two input sequences.
+
+Table 1
+:
+Peak GPU memory (MB) for forward + backward pass. OOM = out-of-memory.
+
+B
+
+L
+
+D
+
+Maghoumi
+
+Ours (unfused)
+
+Ours (fused)
+
+Savings
+
+16
+
+128
+
+64
+
+275
+
+26
+
+23
+
+91.6%
+
+16
+
+512
+
+64
+
+4,136
+
+137
+
+89
+
+97.9%
+
+16
+
+1024
+
+64
+
+OOM
+
+481
+
+289
+
+—
+
+16
+
+2048
+
+64
+
+OOM
+
+1,842
+
+1,074
+
+—
+
+32
+
+128
+
+64
+
+534
+
+35
+
+28
+
+94.7%
+
+32
+
+512
+
+64
+
+8,256
+
+257
+
+161
+
+98.1%
+
+32
+
+1024
+
+64
+
+OOM
+
+946
+
+562
+
+—
+
+32
+
+2048
+
+64
+
+OOM
+
+3,672
+
+2,134
+
+—
+
+Table 2
+:
+Wall-clock runtime (ms) for forward + backward pass.
+
+B
+
+L
+
+D
+
+Maghoumi
+
+Ours (unfused)
+
+Ours (fused)
+
+16
+
+128
+
+64
+
+7.7
+
+1.8
+
+47.0
+
+16
+
+512
+
+64
+
+83.2
+
+16.0
+
+200.8
+
+16
+
+1024
+
+64
+
+OOM
+
+94.0
+
+891.6
+
+16
+
+2048
+
+64
+
+OOM
+
+685.1
+
+5,970
+
+32
+
+128
+
+64
+
+13.4
+
+2.4
+
+57.9
+
+32
+
+512
+
+64
+
+2,791
+
+41.8
+
+429.5
+
+32
+
+1024
+
+64
+
+OOM
+
+189.3
+
+2,877
+
+32
+
+2048
+
+64
+
+OOM
+
+1,069
+
+13,319
+
+Discussion.
+
+The unfused mode is consistently faster due to more efficient memory access patterns.
+The fused mode is 10–15
+\times
+slower than unfused but reduces memory by 40% (unfused
+\to
+fused) and up to 98% compared to Maghoumi.
+This makes fused mode the recommended choice when GPU memory is the bottleneck, a common scenario in training settings with large batch sizes or long sequences.
+Importantly, our implementation is the only one that supports
+N>1024
+on GPU at all.
+
+Figure 1
+visualizes these trends across sequence lengths and feature dimensions.
+
+6
+Limitations and Future Work
+
+Fused mode runtime.
+
+The fused backward kernel recomputes three distance values per cell per anti-diagonal step, resulting in significant runtime overhead compared to the unfused path.
+Shared-memory caching of
+X
+and
+Y
+tiles could reduce this gap.
+
+Normalization constraint.
+
+The normalized SoftDTW variant
+\mathrm{sdtw}(\mathbf{x},\mathbf{y})-\tfrac{1}{2}[\mathrm{sdtw}(\mathbf{x},\mathbf{x})+\mathrm{sdtw}(\mathbf{y},\mathbf{y})]
+
+[
+1
+]
+currently requires
+N=M
+.
+Extending to unequal lengths requires padding or interpolation.
+
+Kernel launch overhead.
+
+The tiled path issues
+N+M-1
+separate kernel launches from Python.
+For very long sequences (e.g.,
+N=M=5000
+), this amounts to
+\sim
+10,000 launches.
+A persistent-kernel or CUDA-graph approach could amortize this overhead.
+
+Mixed precision.
+
+The current implementation operates in FP32.
+FP16 or BF16 support could further reduce memory and improve throughput on modern GPUs with tensor cores.
+
+7
+Conclusion
+
+We presented
+softdtw-cuda-torch
+, a GPU-accelerated SoftDTW library for PyTorch that removes the 1024 sequence-length limit via tiled anti-diagonal execution, ensures numerical stability through a log-space backward pass, and achieves up to 98% GPU memory reduction via fused on-the-fly distance computation.
+The library is open-source under the MIT license and available at
+https://github.com/BGU-CS-VIL/sdtw-cuda-torch
+.
+
+Acknowledgments.
+
+We thank Mehran Maghoumi for the original
+pytorch-softdtw-cuda
+implementation
+[
+4
+]
+, which pioneered GPU-accelerated SoftDTW and served as a foundation for our work.
+

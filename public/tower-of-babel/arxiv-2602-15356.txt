@@ -1,0 +1,1523 @@
+Co-Design and Evaluation of a CPU-Free MPI GPU Communication Abstraction and Implementation
+Patrick G. Bridges, Derek Schafer, Jack Lange, James B. White III, Anthony Skjellum, Evan Suggs, Thomas Hines, Purushotham Bangalore, Matthew G. F. Dosanjh, Whit Schonbein
+
+Abstract
+Removing the CPU from the communication fast path is essential to efficient GPU-based ML and HPC application performance. However, existing GPU communication APIs either continue to rely on the CPU for communication or rely on APIs that place significant synchronization burdens on programmers. In this paper we describe the design, implementation, and evaluation of an MPI-based GPU communication API enabling easy-to-use, high-performance, CPU-free communication. This API builds on previously proposed MPI extensions and leverages HPE Slingshot 11 network card capabilities. We demonstrate the utility and performance of the API by showing how the API naturally enables CPU-free gather/scatter halo exchange communication primitives in the Cabana/Kokkos performance portability framework, and through a performance comparison with Cray MPICH on the Frontier and Tuolumne supercomputers. Results from this evaluation show up to a 50% reduction in medium message latency in simple GPU ping-pong exchanges and a 28% speedup improvement when strong scaling a halo-exchange benchmark to 8,192 GPUs of the Frontier supercomputer.
+
+
+
+I
+Introduction
+
+Modern HPC systems include sophisticated network capabilities to support communication using GPU devices. For example, recent GPU and network architectures include features to support GPU-initiated communication
+[
+1
+,
+14
+,
+6
+]
+.These features are designed to enable efficient direct GPU-to-NIC (network interface card) communication and to remove the CPU from the communication fast path; a recent survey of GPU communication techniques termed this overarching goal
+CPU-free communication
+
+[
+18
+]
+.
+
+Traditional approaches to communicating GPU payloads require CPU/GPU synchronization. GPU-initiated, CPU-free communication seeks to provide high-performance communication APIs that do not require this CPU/GPU synchronization. This optimization may reduce communication latency and increase small-message bandwidth, while improving the performance of strong scaling workloads whose performance is dominated by communication latency.
+
+Currently proposed CPU-free communication interfaces and implementations often significantly reduce the expressiveness of the communication API. For example, some remove support for features commonly used in HPC applications, such as message matching
+[
+1
+,
+13
+,
+12
+,
+10
+]
+and two-sided data movement
+[
+13
+]
+, from the available APIs to achieve the benefits of CPU-free communication; this has limited their usability in HPC applications and performance portability frameworks. More general-purpose GPU communication APIs, including most proposed GPU-triggered MPI APIs
+[
+3
+]
+and NVIDIA NCCL
+[
+12
+]
+, still generally use the CPU on the communication fast path
+1
+1
+
+1
+
+NCCL release 2.28.3 recently added experimental support for what it terms GPU-Initiated Networking
+[
+6
+]
+.
+.
+
+This paper describes the design, implementation, and evaluation of MPI extensions that provide CPU-free, two-sided MPI GPU communication.
+Specifically, after presenting relevant background information (Section
+II
+), this paper describes in detail the following research contributions:
+
+•
+
+The design of a new GPU communication API that can support CPU-free communication and mostly preserves familiar MPI two-sided communication abstractions (Section
+III
+).
+
+•
+
+The demonstration of the usage of this API to create revised versions of halo exchange objects used by both benchmarks and production applications written for the Cabana performance portability framework (Section
+IV
+).
+
+•
+
+An implementation of this API for HPE Slingshot 11 systems
+[
+4
+]
+that leverages the deferred work queue and counter features of the
+libfabric
+API
+[
+5
+]
+and the HPE
+libfabric
+CXI provider
+[
+14
+]
+to provide full CPU-free MPI point-to-point communication (Section
+V
+).
+
+•
+
+The evaluation of the impact of these abstractions on MPI GPU ping-pong performance and the strong scaling performance of HPC benchmarks, which demonstrates up to 50% reduction in GPU ping-pong latency and 20% or more improved strong scaling in Cabana halo-exchange benchmarks, when running on 1,024 nodes with 8,192 GPUs of the ORNL Frontier supercomputer (Section
+VI
+).
+
+In addition, this paper also discusses related work (Section
+VII
+) and directions for future work (Section
+VIII
+) relevant to these research contributions, prior to presenting conclusions (Section
+IX
+).
+
+II
+GPU Communication Background
+
+Communication on modern GPU systems typically involves both GPU and CPU execution, with significant latency overheads. Even the simple sequence of receiving data, running a kernel to compute using the received data, and then sending a message based on the results of that computation involves complex GPU, CPU, and NIC interactions. Our research builds on multiple approaches to reduce these overheads, many of them leveraging features of modern communication devices. The remainder of this section provides background on GPU communication costs, the approaches to mitigating or eliminating them our research builds on, the
+libfabric
+features and extensions implemented on HPE Slingshot NICs that we leverage to reduce these overheads, and performance data on the impact of different HPC GPU communication approaches on latency.
+
+II-A
+
+Overheads in GPU-Aware Communication Exchanges
+
+Standard GPU-aware MPI communication incurs significant latency overheads, as shown in Fig.
+1
+.
+
+⬇
+
+MPI_Recv
+(
+messageIn
+,
+
+src
+,
+
+length
+);
+
+parallel_kernel
+<
+x
+,
+
+y
+,
+
+stream
+>(
+problem
+,
+
+messageIn
+,
+
+messageOut
+);
+
+//
+
+Kernel
+
+Launch
+
+gpuStreamSynchronize
+(
+stream
+);
+
+//
+
+Memory
+
+Barrier
+
+MPI_Send
+(
+messageOut
+,
+
+dest
+,
+
+length
+);
+
+//
+
+RTS/CTS
+
+and
+
+Matching
+
+Fig. 1
+:
+Simplified CPU-driven GPU computation and MPI communication. Most current applications use this CPU-based approach to communicating data to and from GPU computations.
+
+In addition to network communication costs, GPU-aware two-sided MPI communication incurs the following costs:
+
+{LaTeXdescription}
+
+Launching a parallel kernel from the CPU typically takes on the order of a microsecond.
+
+GPUs include significant caches, and even when CPU and GPU memories are coherent, communicating data from GPU memory can require a memory barrier (the main cost of a stream synchronization) that takes on the order of a microsecond.
+
+Traditional two-sided MPI communication, which ensures that the receive buffer is ready, for example using a Ready-to-Send/Clear-To-Send (RTS/CTS) protocol, and handles MPI matching semantics, can take several microseconds depending on the exact details of the messaging implementation.
+
+As a result, GPU communication can easily increase latency by 2-4 microseconds. For 16KB message (e.g., an edge in a halo exchange) where network latency is on the order of 5 to 10 microseconds, this could increase end-to-end latency by 20-80%.
+
+II-B
+
+Reducing GPU Communication Overheads
+
+A wide range of approaches have been proposed for reducing the GPU communication overheads described above, which has been summarized by Unat et al
+.
+
+[
+18
+]
+. The most relevant of these, which inspired techniques used in this paper, are the following:
+
+{LaTeXdescription}
+
+In this approach, GPU kernels interact with CPU communication threads that poll memory, waiting for GPU kernel completion before initiating communication. This reduces kernel launch and stream synchronization latencies, and is typified by the NVIDIA Collective Communication Library
+[
+12
+]
+, the
+MPIX_Stream
+extension
+[
+20
+]
+to the
+MPICH
+communication library, and HPE’s original GPU-based communication primitives
+[
+11
+]
+.
+
+In this approach, GPU code, whether stream or kernel triggered, uses a restricted communication interface that eliminates the complex synchronization logic used to match messages, pauses the sender to ensure buffer readiness, and notifies the receiver of data availability. This enables implementations to eliminate kernel launch, memory barrier, and messaging setup costs described above, at the cost of increased programmer synchronization management. NVIDIA’s NVSHMEM library is the canonical example of this approach
+[
+13
+]
+and HPE has also published a paper describing a CPU-free MPI one-sided interface
+[
+10
+]
+.
+
+These approaches restrict or modify the semantics of two-sided semantics to enable CPU-free communication. In the first such approach, NVIDIA researchers designed the
+libmp
+two-sided communication library
+[
+1
+]
+. While this library provided an MPI-like interface, it did not support MPI matching and required that the sender separately guarantee that the receiver was ready to receive sent data. Recent work with MPI partitioned communication moved matching off the two-sided communication critical path and introduced a new MPI call,
+MPIX_Pbuf_prepare
+, to guarantee receiver buffer readiness; this call required CPU involvement prior to each GPU communication cycle
+[
+16
+]
+(however, this function is not yet adopted formally as of the MPI 5.0 standard
+[
+9
+]
+).
+
+II-C
+
+Slingshot 11/
+libfabric
+GPU Communication Features
+
+HPE Slingshot 11 network devices implement the general Open Fabrics Interconnect interface through the open-source CXI provider
+[
+14
+]
+. This provider includes implementations of the OFI triggered communication operations originally designed for the Portals communication API
+[
+19
+,
+2
+]
+. The
+libfabric
+CXI provider for these devices also includes API extensions to access these features from GPUs, which we describe in this section. They provide the foundation for CPU-free GPU-triggered communication that we leverage in this paper.
+
+libfabric
+defines two features to enable construction of triggered communication: (1)
+triggering counters
+that count network device events and can be configured to increment either upon the occurrence of specific network events (e.g., the local completion of a local operation such as a send, atomic operation, a remote write from a remote network device) or by explicit manipulation by the host, and (2)
+deferred work queue entries
+(DWQs) that specify
+libfabric
+communication operations
+2
+2
+
+2
+
+libfabric
+deferred work queue entries currently support only point-to-point communication operations, not hardware collective operations.
+whose execution is delayed until an associated triggering counter reaches a specified integer value.
+
+HPE’s CXI provider includes key extensions to the counter API calls that enable the GPU to trigger counters. First, the CXI provider can give the user an address of the counter that is in a memory-mapped I/O region, which the user can then register with the GPU to be used in a kernel or a GPU stream memory operations (e.g.,
+hipStreamWriteValue64
+). Second, the CXI provider offers registration for a custom writeback buffer for the counter. Note, however, reading CXI counter values requires CPU progress to update host writeback buffers. As a result, GPU memory operations cannot directly read CXI counters without CPU involvement.
+
+HPE has previously demonstrated the use of these features to support CPU-free GPU-triggered one-sided MPI communication
+[
+10
+]
+. Importantly, this paper described an approach to enable GPUs to poll for completion of remote writes without CPU intervention by having the
+sender
+trigger an
+fi_atomic
+write to a host memory location on the receiver when the
+fi_write
+completes on the sender. The receiving GPU, which cannot poll CXI counters directly without CPU assistance, can instead poll this memory location to wait for receive completion. As described in Section
+V
+, we use a variation of this approach where an
+fi_atomic
+is triggered by an
+FI_REMOTE_WRITE
+memory region counter on the
+receiver
+, allowing the GPU to wait for receive completion without an extra network round trip.
+
+III
+Proposed MPI GPU Triggering API
+
+Because of the importance of two-sided communication to a wide range of HPC applications,
+we set out to design an API that supports as many of the two-sided and collective MPI communication modes as possible. In addition, we sought to design an API that would support CPU-free GPU control flow and data movement on the communication fast path of HPE Slingshot 11 network devices. In the remainder of this section, we provide an overview of our design and the rationale behind our design choices, and we then give a detailed semantics of the key elements of this API.
+
+III-A
+
+Overview
+
+Our first design decision for a new MPI GPU API was to
+use existing MPI persistent operations
+, specifically persistent point-to-point and collective operations, whenever possible
+[
+9
+]
+. The existing persistent operations are attractive for GPU communication for two reasons: (1) they cover almost all of the commonly used MPI semantics, reducing the number of new abstractions or optimizations that need to be added to MPI, and (2) they explicitly separate setup operations involved in creating a request from the use of that request on the communication fast path. The latter is particularly important because it allows our
+MPI_Match
+function described below to remove communication operations with complex semantics such as message matching and exchange of RMA keys from the GPU-NIC fast path, where such operations are generally infeasible
+[
+7
+]
+.
+
+Next, we
+added an MPI progress engine abstraction, the
+MPI_Queue
+, that ties persistent operation communication to GPU execution
+.
+In this model,
+start
+and
+wait
+operations are enqueued to an MPI queue that is associated with a GPU stream, similar to the (non-persistent) approach first suggested by HPE researchers
+[
+11
+]
+.
+We augmented that proposal by also adopting the concurrency semantics proposed by MPICH researchers as part of the
+MPIX_Stream
+proposal, though not the more complex stream communicator elements of that proposal
+[
+20
+]
+.
+
+Third, we
+added a set of
+MPI_Match
+operations that can be applied to existing persistent operations
+. This change enables one-sided data movement for two-sided and collective persistent operations. This is not currently possible for MPI persistent point-to-point operations, with the exception of MPI partitioned point-to-point operations
+[
+9
+]
+. This also address OFI deferred work queues semantics not supporting the deferred activation of
+fi_recv
+operations
+[
+5
+]
+.
+
+Finally, we
+retained required MPI buffer readiness guarantees on the GPU-NIC fast path
+. Deferring data movement until the receiver indicates the remote buffer is ready is one of the features that makes two-sided communication more convenient than one-sided communication. Previous MPI GPU approaches added CPU involvement to the GPU communication fast path to ensure readiness (e.g.,
+MPI_Pbuf_Prepare
+, a proposed addition to partitioned communication mentioned above that is not currently in the MPI standard
+[
+8
+]
+). However, we determined that such calls were (1) unnecessary if we carefully leverage MPI persistent operations and OFI deferred work queue/triggered operation semantics, and (2) were undesirable if the application could separately guarantee and indicate buffer readiness (e.g., through the use of MPI ready send operations).
+
+III-B
+
+MPI_Queue
+: Ordering Progress with External Execution
+
+To represent an ordered set of communication tasks to execute on a GPU, we define an
+MPI_Queue
+object. Proposed APIs related to general management of the
+Queue
+object itself can be found in in Table
+I
+. These APIs are similar to other creation and freeing functions found within the MPI standard. The remainder of this section explains both how to use the proposed
+Queue
+objects.
+
+TABLE I
+:
+Queue Object Management APIs
+
+API
+
+Description
+
+Input(s)
+
+Output
+
+Queue_init
+
+Create a
+Queue
+
+Type of
+Queue
+,
+
+Queue
+
+object
+
+Address of related
+
+GPU stream
+
+Queue_free
+
+Free a
+Queue
+
+Queue
+to free
+
+object and any
+
+resources
+
+III-C
+
+MPI_Match
+: Enabling Stream Triggering of Legacy Persistent Operations
+
+In MPI, blocking, non-blocking, and persistent point-to-point calls need to be matched before data transfer can occur. For persistent calls, this matching occurs and adds complexity on every use. We mitigate this by requiring stream-triggered operations to have been fully matched—the implementation must have already done tag matching and should not need to negotiate with its communication partner how and where to put the data being exchanged. While not a new concept to MPI, we propose an API that provides the user with more explicit control of when this action happens, as well as the means to check on the status of matching. Table
+II
+outlines the set of APIs we are proposing.
+
+MPI_Match
+accepts an MPI request representing an inactive persistent request and returns a permanently matched equivalent. This means that once a request is processed by
+MPI_Match
+, it will have a determined pair request on the remote process, which will be permanent until the request is freed through
+MPI_Request_free
+. This eliminates much of the complexity of point-to-point, allowing for various optimizations and enabling stream triggering.
+
+Currently in MPI, any variant of
+MPI_Send
+may match with any style of
+MPI_Recv
+. This property of matching means that persistent communication may match with non-persistent communication, and thus persistent communication requests must match every time they are started. To ensure a persistent match, a persistent request using our matching APIs may only match to other persistent operations. Non-blocking requests cannot be matched with this API, either as direct inputs or as the matched operation on the other end of a matching call. Generalized requests are also considered as erroneous input. If a persistent request goes through the normal MPI calls and does not use any of our proposed APIs, then there is no change in behavior.
+
+In addition to a blocking match function, we also provide a non-blocking version. This function will return an
+MPI_Request
+that the user can wait and test on, similar to other non-blocking MPI communications. These matching requests are non-blocking, non-persistent, and cannot be canceled. When doing a non-blocking matchall of multiple requests, only a single request is returned from the function. This matching request will be considered completed when all of the input requests have been matched.
+
+Lastly, we also provide an API to test whether the original communication request(s) has/have been matched. The function does nothing to the matching request regardless of the state of the match; the matching request must still be completed by a regular MPI function (i.e.,
+MPI_Test
+or
+MPI_Wait
+).
+
+TABLE II
+:
+Proposed Matching APIs
+
+API
+
+Description
+
+Input(s)
+
+Output
+
+Match(all)
+
+Block until given
+
+Request(s)
+
+Request(s) are matched
+
+(array size)
+
+Imatch(all)
+
+Start the match
+
+Request(s)
+
+New Request
+
+for Request(s)
+
+(array size)
+
+(array)
+
+Is_matched
+
+Query the match
+
+Request
+
+Match result
+
+status of a Request
+
+III-D
+
+Concurrency Management using
+MPI_Queue
+
+TABLE III
+:
+Proposed Enqueueing APIs
+
+API
+
+Description
+
+Input(s)
+
+Enqueue_start(all)
+
+Enqueue the start of a
+
+Queue
+
+Requests(s) on a
+Queue
+
+Request(s)
+
+(array size)
+
+Enqueue_wait(all)
+
+Enqueue a wait that will
+
+Queue
+
+block a
+Queue
+until
+
+Request(s)
+
+Request(s) are completed
+
+(array size)
+
+Queue_wait
+
+Block the caller until
+
+Queue
+
+a
+Queue
+is empty
+
+Once an
+MPI_Queue
+object has been created, users may begin adding matched persistent requests to a
+Queue
+using the APIs shown in Table
+III
+. It is erroneous to add non-blocking requests or generalized requests to a
+Queue
+. If the user enqueues a request that has not yet been matched, the enqueue function will return an error, and the request will not be enqueued. If this happens in a function where multiple requests are enqueued, no request will be enqueued. In order for a request to be permitted to enqueue its start, it must be a persistent request, it must be matched, and any previous starts enqueued for the request must have a corresponding wait.
+
+After a request has been enqueued, the host thread is not permitted to call most normal MPI operations on it (e.g.
+MPI_Wait
+,
+MPI_Cancel
+, etc.). In addition, a request that has started on one
+Queue
+may not be waited on in a different
+Queue
+.
+
+Finally, we provide a function to block the CPU thread until all actions (communication or otherwise) in the
+Queue
+have completed. This call can be thought of as doing, at a minimum, the relevant synchronization method (e.g.,
+cudaStreamSynchronize
+), but an implementation may also do other progression related activities as well. Once the user knows that an enqueued request has been completed, the programmer is allowed to call
+MPI_Request_free
+to free the request.
+
+IV
+Prototyping Halo Exchanges with the Revised API
+
+⬇
+
+StreamHalo
+(
+ExecutionSpace
+
+exec_space
+)
+
+{
+
+...
+
+_my_stream
+
+=
+
+findStream
+(
+exec_space
+);
+
+MPI_Queue_init
+(&
+_my_queue
+,
+
+CXI
+,
+
+&
+_my_stream
+);
+
+//
+
+Create
+
+Send/Receive
+
+Requests
+
+for
+
+(
+int
+
+n
+
+=
+
+0;
+
+n
+
+<
+
+num_n
+;
+
+++
+n
+)
+
+{
+
+MPI_Recv_init
+(
+_ghost_buffers
+[
+n
+].
+data
+(),
+
+_ghost_buffers
+[
+n
+].
+size
+(),
+
+MPI_BYTE
+,
+
+_neighbor_ranks
+[
+n
+],
+
+_receive_tags
+[
+n
+],
+
+_comm
+,
+
+&
+_requests
+[
+n
+]);
+
+MPI_Send_init
+(
+_owned_buffers
+[
+n
+].
+data
+(),
+
+_owned_buffers
+[
+n
+].
+size
+(),
+
+MPI_BYTE
+,
+
+_neighbor_ranks
+[
+n
+],
+
+_send_tags
+[
+n
+],
+
+_comm
+,
+
+&
+_requests
+[
+num_n
+
++
+
+n
+]);
+
+}
+
+//
+
+Match
+
+send
+
+and
+
+receive
+
+requests
+
+MPI_Matchall
+(&
+_requests
+[
+n
+]);
+
+...
+
+}
+
+Fig. 2
+:
+Simplified version of MPI code to initialize a halo gather operation in the
+StreamHalo
+object.
+
+⬇
+
+template
+
+<
+class
+...
+
+ArrayTypes
+>
+
+void
+
+enqueueGather
+(
+
+const
+
+ArrayTypes
+&...
+
+arrays
+)
+
+{
+
+//
+
+Enqueue
+
+starting
+
+the
+
+receives
+
+MPI_Enqueue_startall
+(
+
+_my_queue
+,
+
+num_n
+,
+
+&
+_requests
+[0]
+
+);
+
+//
+
+Enqueue
+
+packing
+
+the
+
+data
+
+to
+
+send
+
+enqueuePackBuffers
+(
+
+_owned_buffers
+,
+
+_owned_steering
+,
+
+arrays
+.
+view
+()...);
+
+//
+
+Enqueue
+
+sends
+
+and
+
+waiting
+
+for
+
+//
+
+communication
+
+to
+
+complete
+
+MPI_Enqueue_startall
+(
+
+_my_queue
+,
+
+num_n
+,
+
+&
+_requests
+[
+num_n
+]
+
+);
+
+MPI_Enqueue_waitall
+(
+
+_my_queue
+
+);
+
+//
+
+Enqueue
+
+unpacking
+
+receive
+
+buffers
+
+enqueueUnpackBuffers
+(
+_ghost_buffers
+,
+
+_ghost_steering
+,
+
+arrays
+.
+view
+()...);
+
+}
+
+Fig. 3
+:
+Simplified version of MPI code to enqueue a ghost cell gather operation in the
+StreamHalo
+object.
+
+The StreamHalo class discussed in this paper derives from the Halo class in Cabana’s grid
+package
+[
+15
+]
+.
+This paper covers two version of StreamHalo, a default MPI-based StreamHalo class and a version enhanced to use the stream-triggering API described in Section
+III
+. Both versions implement two main methods:
+enqueueScatter
+and
+enqueueGather
+; the former uses standard MPI
+Isend
+and
+Irecv
+, while the latter uses our prototype stream-triggering APIs.
+
+Fig.
+2
+shows part of the constructor for the version of the
+StreamHalo
+object that uses our stream-triggered API.
+First, it finds the stream object associated with the current Kokkos execution space and uses it to initialize an
+MPI_Queue
+; this ties progress for communication operations on this queue to the associated GPU stream.
+Next, using
+MPI_Send_init
+and
+MPI_Recv_init
+calls, the constructor creates persistent send and receive requests for performing communication associated with
+StreamHalo
+gather operations.
+Finally, the
+StreamHalo
+constructor performs an
+MPI_Matchall
+operation on the created persistent operations to enable their use on stream. This call is a key difference between our API and the traditional MPI persistent communication API, and it moves message matching out of the communication critical path.
+
+Fig.
+3
+shows the code for the
+enqueueGather
+method using the proposed stream-triggered API. As is common in GPU stream code, this code enqueues a sequence of operations to the GPU stream and associated
+MPI_Queue
+. In order, the enqueued opertions (1) start the previously initialized and matched MPI receive requests, (2) pack communication buffers for sending, (3) start the previously initialized send requests, (4) wait for pending sends and receives to complete, and (5) unpack received communication buffers.
+
+With the exception of the lack of fencing, the ability to enqueue MPI operations to GPU streams, and
+MPI_Matchall
+, this version has only minor changes compared to the standard MPI code.
+The API preserves ease of use, while enabling increases in efficiency and speed.
+
+V
+Achieving CPU-Free MPI GPU Communication
+
+In this section, we describe the design of a high-performance implementation of the communication of the API described in Sections
+III
+and
+IV
+for the HPE Slingshot 11 NIC. We first describe the general data movement strategy, and then discuss a key issue for CPU-free two-sided MPI communication: delaying transmission on the sender until the remote receive buffer is ready, along with potential sources of deadlock in this implementation.
+
+V-A
+
+Send and Receive with GPU Communication Counters
+
+(a)
+
+Send timeline
+
+(b)
+
+Receive timeline
+
+Fig. 4
+:
+Timeline for our stream-triggered implementation of send, ready send, and receive operations with respect to the CPU, GPU, and NIC. Dotted boxes represent deferred work queue operations being carried out; orange boxes represent actions specific to the implementation of regular (non-ready) send, as described in Section
+V-B
+.
+
+On creation of a persistent send and receive, our implementation allocates the following resources:
+
+•
+
+A triggering counter on the sender that can be triggered by the GPU stream to initiate communication.
+
+•
+
+A local completion buffer for the persistent operation that can be polled by a GPU stream or kernel operation.
+
+•
+
+A completion counter on both the sender and receiver that is used to trigger an
+fi_atomic
+to increment the local completion buffer. On the sender, this counter increments on completion of the triggered
+fi_write
+. On the receiver, this counter increments on an
+FI_REMOTE_WRITE
+to the memory buffer associated with the receive.
+
+Our overall data-movement strategy for matching and ready-send/receive operations using these resources is shown in blue in Fig.
+4
+:
+
+•
+
+MPI_Match
+operations on persistent sends and receives
+use standard MPI communication operations to exchange RMA communication keys with all peers with which they are matching.
+
+•
+
+MPI_Enqueue_Start
+on a send operation
+constructs an
+fi_write
+deferred work queue entry for the data movement operation and an
+fi_atomic
+deferred work queue entry to a
+local
+memory completion buffer. The
+fi_write
+deferred work queue entry is tied to the triggering counter that the local GPU will increment, and the
+fi_atomic
+deferred work queue entry is tied to the completion counter for the
+fi_write
+operation. Finally,
+MPI_Enqueue_Start
+on a send enqueues a GPU kernel that will increment the triggering counter associated with the persistent stream-triggered send. As shown in Fig.
+4(a)
+, when this kernel runs, it will trigger the deferred
+fi_write
+operation, and the completion of this
+fi_write
+will trigger the
+fi_atomic
+operation to update the local completion buffer associated with the persistent send.
+
+•
+
+MPI_Enqueue_Start
+on a receive operation
+creates a deferred work queue entry for an
+fi_atomic
+operation that triggers from the completion counter for
+FI_REMOTE_WRITE
+operations to the local memory buffer. As shown in Fig.
+4(b)
+, when the
+fi_write
+associated with a send places data in this buffer, the local
+fi_atomic
+operation will update the local completion buffer associated with the persistent receive.
+
+•
+
+MPI_Enqueue_Wait
+enqueues a kernel that polls for the relevant local completion buffer to be incremented to the appropriate value by an
+fi_atomic
+operation.
+
+Finally, when possible, our implementation merges the use of triggering counters. Specifically,
+MPI_Enqueue_startall
+for ready sends and receives can share a triggering counter. Because non-ready sends require more involved synchronization, as described below, they cannot share triggering counters.
+
+V-B
+
+Handling Receiver Readiness Checks
+
+Unlike many one-sided operations or MPI ready sends, standard MPI send operations cannot deliver data into the user’s receive buffer until a matching receive operation is called. Because our current implementation relies on one-sided
+fi_write
+operations to move data directly to the user buffer, it must include a mechanism to defer writes until a receive is triggered by the GPU on the receiver.
+
+We implement these semantics using the operations shown in orange in Fig.
+4
+. First,
+MPI_Enqueue_Start
+on a receive matched with a regular non-ready send also creates a deferred
+fi_atomic
+operation to a buffer to serve as a Clear-To-Send (CTS) message, and enqueues a kernel to trigger this operation when GPU execution reaches the receive. Second, regular sends tie counting of
+FI_REMOTE_WRITE
+to this buffer to its send triggering counter. Finally, enqueued regular sends only trigger on
+even numbered
+counter values. Because MPI forbids starting another send or receive without an intervening wait, this guarantees that a stream-triggered regular send will only occur when (1) the GPU has triggered the relevant send and (2) a CTS for the relevant send has been received.
+
+V-C
+
+Deadlock and Resource Exhaustion Analysis
+
+Because of their deferred execution model, understanding and limiting potential sources of deadlock are important when designing and implementing GPU-triggered communication. Our API and implementation are designed to minimize the potential for communication-induced deadlock by allowing
+only
+
+MPI_Enqueue_wait
+to block stream execution;
+MPI_Enqueue_start
+cannot enqueue any GPU kernels that can block. This places the onus on MPI programmers to guarantee that all relevant sends and receives are active prior to a wait occurring, but MPI already requires this.
+
+Our current implementation includes another potential source of deadlock: resource exhaustion of Slingshot DWQ entries. Because calls on the CPU to
+MPI_Enqueue_start
+allocate DWQ entries, exhausting the pool of available entries can cause
+MPI_Enqueue_start
+to hold on the CPU while waiting for an arbitrary communication operation to complete and free an entry. Current Slingshot NICs have approximately 500 DWQ entries available for application use, and our implementation uses at most 2 DWQ entries per send or receive, so this has not been a significant limitation in practice thus far. More generally, an implementation could use a CPU thread to progress stream-triggered operations when hardware DWQ entries are exhausted.
+
+Finally, we note that, like all GPU communication approaches, our proposed stream-triggering API relies on users to avoid deadlocks induced by the GPU scheduler failing to schedule streams with communication operations. The most common approach to doing this, for example when using NCCL in PyTorch, is to perform all communication on a high-priority GPU stream.
+
+VI
+Evaluation
+
+We measured the performance of the co-designed API and its prototype implementation described in the previous sections to evaluate its strengths and weaknesses in comparison with the standard MPI implementations. Here, we describe the benchmarks and platforms used for this evaluation. We used microbenchmarks of point-to-point latency and bandwidth, and we measured the impact of our proposed API and implementation on the scalability of halo-exchange communications.
+
+VI-A
+
+Experimental Setup
+
+We conducted our evaluation using two benchmarks that vary in their behavior on two platforms, which we describe below. Full implementation and benchmark source code, system run scripts, measured data, and analysis are available as open source online (Section
+Source Code and Data Availability
+).
+
+VI-A
+1
+Test Systems
+
+We performed our tests on two systems: ORNL Frontier and LLNL Tuolumne. Frontier is a 9,408 node Cray EX system with one 64-core AMD EPYC CPU and four AMD Instinct MI250X GPUs per node. Each MI250X has two separately programmable 64GB graphics compute dies (GCDs), so applications can use up to eight GCDs per Frontier compute node. Tuolumne is a 1,152 node Cray EX supercomputer with four MI300A APUs per node, each with 24 AMD EPYC CPU cores and one GPU that share 128GB of high-bandwidth memory. Both Frontier and Tuolumne nodes are connected via a 200Gbps HPE Slingshot 11 network using a Dragonfly network topology, with four Slingshot NICs per node. Software versions used on these systems are shown in Table
+IV
+.
+
+TABLE IV
+:
+Software versions used on test systems
+
+System
+
+Cray Compiler
+
+ROCm
+
+Cray
+
+Libfabric
+
+Environment
+
+MPICH
+
+Frontier
+
+18.0.1
+
+6.2.4
+
+8.1.31
+
+1.22.0
+
+Tuolumne
+
+20.0.0
+
+6.4.0
+
+9.0.1
+
+1.15.2
+
+VI-A
+2
+GPU Ping-Pong Microbenchmark
+
+To examine the fine-grain performance differences between communication using standard GPU-aware
+MPI_Send
+and
+MPI_Recv
+operations and our proposed stream-triggered alternatives, we designed a simple GPU-focused ping-pong benchmark that repeatedly packs, sends, receives, and unpacks a GPU buffer of configurable size between a pair of MPI processes a configurable number of times. For standard MPI operations, this GPU ping-pong adds two kernel launches and one GPU synchronization to the communication fast path compared to normal MPI ping-pong benchmarks: launching a packing kernel synchronizing the CPU with the GPU prior to calling
+MPI_Send
+, and launching an unpacking kernel after the completion of the
+MPI_Recv
+. In contrast, all packing, unpacking, and communication operations for the ping-pong exchange are enqueued to the GPU stream and associated
+MPI_Queue
+at benchmark startup, with the CPU using only a single GPU/CPU synchronization to wait for all message exchanges to finish and time the length of the entire exchange.
+
+After completing warm-up iterations, we ran each ping-pong trial for a given buffer size for a number of round-trip iterations chosen to make the total measurement time between between 1 and 30 seconds; this was 100,000 iterations for buffer sizes less than 4MB, 10,000 iterations for buffer sizes between 4MB and 64MB, and 1,000 iterations for buffer sizes greater than 64MB. We ran five ping-pong trials for all power-of-two buffer sizes between one byte and one gigabyte, and computed and plotted the average and 95% confidence interval of the per-trial average ping-pong latency and bandwidth.
+
+VI-A
+3
+CabanaGhost Halo Exchange Benchmark
+
+To measure the impact of stream triggering on more complex communication patterns, we developed a C++-based halo exchange benchmark called
+CabanaGhost
+using the Cabana performance portability framework
+[
+15
+]
+.
+CabanaGhost
+’s Game of Life benchmark uses an underlying Cabana grid halo exchange class to perform 8-point stencil communications, and we added a
+StreamHalo
+class to Cabana to support stream-triggered halo exchanges in
+CabanaGhost
+, as outlined in Section
+IV
+. The
+StreamHalo
+class can be configured to use standard MPI sends/receives with GPU fence operations, the stream-triggered standard sends and receives, or stream-triggered ready sends and receives.
+
+We tested the performance impact of stream-triggered communication on
+CabanaGhost
+halo exchanges by examining the strong scaling performance of the Game of Life test on small and large problems. The large problem, a 30GB problem on the Frontier system and a 62GB problem on the Tuolumne system, was chosen to test strong scaling performance below and up to the strong-scaling limit of the problem. The small problem, a 2GB problem on both systems, was chosen to test both regular and stream-triggered performance
+beyond
+the strong scaling limit of the problem. For each we conducted five trials of 1,000 Game of Life iterations, where we measured the time from the beginning to the end of the solver phases of the benchmark.
+
+VI-B
+
+Ping-Pong Latency and Bandwidth
+
+(a)
+
+Bandwidth
+
+(b)
+
+Latency
+
+Fig. 5
+:
+Cray MPICH and Stream-Triggered GPU packing ping-pong bandwidth and latency between two Frontier nodes.
+
+We first examined the ping-pong bandwidth and latency performance of our stream-triggered operations in comparison to Cray MPICH on the Frontier system, as shown in Fig.
+5
+. These results show that stream-triggered exchanges have significantly lower latency than CPU-triggered sends and receives, as well as significantly higher ping-pong bandwidth, particularly for messages between 4,096 bytes and one megabyte, but that Cray MPICH achieves higher bandwidth than our stream-triggered interface for messages 8MB or larger. On Frontier, stream-triggered sends and ready sends, respectively, have 12–39% and 12–49% lower latency than Cray MPICH for message sizes between 32 bytes and 512KB, and 2.7–4.9% increased latency for messages 8MB and larger. On Tuolumne, stream-triggered sends and ready sends, respectively, have 14–51% and 14–59% lower latency than Cray MPICH for message sizes between 32 bytes and 2MB, and 8.6–18% increased latency for messages 16MB and larger.
+
+We believe the reduced latency of stream-triggered messages results from the elimination of kernel launch overheads and GPU/CPU synchronization from the communication critical path. However, this is a best-case improvement for stream-triggering latency because it requires two kernel launches and a synchronization per send; more complex communication patterns like halo exchanges
+will incur these overheads only once per halo exchange. In addition, the ping-pong benchmark generally guarantees that the receiving buffer will be ready, minimizing the need for regular sends to wait for CTS arrival.
+
+VI-C
+
+Halo Exchange Strong Scaling
+
+We tested strong-scaling
+CabanaGhost
+problems on power-of-two numbers of nodes from 1 to 1,024 nodes on both the ORNL Frontier and LLNL Tuolumne systems, using either 1, 2, 4, or 8 MI250X GPU GCDs (and MPI processes) per node on Frontier and 1, 2, or 4 MI300A APU GPUs on Tuolumne. On both systems, we ran five independent runs of 1,000
+CabanaGhost
+iterations for each node/GPUs per node combination. On both systems, our evaluation focused on the average speedup over the mean single-GPU Cray MPICH solve time averaged across all samples with the same number of total MPI ranks.
+
+VI-C
+1
+ORNL Frontier
+
+(a)
+
+Linear Scale
+
+(b)
+
+Log Scale
+
+Fig. 6
+:
+Strong scaling speedup of the 8-point halo exchange benchmark for small and large problems on ORNL Frontier.
+
+Fig.
+6
+shows the results of this test for Frontier using both a log and linear scale, with the 95% confidence interval of the speedup shown in the shaded area. As a baseline, the average Frontier solve time for the 30.0 GB problem using one GCD with the Cray MPICH backend was approximately 88.67 seconds, while the average solve time for the 2.0 GB problem using one GCD was 6.156 seconds.
+
+Stream-triggered ready send has a higher maximum speedup than both stream-triggered standard send and Cray MPICH standard sends on both problems. On the large problem, both stream-triggered alternatives outperform Cray MPICH standard sends. On the small problem, stream-triggered standard send outperforms Cray MPICH up to 256 MPI processes, but Cray MPICH standard sends outperforms stream-triggered standard sends at 512 MPI processes and larger.
+
+Table
+V
+summarizes the maximum mean speedup for each backend, and the number of nodes and MPI processes at which this maximum is achieved.
+
+TABLE V
+:
+Summary of best Frontier mean speedup by backend and problem size, along with the the number of nodes and MPI processes at which the maximum was reached.
+
+Problem
+
+Backend
+
+Maximum
+
+Nodes/Ranks
+
+Size (GB)
+
+Mean Speedup
+
+2.0
+
+Cray MPICH
+
+50.23
+
+1,024/1,024
+
+Stream Rsend
+
+50.23
+
+512/1,024
+
+Stream Send
+
+40.49
+
+512/1,024
+
+30.0
+
+Cray MPICH
+
+485.4
+
+1024/4096
+
+Stream Rsend
+
+622.2
+
+1,024/8,192
+
+Stream Send
+
+543.7
+
+1,024/4,096
+
+Stream-triggered ready send achieves identical speedup to Cray MPICH on half as many nodes on the small problem and has a 28% higher maximum mean speedup on the large problem.
+
+VI-C
+2
+LLNL Tuolumne
+
+Fig. 7
+:
+Strong scaling speedup of the 8-point halo exchange benchmark on LLNL Tuolumne for the 62.0 GB problem with varying numbers of GPUs per node.
+
+Fig.
+7
+shows the result of the halo exchange strong scaling test for Tuolumne, using a linear scale with the 95% confidence interval of the speedup shown in the shaded area. Unlike Fig.
+6
+, this chart plots speedup with different numbers of GPUs per node separately due to large variation in speedup on Tuolumne with the same number of total GPUs but different numbers of GPUs per node. On this system, the average solve time for the 62.0 GB problem on one GPU with the Cray MPICH backend was approximately 88.80 seconds, while the average solve time for the 2.0 GB problem on one GPU was 3.110 seconds.
+
+Broad Tuolumne performance trends are similar to Frontier, but with much higher variation in Cray MPICH performance with different numbers of GPUs per node. Specifically,
+(1) our stream-triggering operations are faster at all numbers of MPI processes when using four GPUs per node, (2) for a fixed number of total GPUs, Cray MPICH is always slower when using four GPUs per node, and (3) Cray MPICH outperforms stream-triggering at the largest scales when using one or two GPUs per node. We did not observe this behavior on Frontier, where speedup variance with different GCDs per node was almost always less than 5%. We believe this may be because optimizations of Cray MPICH for Tuolumne MI300A APU features are still in progress.
+
+VI-D
+
+Communication Performance by Maximum Message Size
+
+As previously shown in Section
+VI-B
+, our proposed stream-triggering primitives can significantly reduce the latency of individual message exchanges by reducing or removing kernel launch and GPU/CPU synchronization overheads. However, as Fig.
+4
+shows, our simple approach to stream triggering, which always uses the NIC and does not currently attempt to optimize for different message sizes, incurs additional costs for regular (non-ready) sends. In contrast, production MPI implementations such as Cray MPICH use optimized hardware and protocols for different messages sizes. As a result, the performance benefits of our current stream-triggering implementation may vary significantly by message size, especially with more complex communication patterns.
+
+Fig. 8
+:
+Percentage improvement over Cray MPICH in the halo exchange benchmark speedup by problem size and average halo edge length on ORNL Frontier.
+
+Fig.
+8
+plots the percentage speedup of the stream-triggering halo exchange approaches in comparison with Cray MPICH versus the average length of the edge in the halo exchanges on Frontier; note that four 8-byte corner messages are also exchanged each iteration in addition to these edges.
+
+This graph shows that our stream-triggering implementation outperforms Cray MPICH for medium-size messages, which are performance critical in many HPC workloads. However, Cray MPICH significantly outperforms stream-triggered regular (non-ready) sends when messages are less than 8KB in size because Cray MPICH is able to use Slingshot unexpected message hardware to avoid waiting for CTS messages prior to sending messages. A stream-triggering implementation could also optimize such transfers using bounce buffers and GPU copies, but we have not yet implemented this optimization. Finally, we note that these costs were not captured in the micro-benchmark analysis in Section
+VI-B
+, indicating the importance of assessing the performance of communication abstractions on more complex communication patterns.
+
+VII
+Related Work
+
+Many MPI APIs for GPU communication have been proposed, as recently surveyed
+[
+3
+]
+. Of these, the HPE two-sided GPU communication API
+[
+11
+]
+and the MPICH
+MPIX_Stream
+API
+[
+20
+]
+are closest to our work, and key features from these proposals informed our design. Unlike them, our API leverages persistent communication to reduce the number of operations to add to the API and augments two-sided matching semantics to enable one-sided data movement.
+
+Of the MPI GPU-triggered communication implementations, we are aware of only two that attempt to provide CPU-free communication: HPE’s MPI one-sided communication API and implementation
+[
+10
+]
+, and a GPU-initiated MPI partitioned communication system
+[
+16
+]
+. The HPE one-sided API and implementation informed our design, particularly the use of
+fi_write
+for data movement and chained
+fi_atomic
+opertions for completion notification. Our API and implementation provides similar data movement and notification capabilities while preserving two-sided communication semantics and enabling faster communication through ready sends. Unlike our approach, the GPU-initiated partitioned communication system in
+[
+16
+]
+requires the use of CPU-based
+MPI_Pbuf_prepare
+calls to guarantee receiver readiness. Unlike our approach, this API is also very different from the standard MPI two-sided communication API.
+
+Non-MPI APIs have also been designed and implemented that support CPU-free communication, particularly NVIDIA’s NVSHMEM
+[
+13
+]
+and NCCL
+[
+12
+]
+communication systems. NCCL is most similar to our approach in providing an API for stream-initiated communication inspired by MPI; NVSHMEM is a one-sided communication API that relies on kernel-initiated communication. While the NCCL API is partially inspired by MPI, it provides a fundamentally collective communication API even for point-to-point communication, and, unlike our API,
+does not support important MPI features such as message matching. Finally, NCCL has recently implemented CPU-free communication
+[
+6
+]
+; we have not been able to compare our performance with this system because our API has not been ported to Infiniband, and NCCL GPU-Initiated Networking has not been ported to HPE Slingshot.
+
+VIII
+Directions for Future Work
+
+There is a wide range of directions for future work that builds on the research described in this paper. First, there are many optimization opportunities in the current implementation that have not yet been explored. For example, Section
+VI-D
+shows that small stream-triggered sends when the receiver is not yet ready incur a substantial performance penalty. This case could be easily optimized for small messages using a simple bounce-buffer scheme, where small writes are staged through pre-allocated buffers associated with the persistent receive operation, and the
+MPI_Enqueue_wait
+kernel copies received data to its final destination. Similarly, the implementation could be optimized to leverage GPU-to-GPU copy hardware for intra-node communication.
+
+Another potential area for future research is in stream-triggered collective communication operations. The OFI deferred work queue operations we leverage in this paper were originally designed for implementing offloaded collective communications
+[
+19
+]
+, and they provide an opportunity for constructing flexible, high-performance stream-triggered operations. There are also many
+tradeoffs with NIC, CPU, and GPU resource usage when implementing collectives of different buffer sizes and numbers of MPI processes.
+
+Future work would also be helpful on the impact of this API and its implementation on a broader range of applications and NIC and GPU architectures. For example, integration of the API into additional applications such as machine learning and conjugate gradient solvers
+[
+17
+]
+would broaden the understanding of its impact. Testing our API on NVIDIA GPU/HPE Slingshot systems is in theory straightforward; our implementation relies only on GPU memory operations that are available on NVIDIA GPUs and should run with minimal changes on NVIDIA GPU/HPE Slingshot NIC systems. Unfortunately, the only such systems to which we have access did not include the NVIDIA kernel device driver option needed to support the required peer memory operations. Finally, porting our proposed API to NVIDIA InfiniBand NICs would enable systematic comparisons with NCCL GPU-Initiated Communication
+[
+6
+]
+, insight into how well our API support for CPU-free communication on other network devices, and direct comparisons of the CPU-free communication features of HPE Slingshot and NVIDIA InfiniBand network devices.
+
+IX
+Conclusions
+
+This paper presented a co-designed API and implementation for MPI stream-triggered GPU communication that completely removes the CPU from the communication fast path. The API, which leverages persistent communication operations, preserves the matched two-sided communication semantics of MPI with only minimal changes; as a result, common HPC communication patterns such as halo exchanges remain easy to implement. The co-designed API and implementation leverage features of the OFI interface that the HPE Slingshot NIC makes available to GPU kernels, to provide complex synchronization without introducing additional blocking paths on GPU streams, while reducing small and medium message latency measured using a microbenchmark by up to 50%. An evaluation of the impact of this API and implementation on a complex halo exchange benchmark running on up to 8,192 GPUs shows that they can increase the strong scaling speedup of such communication patterns by up to 28%.
+
+Source Code and Data Availability
+
+Source code for the stream-triggering primitives described in this paper is available as open source software as part of the MPI Advance family of libraries at
+https://github.com/MPI-Advance/stream-triggering
+. Source code for our modified version of the Cabana library is available at
+https://github.com/CUP-ECS/Cabana
+. Source code for the CabanaGhost benchmark used in this paper is available at
+https://github.com/CUP-ECS/CabanaGhost
+. Spack packages for building these libraries and benchmarks are available at
+htts://github.com/CUP-ECS/spack-packages
+. The run scripts, raw generated data, and analysis scripts used to create the figures found in this paper are available at
+https://github.com/CUP-ECS/stream-triggering-data
+.
+

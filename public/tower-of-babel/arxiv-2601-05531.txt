@@ -1,0 +1,1548 @@
+DNATokenizer: A GPU-First Byte-to-Identifier Tokenizer for High-Throughput DNA Language Models
+Eliatan Niktab, Hardip Patel
+
+Abstract
+Tokenization sits at the boundary between high-throughput genomic input and GPU compute, posing a challenge for both algorithmic design choices and systems bottlenecks. Inherently, overlapping k k -mer tokenization introduces information leakage under masked language modeling (MLM) and can degrade downstream accuracy; single-nucleotide tokenization avoids leakage and preserves per-base fidelity but explodes sequence length for attention-based architectures. Non-overlapping k k -mers and byte-pair encoding (BPE) provide compression and avoid leakage, at the cost of boundary sensitivity or reduced interpretability. Empirically, the choice of tokenization interacts strongly with model architecture and task requirements. At the system level, however, standard string tokenizers and host-bound vocabulary lookups dominate wall-clock time once inputs reach billions of bases, regardless of the chosen algorithmic tokenization. This work presents DNATok , a high-performance GPU-first tokenization system that replaces general-purpose string processing with byte lookup table (LUT)-based identifier streaming and an overlapped host-to-device (H2D)/compute pipeline utilizing pinned memory and architectural parallelism. DNATok is vocabulary-agnostic; it accelerates single-nucleotide, non-overlapping k k -mer, or BPE tokenization and integrates as a drop-in systems layer beneath genomic foundation models. On the benchmark system described in Table , DNATok achieves 84 84 – 95 × 95\times higher encode throughput than optimized Hugging Face baselines and up to 1.9 × 1.9\times higher H2D throughput. End-to-end streaming throughput reaches 1.27 1.27 – 1.84 × 10 8 1.84\times 10^{8} tokens/s depending on configuration, effectively removing tokenization as a bottleneck for production-scale training and inference.
+
+
+
+\keepXColumns
+
+1
+Introduction
+
+Deep learning models increasingly rely on efficient input pipelines to realize their highly parallelized potential. For DNA sequences, tokenization sits at the critical boundary between high-throughput I/O and GPU compute. Modern genomic models, including Nucleotide Transformer,
+1
+HyenaDNA,
+2
+Evo2,
+3
+Caduceus,
+4
+and GPN
+5
+demonstrate that tokenization choice fundamentally shapes model performance, in terms of hardware utilization, training efficiency, and generalization across species and tasks.
+
+1.1
+Algorithmic tokenization: the leakage problem
+
+Early genomic language models employed overlapping
+k
+-mer tokenization with stride 1, where each token is a substring of length
+k
+and adjacent tokens share
+k{-}1
+bases.
+6
+This approach captures local sequence motifs and provides richer immediate context, but introduces two critical problems. First, it produces redundant token streams of length
+L{-}k{+}1
+for an input of length
+L
+, increasing memory and compute costs. Second, and more seriously, overlapping
+k
+-mers cause
+information leakage
+under masked language modeling: when predicting a masked token, the model can infer much of the answer from adjacent unmasked tokens that share
+k{-}1
+bases with the target, degrading sample efficiency and potentially harming downstream accuracy.
+7
+
+BPE-based genomic tokenizers address this leakage problem by replacing overlapping
+k
+-mers with learned subword vocabularies.
+7
+,
+8
+BPE constructs a vocabulary of variable-length tokens from frequent genomic substrings, providing substantial input compression, eliminating the stride-1 overlap, and thereby avoiding MLM leakage.
+7
+
+Non-overlapping (blocked)
+k
+-mers compress input length in proportion to
+k
+and avoid MLM leakage by eliminating shared bases between adjacent tokens. However, they introduce boundary sensitivity: small shifts, insertions, or deletions can substantially change tokenization, potentially missing motifs that cross token boundaries. BPE and other data-driven subword schemes provide variable-length tokens that adapt to frequent genomic patterns, offering strong compression and few out-of-vocabulary tokens, but may lack direct biological interpretability and can exhibit domain-transfer challenges across species.
+7
+,
+9
+
+Single-nucleotide (character) tokenization preserves per-base resolution and is robust to small insertions and deletions, making it ideal for tasks sensitive to single-nucleotide polymorphisms and for architectures that efficiently handle long contexts (for example, state-space models like HyenaDNA and Evo2).
+2
+,
+3
+However, character tokenization produces very long token sequences that stress attention-based models at long context lengths.
+
+Table
+1
+summarizes major tokenization schemes and their empirical trade-offs as synthesized in recent reviews and comparative studies.
+9
+,
+7
+
+Table 1:
+Genomic tokenization schemes and their trade-offs for long-context DNA language models.
+
+Scheme
+
+Benefits
+
+Drawbacks
+
+Benchmarked models
+
+Single-nucleotide (character)
+
+Per-base resolution; robust to single-nucleotide variants and small indels; no token-boundary artefacts.
+
+Sequences as long as the input DNA; high compute cost for attention at long context lengths.
+
+HyenaDNA,
+2
+Evo2
+3
+
+Overlapping
+k
+-mers
+
+Enriches local context; captures short motifs.
+
+Adjacent tokens share
+k-1
+bases, causing MLM leakage and redundancy; now generally discouraged.
+7
+
+Not benchmarked
+
+Non-overlapping
+k
+-mers
+
+Reduces input length in proportion to
+k
+; avoids MLM leakage.
+
+Boundary sensitivity: small shifts or indels change the tokenization frame and can split motifs.
+
+Nucleotide Transformer
+1
+
+BPE / data-driven subwords
+
+Strong compression; compact vocabulary; avoids MLM leakage.
+
+Reduced biological interpretability; domain-transfer challenges across genomes and assays.
+
+Not benchmarked
+
+1.2
+The systems gap
+
+Genomic models provide limited systems-level approaches to overcome tokenization as a throughput bottleneck in production workloads. The focus remains primarily on token design, model architectures, and downstream benchmarks (e.g., GenomicBenchmarks
+10
+); explicit, quantitative studies of tokenization throughput, pinned host memory, host-device concurrency, or GPU-resident tokenization are sparse.
+7
+,
+9
+Recent genomic transformer work highlights model-side accelerations such as FlashAttention and Attention with Linear Biases (ALiBi),
+11
+,
+12
+but does not detail input pipeline optimizations. Broader LLM systems surveys acknowledge tokenization as a pipeline step affecting latency and throughput, and discuss concurrent CUDA streams and overlapping transfers with compute, but reproducible measurements specific to tokenizer throughput in genomics remain limited.
+13
+,
+14
+,
+15
+
+NVIDIA programming guides and systems papers on deep learning emphasize pinned memory reuse, asynchronous transfers, and compute-communication overlap as prerequisites for high-throughput GPU applications.
+13
+,
+14
+,
+15
+However, these principles have not been systematically applied or quantified for genomic tokenization. Existing work usually treats tokenization as a solved preprocessing step, ignoring the substantial serialization overhead imposed by CPU-bound string processing at the terabyte scale.
+DNATok
+bridges this gap by providing a dedicated, reproducible pipeline optimized for fixed-alphabet genomic inputs, compatible with recent foundation models including Evo2, Nucleotide Transformer, and HyenaDNA.
+
+In practical genomic embedding stacks, popular string tokenizers from NLP toolkits, most notably the Hugging Face tokenizers library,
+16
+incur per-character branching, dynamic allocations, and host-side vocabulary lookups that are unnecessary for DNA’s fixed four-letter alphabet. For long contexts and large batches, tokenization becomes both CPU-bound and H2D-bound, dominating wall-clock time even when downstream models are highly optimized. This systems bottleneck is agnostic to whether the user employs single-nucleotide,
+k
+-mer, or BPE tokenization at the algorithmic level.
+
+1.3
+Contributions
+
+This paper presents
+DNATok
+, a tokenization system engineered to eliminate string-processing overheads for DNA at scale while remaining compatible with the benchmarked tokenizers for Nucleotide Transformer (NTv2/NTv3), HyenaDNA, and Evo2.
+DNATok
+’s design is orthogonal to algorithmic tokenization choice; it accelerates whatever vocabulary the user selects and provides three complementary pathways:
+
+1.
+
+Tokenizer-agnostic systems layer.
+A drop-in framework that accelerates single-nucleotide, non-overlapping
+k
+-mer, or BPE tokenization by converting the process into memory movement and fixed-size gather operations, independent of the underlying vocabulary choice.
+
+2.
+
+Optimized encoding paths.
+We provide three complementary strategies: (a) an
+IDs path
+using vectorized CPU mapping and pinned staging; (b) a
+bytes path
+utilizing device-side 256-entry LUTs; and (c) a
+pipelined streaming path
+that hides H2D latency by overlapping transfers with embedding computation via CUDA streams.
+
+3.
+
+Rigorous empirical validation.
+We evaluate
+DNATok
+across 222 benchmark configurations, including synthetic microbenchmarks with variable batch sizes and sequence lengths, and real-world integration with NTv3, HyenaDNA, and Evo2 models. This validation confirms consistent speedups of
+20
+–
+112\times
+across diverse model architectures.
+
+2
+Design
+
+DNATok
+is a GPU-accelerated tokenization system that replaces string-based tokenization with lookup-table-based identifier streaming. The core insight is that genomic tokenization, whether single-nucleotide,
+k
+-mer, or BPE, reduces to mapping ASCII characters to integer identifiers, an operation well-suited to vectorization and GPU parallelism. Our design provides multiple encoding strategies optimized for different hardware bottlenecks, automatic discovery of tokenizer metadata, and seamless compatibility with existing genomic foundation models.
+
+Let
+B
+denote batch size,
+T
+sequence length, and
+D
+embedding dimension. Assume an embedder exposing
+
+\texttt{embed\_tokens}:\mathbb{Z}^{B\times T}\rightarrow\mathbb{R}^{B\times T\times D}.
+
+DNATok
+focuses on accelerating the conversion of raw DNA strings into the integer identifier space required by this function.
+
+2.1
+Discovery and validation
+
+DNATok
+probes the upstream tokenizer and embedding stack to retrieve: the padding identifier, valid DNA and ambiguity identifiers, the 256-entry ASCII
+\rightarrow
+identifier LUT, and any fixed token length requirement. A self-test on
+ACGTNacgtn
+verifies consistency between the upstream tokenizer (for example, Hugging Face tokenizers for NTv2/NTv3 or custom vocabularies for HyenaDNA and Evo2) and the discovered LUT. Failures trigger a fallback path that calls the upstream string tokenizer directly to preserve correctness.
+
+2.2
+Encoding paths
+
+DNATok
+provides three complementary encoding strategies that address different performance bottlenecks. Users select strategies via the high-level
+embed_from_strings()
+API, which automatically chooses optimal paths based on hardware capabilities or accepts manual overrides for specific optimization goals.
+
+IDs path (CPU staging).
+
+The IDs path performs vectorized ASCII
+\rightarrow
+identifier conversion on CPU using NumPy into persistent pinned host buffers, then launches non-blocking H2D copies as 32- or 64-bit integers.
+DNATok
+provides two implementations: a legacy
+encode_batch_to_ids()
+that allocates new tensors per call, and an optimized
+encode_batch_to_ids_staging()
+that reuses persistent pinned buffers across invocations. The staging variant supports both int32 and int64 output formats, reducing H2D traffic when smaller integer widths suffice. This path is the simplest drop-in acceleration for existing tokenizers, converting tokenization into memory movement plus a gather operation. On-device type promotion from int32 to int64 (when needed) is nearly free, making 32-bit staging preferable when PCIe bandwidth is the bottleneck.
+
+Bytes path (on-device LUT).
+
+The bytes path stages raw 8-bit ASCII in pinned memory, transfers to the device, then applies a device-resident 256-entry LUT to obtain identifiers. This reduces H2D traffic relative to 32- or 64-bit identifiers, which is particularly beneficial when the interconnect is the dominant bottleneck. The fixed-size LUT fits easily in L1 cache or shared memory. Unlike the IDs path, the bytes path performs a single H2D transfer followed by entirely on-device processing (LUT application, optional left-padding, micro-batching), eliminating the need for ping-pong buffers or stream coordination.
+
+Algorithm 1
+
+DiscoverIDsPath
+— enable IDs path and build ASCII
+\to
+ID LUT
+
+1:
+
+Embedder
+E
+with method
+\texttt{embed\_tokens}(\cdot)
+
+and optional tokenizer
+
+2:
+
+Flag
+use_ids_path
+,
+lookup table
+ascii_lut[0..255]
+,
+IDs
+id_pad
+,
+id_N
+,
+optional fixed length
+token_len
+
+3:
+
+4:
+
+Let
+f\leftarrow E.\texttt{embed\_tokens}
+
+5:
+
+if
+
+f
+is not callable
+then
+
+6:
+
+use_ids_path
+
+\leftarrow
+
+False
+
+7:
+
+return
+
+8:
+
+end
+
+if
+
+9:
+
+pad\leftarrow
+padding ID discovered from
+E
+(pad token fields or pad token string; default
+0
+)
+
+10:
+
+tok\leftarrow
+tokenizer associated with
+E
+(underlying tokenizer if wrapped)
+
+11:
+
+if
+
+tok
+is
+None
+
+then
+
+\triangleright
+fixed DNA fallback
+
+12:
+
+Initialise
+ascii_lut
+of length
+256
+with value
+0
+
+13:
+
+Define
+
+\text{A/a}\mapsto 1,\;\text{C/c}\mapsto 2,\;\text{G/g}\mapsto 3,\;\text{T/t}\mapsto 4,\;\text{N/n}\mapsto 0
+
+14:
+
+for
+
+each
+DNA character
+c\in\{\text{A,C,G,T,N,a,c,g,t,n}\}
+
+do
+
+15:
+
+\texttt{ascii\_lut}[\mathrm{ord}(c)]\leftarrow\text{ID}(c)
+
+16:
+
+end
+
+for
+
+17:
+
+\texttt{id\_pad}\leftarrow pad,\quad\texttt{id\_N}\leftarrow 0
+
+18:
+
+use_ids_path
+
+\leftarrow
+
+True
+
+19:
+
+return
+
+20:
+
+end
+
+if
+
+21:
+
+22:
+
+Try detect K-mer structure (length
+k
+, stride
+k
+)
+
+23:
+
+if
+K-mer structure detected
+then
+
+24:
+
+Build
+\texttt{kmer\_lut}[0..5^{k}-1]
+and
+\texttt{base5\_lut}[0..255]
+
+25:
+
+use_ids_path
+
+\leftarrow
+
+True
+
+26:
+
+return
+
+27:
+
+end
+
+if
+\triangleright
+Standard tokenizer-based path (Char/BPE)
+
+28:
+
+For each
+c\in\{\text{A,C,G,T,N,a,c,g,t,n}\}
+, let
+dna\_ids[c]
+be
+the token ID discovered for
+c
+(using tokenizer APIs), if any
+
+29:
+
+Make
+dna\_ids
+case-insensitive for A,C,G,T and ensure
+
+dna\_ids[\text{``N''}]
+and
+dna\_ids[\text{``n''}]
+exist;
+if no ID for “N”/“n” is found, set both to
+pad
+
+30:
+
+n\_id\leftarrow dna\_ids[\text{``N''}]
+
+31:
+
+Initialise
+ascii_lut
+of length
+256
+with value
+n\_id
+
+32:
+
+for
+
+b=0,\dots,255
+
+do
+
+33:
+
+Try to obtain a token ID representing byte
+b
+from
+tok
+
+(via a byte-level token or a single-character token)
+
+34:
+
+if
+such an ID exists
+then
+
+35:
+
+\texttt{ascii\_lut}[b]\leftarrow\text{that ID}
+
+36:
+
+end
+
+if
+
+37:
+
+end
+
+for
+
+38:
+
+for
+
+each
+
+(c,id)
+in
+dna\_ids
+
+do
+
+39:
+
+\texttt{ascii\_lut}[\mathrm{ord}(c)]\leftarrow id
+
+40:
+
+end
+
+for
+
+41:
+
+\texttt{id\_pad}\leftarrow pad,\quad\texttt{id\_N}\leftarrow n\_id
+
+42:
+
+\texttt{token\_len}\leftarrow
+first positive value among
+known maximum sequence length fields of
+E
+(if any)
+
+43:
+
+use_ids_path
+
+\leftarrow
+
+True
+
+Algorithm 2
+
+EmbedFromStrings
+— streaming DNA embeddings via IDs path
+
+1:
+
+Equal-length strings
+S=\{s_{i}\}_{i=1}^{B}
+, each of length
+T
+,
+embedding batch cap
+B_{\mathrm{emb}}
+,
+target device
+acc
+,
+path
+\in\{\texttt{"ids"},\texttt{"bytes"},\texttt{"auto"}\}
+
+2:
+
+IDs path already discovered:
+
+use_ids_path
+=
+True
+,
+
+ascii_lut
+,
+id_pad
+,
+optional
+token_len
+,
+tokens-per-call budget
+M
+
+3:
+
+Streamed embeddings on
+acc
+
+4:
+
+5:
+
+if
+
+path=\texttt{"auto"}
+
+then
+
+6:
+
+path\leftarrow\texttt{"bytes"}
+if
+acc
+is a CUDA device
+with GPU available, else
+"ids"
+
+7:
+
+end
+
+if
+
+8:
+
+9:
+
+if
+
+path=\texttt{"bytes"}
+
+then
+
+\triangleright
+device-side ASCII
+\to
+ID mapping
+
+10:
+
+Pack
+S
+into a byte matrix
+\mathrm{Bytes}[B\times T]
+
+11:
+
+Transfer
+\mathrm{Bytes}
+to
+acc
+as
+\mathrm{Bytes}_{\texttt{acc}}
+
+12:
+
+if
+
+k
+-mer mode enabled
+then
+
+13:
+
+\mathrm{IDs}_{\texttt{acc}}\leftarrow\texttt{MapKmer}(\mathrm{Bytes}_{\texttt{acc}},\texttt{kmer\_lut})
+
+14:
+
+else
+
+15:
+
+\mathrm{IDs}_{\texttt{acc}}\leftarrow\texttt{ascii\_lut}[\mathrm{Bytes}_{\texttt{acc}}]
+
+16:
+
+end
+
+if
+
+17:
+
+if
+
+token_len
+is defined and
+\texttt{token\_len}>T
+
+then
+
+18:
+
+Left-pad each row of
+\mathrm{IDs}_{\texttt{acc}}
+with
+id_pad
+,
+right-aligning the original
+T
+positions
+
+19:
+
+T^{\prime}\leftarrow\texttt{token\_len}
+
+20:
+
+else
+
+21:
+
+T^{\prime}\leftarrow T
+
+22:
+
+end
+
+if
+
+23:
+
+b\leftarrow\min\!\bigl(B_{\mathrm{emb}},\;\max(1,\lfloor M/T^{\prime}\rfloor)\bigr)
+
+\triangleright
+micro-batch size
+
+24:
+
+for
+
+lo\leftarrow 0
+
+to
+
+B-1
+
+step
+
+b
+
+do
+
+25:
+
+hi\leftarrow\min(B,\,lo+b)
+
+26:
+
+Call
+\texttt{embed\_tokens}(\mathrm{IDs}_{\texttt{acc}}[lo:hi])
+
+on
+acc
+and emit the resulting activations
+
+27:
+
+end
+
+for
+
+28:
+
+return
+
+29:
+
+end
+
+if
+
+30:
+
+\triangleright
+Host-side IDs path
+
+31:
+
+Map
+S
+to IDs on the host using
+ascii_lut
+,
+obtaining
+\mathrm{IDs}_{\mathrm{host}}[B\times T]
+
+32:
+
+if
+
+token_len
+is defined and
+\texttt{token\_len}>T
+
+then
+
+33:
+
+Left-pad each row of
+\mathrm{IDs}_{\mathrm{host}}
+with
+id_pad
+,
+right-aligning the original
+T
+positions; set
+T^{\prime}\leftarrow\texttt{token\_len}
+
+34:
+
+else
+
+35:
+
+T^{\prime}\leftarrow T
+
+36:
+
+end
+
+if
+
+37:
+
+b\leftarrow\min\!\bigl(B_{\mathrm{emb}},\;\max(1,\lfloor M/T^{\prime}\rfloor)\bigr)
+
+38:
+
+for
+
+lo\leftarrow 0
+
+to
+
+B-1
+
+step
+
+b
+
+do
+
+39:
+
+hi\leftarrow\min(B,\,lo+b)
+
+40:
+
+Transfer
+\mathrm{IDs}_{\mathrm{host}}[lo:hi]
+to
+acc
+
+41:
+
+Call
+embed_tokens
+on this slice and emit activations
+
+42:
+
+end
+
+for
+
+Pipelined streaming.
+
+Pipelined streaming applies exclusively to the IDs path, overlapping H2D transfers with embedding compute using separate CUDA streams. The bytes path does not use pipelined streaming. The pipelined path pre-allocates device buffers. When using int32 staging, four buffers are allocated (two int32 for H2D staging, two int64 for embedder calls); when using int64 direct mode, two int64 buffers suffice. CUDA streams and events coordinate the overlap.
+13
+
+•
+
+Streaming baseline
+(
+DNATok
+) uses sequential H2D copy followed by embedding compute per micro-batch (no overlap).
+
+•
+
+Streaming pipelined
+(
+DNATok
+) uses dual streams and ping-pong device buffers so that H2D transfer for micro-batch
+n{+}1
+is overlapped with embedding compute for micro-batch
+n
+.
+
+Both variants keep tokenizer logic unchanged; the difference lies purely in how data movement is scheduled relative to compute. The impact of pipelining is workload-dependent and is quantified in the Results section.
+
+2.3
+Robustness and compatibility
+
+Memory management and automatic micro-batch sizing.
+
+DNATok
+automatically calculates micro-batch size as
+b=\min(B_{\mathrm{emb}},\max(1,\lfloor M/T\rfloor))
+where
+M
+is the token budget (default 1,048,576 tokens per call). This prevents 32-bit index overflow in embedding operations. To handle out-of-memory or overflow despite this sizing, we detect failures (
+"canuse32bitindexmath"
+,
+"out of memory"
+,
+"conv1d index"
+), halve micro-batch size, and retry. Persistent buffers (
+_staging_ids_cpu
+,
+_staging_bytes_cpu
+, device ping-pong buffers) are reused across calls to avoid repeated allocations.
+
+Cascading fallback hierarchy.
+
+Three levels of graceful degradation ensure correctness: (1) pipelined streaming falls back to baseline streaming on mid-pipeline errors without duplicating outputs, (2) baseline streaming retries with halved batch sizes on OOM/overflow, (3) discovery failure triggers fallback to the upstream string tokenizer. Errors in byte parsing or LUT application trigger safe fallback to the IDs path or upstream tokenizer.
+
+Compatibility validation.
+
+DNATok
+integrates with the Hugging Face-style tokenizers used by NTv2/NTv3, HyenaDNA, and Evo2. Optional self-tests compare token IDs on random genomic subsequences (with special-token handling where applicable) to confirm tokenization equivalence during setup.
+
+2.4
+User interface
+
+Users interact with
+DNATok
+primarily through the
+embed_from_strings
+API call, which handles the complete pipeline from strings to embeddings. The
+path
+parameter controls strategy selection:
+
+"auto"
+(default):
+
+Selects
+"bytes"
+on CUDA devices,
+"ids"
+otherwise
+
+"ids"
+:
+
+Forces IDs path with optional pipelined streaming (controlled by
+overlap_h2d_compute
+initialization flag)
+
+"bytes"
+:
+
+Forces bytes path with on-device LUT application
+
+This abstraction allows optimization for different hardware configurations (PCIe vs. NVLink, bandwidth-limited vs. compute-limited) without modifying application code.
+
+3
+Results
+
+3.1
+Experimental Setup
+
+Hardware/Software.
+See Table
+.
+Workloads.
+Standard, large-batch, and long-sequence configurations follow the settings reported in Table
+.
+Baselines.
+Hugging Face tokenizer (batched interface).
+16
+
+DNATok
+variants.
+IDs path (64-bit), IDs path (32-bit + on-device cast), streaming baseline, streaming pipelined.
+
+We evaluate
+DNATok
+against Hugging Face’s standard tokenizer implementation across three key dimensions: raw encoding throughput, host-to-device transfer efficiency, and end-to-end streaming performance. All experiments use a fixed nucleotide vocabulary, and the standard configuration aligns with the benchmark table unless otherwise noted.
+
+3.2
+Encoding Throughput
+
+DNATok
+’s GPU-native encoding eliminates the CPU bottleneck, delivering
+84
+–
+95\times
+speedups over the optimized Hugging Face baseline in microbenchmarks (Figure
+; Table
+). In the standard configuration, 64-bit encoding (both staging and direct) saturates the device’s integer throughput, significantly outperforming the 32-bit path which incurs casting overhead. This ordering persists across large-batch and long-sequence regimes, confirming that minimizing host-side ops is the dominant factor.
+
+Performance scaling across batch sizes reveals the expected saturation regimes (Figure
+), while sequence-length sweeps show similar trends (Figure
+). Trial-to-trial variability remains moderate (Figure
+), supporting reproducibility across runs.
+
+3.3
+Host-to-Device Transfer Efficiency
+
+Host-to-device (H2D) transfer efficiency is maximized by minimizing data volume. The int32 staging path achieves the highest H2D throughput (
+1.3
+–
+1.9\times
+baseline) by halving the transfer payload compared to 64-bit paths (Figure
+). This optimization is impactful because the baseline Hugging Face implementation is bottlenecked by serialized CPU-side memory copies rather than PCIe bandwidth. The 32-bit path effectively doubles the available transfer budget, a critical optimization for PCIe-constrained systems.
+
+3.4
+End-to-End Streaming Performance
+
+Overlapping compute and transfer via pipelined streaming yields workload-dependent outcomes (Figure
+). In the standard configuration, pipelining slightly underperforms baseline streaming, while it improves throughput in the large-batch and long-sequence configurations (Table
+).
+
+The magnitude and direction of pipelining gains depends on the compute-to-transfer ratio (Figures
+,
+). Batch sweeps show mixed behavior with a mid-range crossover: pipelining underperforms at small batches, exceeds baseline for some mid-to-large batches, and converges at the largest batches. Length sweeps show pipelining lagging at very short lengths, improving at longer lengths, and fluctuating around parity depending on sequence length.
+
+3.5
+Ablation Study
+
+To isolate optimization contributions, we compare four configurations (Table
+; Figure
+). In the standard regime (
+B=4096,T=512
+), simply enabling overlap or int32 transfers yields negligible gains (
+<1.05\times
+) or slight regressions because the compute kernel is too fast to hide transfer latency. This negative result clarifies that
+DNATok
+’s primary speedup comes from the vectorised CPU map and pinned memory staging (the "IDs path"), rather than CUDA stream overlap, which only becomes beneficial when the compute-to-transfer ratio increases (e.g., larger batches).
+
+3.6
+Real-Model Benchmarks
+
+This study benchmarks end-to-end tokenization and embedding throughput for NTv2 (NTv2_500M), NTv3 variants (8M/100M/650M), HyenaDNA (tiny_1k/small_32k/medium_160k), and Evo2-1B under short-sequence, latency-focused, throughput-focused, long-sequence, and ultra-long scenarios (
+,
+,
+and
+). The grouped results show short-sequence gains of
+3.88
+–
+6.98\times
+, latency gains of
+1.34
+–
+3.30\times
+, throughput gains of
+19.96
+–
+25.13\times
+, long-sequence gains of
+18.37
+–
+40.04\times
+, and ultra-long gains of
+11.09
+–
+37.81\times
+; the per-model breakdown is provided in
+results/benchmarks/real_model_benchmark.csv
+.
+
+3.7
+Summary of Performance Gains
+
+Across all metrics,
+DNATok
+demonstrates:
+
+•
+
+Encoding
+:
+84
+–
+95\times
+speedups over HF native baselines in the microbench configurations (Table
+)
+
+•
+
+H2D transfer
+: int32 staging improves effective bandwidth up to
+1.9\times
+, while 64-bit paths remain near baseline (Figure
+)
+
+•
+
+E2E streaming
+: pipelined streaming trails baseline in the standard configuration but improves throughput in the large-batch and long-sequence configurations (Figures
+,
+,
+)
+
+•
+
+Reproducibility
+: stable medians across trials with moderate variance (Figure
+)
+
+•
+
+Scalability
+: clear saturation regimes across batch and length sweeps (Figures
+,
+)
+
+These improvements reduce tokenization time in the benchmarked workloads, shifting more of the end-to-end budget to downstream preprocessing and model execution for the tested configurations.
+
+4
+Discussion
+
+4.1
+Systems Optimization Orthogonal to Algorithmic Choices
+
+DNATok
+does not change the underlying tokenization scheme—it is agnostic to whether users employ single-nucleotide, non-overlapping
+k
+-mer, or BPE tokenization. Those algorithmic decisions remain driven by downstream task requirements, model architecture, and masked language modeling (MLM) leakage considerations as established in the literature.
+7
+,
+9
+Instead,
+DNATok
+targets the systems bottleneck common to all tokenization schemes by replacing general-purpose string processing with lookup-table-based identifier streaming and overlapping host-to-device transfers with embedding compute.
+
+This orthogonality is critical for adoption: algorithmic debates about optimal tokenization strategies for genomic foundation models continue,
+9
+and different models make different choices based on their architectural constraints and target tasks. By operating purely at the systems layer,
+DNATok
+allows researchers to explore tokenization algorithms without being constrained by implementation performance. A vocabulary change requires only rebuilding the lookup table; the GPU kernels, memory management, and streaming infrastructure remain unchanged.
+
+Measured speedups for encoding and H2D transfers cover character-level tokenization (HyenaDNA, Evo2) and non-overlapping
+k
+-mer tokenization (Nucleotide Transformer) in our benchmarks; we do not report BPE benchmarks here. The only requirement is that the vocabulary fits in GPU memory for the lookup table—a constraint satisfied by the genomic tokenizers used in Nucleotide Transformer (NTv2/NTv3), HyenaDNA, and Evo2.
+1
+,
+2
+,
+3
+
+4.2
+Performance Characteristics and Scaling Behavior
+
+4.2.1
+Throughput Saturation and Memory Bandwidth Limits
+
+Our batch and sequence length sweeps reveal clear saturation regimes that inform deployment decisions. Encoding throughput rises with batch size and shorter sequences until GPU occupancy maximizes, after which increasing batch size yields diminishing returns due to memory pressure and reduced parallelism. Similar trends appear in sequence-length sweeps as memory access patterns become less cache-friendly; see Figures
+and
+.
+
+These saturation points indicate that
+DNATok
+is memory bandwidth-limited rather than compute-limited at production scales—consistent with the simple arithmetic nature of table lookups. The H2D transfer results reinforce this interpretation: effective bandwidth remains well below theoretical interconnect peaks,
+17
+suggesting that Python-to-CUDA handoff overhead and non-contiguous memory layouts consume a large fraction of available bandwidth. The int32 staging path partially addresses this by halving data volume, while pipelining overlaps transfers with GPU-side compute.
+
+4.2.2
+Pipelining Overhead and Crossover Behavior
+
+A critical finding is that pipelined streaming introduces non-trivial coordination overhead that produces workload-dependent crossovers. In the batch sweep, baseline streaming wins at small batches, pipelining improves throughput at several mid-to-large batches, and the two modes converge at the largest batches. Across sequence lengths, pipelining lags at very short lengths and improves at longer lengths, with some fluctuation around parity.
+
+This behavior has practical implications: for exploratory work with small datasets or debugging runs using short sequences, the simpler baseline streaming approach is often faster and easier to reason about. For larger production workloads, pipelining can help once overlap outweighs coordination, but the crossover should be measured on the target system.
+
+4.2.3
+Reproducibility and Production Readiness
+
+Trial-to-trial variance is modest for encode paths in the standard configuration and higher for streaming baselines (Figure
+). These results provide stable medians for comparing tokenization throughput across configurations.
+
+4.2.4
+Real-Model Divergence and Architecture Sensitivity
+
+Observed speedups diverge by architecture: Evo2 and NTv3 achieve
+25
+–
+40\times
+gains, while HyenaDNA shows more moderate
+11
+–
+20\times
+improvements (Table
+). This variance is explained by the baseline’s cost: HyenaDNA uses simple character splitting which is computationally cheap on CPU, establishing a higher baseline performance (
+{\sim}10^{7}
+tok/s) compared to the expensive BPE merges required for NTv3 (
+{\sim}10^{6}
+tok/s). Consequently,
+DNATok
+provides the largest relative acceleration for models with complex tokenization logic (NTv3) or those processing massive contexts where memory copy overhead dominates (Evo2).
+
+4.2.5
+Ablation Nuances: Why overlap isn’t a silver bullet
+
+Our ablation study (Figure
+) reveals that simply enabling H2D/compute overlap does not guarantee performance gains. In the standard configuration (
+B=4096,T=512
+), the compute intensity of the embedding lookup is relatively low compared to the transfer cost, and the overhead of managing CUDA streams and events for overlap can outweigh the benefits. Overlap becomes advantageous only when the compute workload is sufficient to hide the transfer latency—typically at larger batch sizes or longer sequence lengths, as confirmed by our sweep results (Figures
+and
+). This finding emphasizes the importance of adaptive strategy selection, which
+DNATok
+supports via its configuration API.
+
+4.3
+When Does
+DNATok
+Matter?
+
+4.3.1
+High-Impact Scenarios
+
+DNATok
+’s speedups are most consequential when tokenization is or would become a bottleneck:
+
+Large-scale pretraining:
+
+Foundation model pretraining on trillion-token genomic datasets requires processing hundreds of billions of tokens during data loading. Even a small fraction of pipeline time spent on tokenization can translate to substantial compute savings at scale.
+
+Interactive genomic search and retrieval:
+
+Systems that tokenize queries or database sequences on-the-fly for embedding-based similarity search benefit from low-latency tokenization. GPU-native tokenization enables real-time handling of long sequences.
+
+Online serving and inference:
+
+Genomic language models deployed for variant effect prediction or regulatory element annotation must tokenize input sequences before model forward passes. GPU-native tokenization eliminates a CPU preprocessing step, simplifying deployment and reducing inference latency.
+
+Multi-species and meta-genomic analysis:
+
+Processing sequences from hundreds or thousands of species simultaneously benefits from GPU parallelism. Our batch-level speedups enable high-throughput comparative genomics workflows.
+
+4.3.2
+Low-Impact Scenarios
+
+Conversely,
+DNATok
+provides minimal benefit when tokenization is not a bottleneck:
+
+Small-scale fine-tuning:
+
+Adapting a pretrained model to a task-specific dataset of
+10^{6}
+–
+10^{7}
+tokens involves tokenization once during preprocessing, often offline. The one-time cost of CPU tokenization (seconds to minutes) is negligible compared to multi-hour training.
+
+Static datasets with cached tokens:
+
+Datasets tokenized once and stored to disk bypass tokenization during training. While
+DNATok
+can accelerate initial preprocessing, subsequent epochs see no benefit.
+
+CPU-bound inference:
+
+Deploying models on edge devices or CPU-only infrastructure cannot leverage GPU tokenization. However, the simpler algorithmic approaches (character-level or fixed
+k
+-mer) remain fast enough on CPUs for most inference workloads.
+
+The key determinant is the ratio of tokenization time to total pipeline time. When tokenization consumes only a small fraction of preprocessing, even large speedups provide limited end-to-end improvement. When tokenization represents a larger share of the pipeline,
+DNATok
+delivers meaningful gains.
+
+4.4
+Accuracy, Information Leakage, and Algorithmic Neutrality
+
+Overlapping
+k
+-mers leak information under masked pretraining, harming sample efficiency and sometimes accuracy; this is why current recommendations discourage overlapping tokenization for MLM and favor subword approaches such as BPE.
+7
+Character tokens avoid leakage and perform well on base-resolution tasks, whereas BPE or blocked
+k
+-mers provide meaningful compression for attention models when per-base fidelity is less critical.
+9
+
+DNATok
+preserves these properties by accelerating the systems layer without altering token semantics: a BPE vocabulary remains BPE with identical token IDs and segmentation behavior, a character vocabulary remains character-level, and overlapping
+k
+-mers retain their leakage characteristics. The implementation includes optional equivalence checks to validate token ID parity against reference tokenizers during setup.
+
+This neutrality extends to downstream model behavior: because token IDs and orderings are unchanged, pretrained model weights, position embeddings, and learned token representations remain valid. Users can swap CPU tokenizers for
+DNATok
+mid-training without invalidating checkpoints or disrupting convergence, enabling seamless integration into existing workflows.
+
+4.5
+Limitations and Future Work
+
+4.5.1
+Vocabulary Size Constraints
+
+DNATok
+’s lookup-table approach requires
+|\mathcal{V}|\times d_{\text{emb}}
+bytes of GPU memory for the embedding matrix. For typical genomic vocabularies and embedding dimensions, this footprint is small relative to modern GPU memory. Extremely large vocabularies could still exhaust memory on smaller devices. In such cases, embedding matrices could be sharded across multiple devices or retrieved from CPU memory with optimized batched lookups, though we have not yet implemented these strategies.
+
+4.5.2
+Decode Operations
+
+The current implementation focuses on encoding (sequence
+\to
+token IDs) and optionally embedding lookup, which constitutes the critical path for training and inference. Decoding (token IDs
+\to
+sequence) is necessary for generative tasks but is typically orders of magnitude less frequent—model generation produces tokens one-at-a-time or in small batches, whereas encoding processes entire datasets. We have not yet implemented GPU-accelerated decoding, though the same LUT principles apply: an inverse vocabulary table could map token IDs back to character spans with similar throughput characteristics.
+
+4.5.3
+Dynamic Vocabularies and Online BPE
+
+DNATok
+assumes a fixed vocabulary built offline and copied to GPU memory at initialization. This is appropriate for inference and training with pretrained tokenizers, but does not support online vocabulary construction (e.g., learning BPE merges during training). For such scenarios, vocabulary tables would need to be rebuilt and re-uploaded to the GPU after each merge step, potentially negating throughput gains. However, current genomic foundation models use static vocabularies throughout training, making this a non-issue for existing workflows.
+7
+,
+1
+,
+2
+,
+3
+
+4.5.4
+Integration with Data Augmentation
+
+Genomic data augmentation—including reverse complementation, random cropping, and noise injection—often occurs before tokenization.
+DNATok
+currently operates on raw text sequences, leaving augmentation to upstream CPU processing. Future work could implement common genomic augmentations directly in CUDA kernels, enabling fully GPU-resident preprocessing pipelines that eliminate CPU
+\leftrightarrow
+GPU round-trips entirely. Reverse complementation is particularly amenable to GPU acceleration given its deterministic character-level mapping.
+
+4.6
+Deployment Guidance
+
+Combining the literature review with our measurements suggests the following best practices:
+
+Algorithmic layer:
+
+Select tokenization based on task and model architecture:
+
+•
+
+Use single-nucleotide tokenization for variant-sensitive tasks requiring base-resolution fidelity, or for long-context state-space models (HyenaDNA, Evo2) that can process raw character sequences efficiently.
+2
+,
+3
+
+•
+
+Use BPE or blocked (non-overlapping)
+k
+-mers for context expansion in transformer-style models (e.g., Nucleotide Transformer) where sequence length reduction improves attention efficiency.
+8
+,
+7
+,
+1
+
+•
+
+Avoid overlapping
+k
+-mers for masked language model pretraining due to information leakage, unless using specialized denoising objectives designed to account for overlap.
+7
+
+Systems layer:
+
+Deploy
+DNATok
+’s optimizations regardless of algorithmic choice:
+
+•
+
+Use pinned memory buffers and asynchronous H2D copies for all GPU-accelerated training.
+13
+,
+14
+
+•
+
+Select streaming mode empirically; in our benchmarks, baseline streaming is best in the standard configuration, while pipelining improves throughput in large-batch and long-sequence runs.
+
+•
+
+Use int32 staging when PCIe bandwidth is constrained (PCIe 3.0 systems, multi-GPU setups with limited NVLink connectivity); otherwise default to int64 direct encoding.
+
+•
+
+Tune batch size and sequence length to balance memory constraints and throughput, adjusting based on GPU capacity and model requirements.
+
+Compatibility and integration:
+
+•
+
+DNATok
+integrates with the Hugging Face-style tokenizers used by NTv2/NTv3, HyenaDNA, and Evo2; optional equivalence checks validate token ID parity.
+
+•
+
+Benchmarks in this paper cover NTv2/NTv3, HyenaDNA, and Evo2; additional models should be validated with the same equivalence checks before adoption.
+
+•
+
+Token IDs are preserved by construction, so swapping tokenization backends does not alter model inputs when equivalence checks pass.
+
+When to deploy:
+
+•
+
+High priority for large-scale pretraining, online serving, interactive genomic search, and multi-species analysis.
+
+•
+
+Lower priority for small-scale fine-tuning, static datasets with cached tokens, or CPU-only inference.
+
+•
+
+Consider deployment when tokenization represents a significant fraction of total preprocessing time; profile existing pipelines to quantify potential gains.
+
+4.7
+Broader Implications for Genomic Deep Learning
+
+The performance gap between CPU and GPU tokenization reflects a broader pattern in genomic deep learning: many "solved" preprocessing steps were optimized for CPU execution in an era when GPUs were specialized compute devices, not general-purpose accelerators with high-bandwidth memory and mature ecosystems. As GPUs have evolved into the primary compute substrate for deep learning, revisiting these assumptions can unlock substantial performance improvements.
+
+Similar opportunities likely exist in genomic data preprocessing beyond tokenization: FASTA/FASTQ parsing, quality score filtering, k-mer counting, and sequence alignment could all benefit from GPU acceleration using principles analogous to
+DNATok
+(lookup tables, batched operations, overlapped compute and transfer). The key is identifying steps that are currently CPU-bound, frequently executed, and amenable to parallel execution—precisely the characteristics that make tokenization a good candidate.
+
+More broadly,
+DNATok
+demonstrates that systems optimization for domain-specific deep learning requires co-designing algorithms, data structures, and hardware utilization rather than treating each layer independently. The algorithmic choice of tokenization scheme, the data structure of lookup tables, and the hardware exploitation of GPU parallelism and memory bandwidth form a coherent optimization strategy. As genomic foundation models scale to trillion-parameter regimes and trillion-token datasets, such systems-level co-design will become increasingly critical for feasible training.
+
+5
+Reproducibility and Availability
+
+Code Availability.
+The
+DNATok
+implementation and supporting scripts are available at
+https://github.com/eniktab/DNAtok
+.
+
+Benchmark Reproduction
+
+To reproduce the experimental results, we provide a unified entry point script.
+
+Full suite:
+
+python run_all_audit_and_bench.py
+
+(Optional arguments:
+--device cuda
+,
+--embedder-mode real
+,
+--allow-downloads
+,
+--cache-root <path>
+)
+
+Smoke test:
+
+python run_all_audit_and_bench.py --smoke
+
+Manual execution
+
+Individual components can lead to more granular results if needed:
+
+•
+
+Correctness Audit:
+
+python benchmarks/run_correctness_audit.py ...
+
+•
+
+Benchmark Suite:
+
+python benchmarks/run_benchmark_suite.py --suite full ...
+
+•
+
+Aggregation:
+
+python benchmarks/aggregate_results.py ...
+
+•
+
+Plotting:
+
+python benchmarks/plot_results.py
+
+Data Artifacts
+
+Benchmark outputs are generated in
+results/benchmarks
+(JSON/CSV) and
+results/figures
+(PDF/TeX). Metrics are defined as follows: detailed wall-clock latencies for each phase (preparation, tokenization, transfer) and throughput (tokens/sec). Hardware/software specifications (Table
+) and random seeds are fixed to ensure reproducibility.
+
+6
+Conclusion
+
+Tokenization represents both an algorithmic design choice and a systems bottleneck for genomic foundation models. The genomics literature has established clear guidelines on tokenization algorithms—avoiding overlapping
+k
+-mers due to MLM leakage, using BPE or blocked
+k
+-mers for compression in transformers, and using single-nucleotide tokens for base-resolution tasks—but has left the systems-level throughput problem largely unaddressed.
+7
+,
+9
+,
+1
+,
+2
+,
+3
+
+DNATok
+fills this gap by converting DNA tokenization into LUT-based identifier streaming and overlapping H2D transfers with embedding compute, delivering
+84
+–
+95\times
+encode speedups and up to
+1.9\times
+H2D throughput in the microbench configurations, with pipelined streaming improving throughput in large-batch and long-sequence runs (Table
+). The methods are simple, reproducible, vocabulary-agnostic, and compatible with Nucleotide Transformer (NTv2/NTv3), HyenaDNA, and Evo2, providing an engineering-grade systems layer that complements existing algorithmic work on genomic tokenization.
+
+7
+Supplementary methods and information
+

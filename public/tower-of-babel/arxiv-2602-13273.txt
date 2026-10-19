@@ -1,0 +1,2688 @@
+MergePipe: A Budget-Aware Parameter Management System for Scalable LLM Merging
+Yuanyi Wang, Yanggan Gu, Zihao Wang, Kunxi Li, Yifan Yang, Zhaoyi Yan, Congkai Xie, Jianmin Wu, Hongxia Yang
+
+Abstract
+. Large language model (LLM) merging has become a key technique in modern LLM development pipelines, enabling the integration of multiple task- or domain-specific expert models without retraining. However, as the number of experts grows, existing merging implementations treat model parameters as unstructured files and execute merges in a stateless, one-shot manner, leading to excessive disk I/O, redundant parameter scans, and poor scalability. In this paper, we present MergePipe , a parameter management system for scalable LLM merging. MergePipe is the first system that treats LLM merging as a data management and execution problem, and introduces a catalog-driven abstraction over model parameters, merge plans, and execution lineage. At its core, MergePipe employs a cost-aware planner that explicitly models expert parameter I/O and enforces user-specified I/O budgets, followed by a streaming execution engine that materializes merged models under transactional guarantees. Our key insight is that while base model reads and output writes are unavoidable, expert parameter reads dominate merge cost and constitute the primary optimization target. By making expert access budget-aware throughout planning and execution, MergePipe mitigates the O ⁡ ( K ) O(K) I/O growth of naive pipelines and achieves predictable scaling behavior. Experiments show that MergePipe reduces total I/O by up to an order of magnitude and delivers up to 11 × 11\times end-to-end speedups (up to 90% wall-time reduction) over state-of-the-art LLM merging pipelines.
+
+
+
+1.
+Introduction
+
+Large language model (LLM) development has increasingly shifted from training a single monolithic, dense model to composing models from multiple expert checkpoints or branches
+(
+22
+)
+.
+Existing LLMs are often maintained as families of checkpoints, consisting of a general-purpose base model and numerous domain-specialized experts (e.g., for mathematics
+(
+25
+;
+38
+)
+, code
+(
+14
+;
+11
+)
+, law
+(
+41
+;
+7
+)
+, or biomedicine
+(
+35
+)
+), trained at the scale of billions to trillions of tokens
+(
+37
+;
+1
+)
+.
+Rather than restarting training from scratch, contemporary development pipelines increasingly rely on
+model merging
+to combine such expert checkpoints, enabling multi-skill integration, domain adaptation
+(
+31
+;
+27
+)
+, and rapid iteration with modest additional compute
+(
+3
+;
+21
+)
+.
+Unlike ensembling, which retains multiple models and aggregates predictions online at the cost of increased latency and memory
+(
+13
+)
+, model merging operates directly on parameters to produce a single deployable model.
+As a result, LLM merging has been widely adopted in recent large-scale models, including DeepSeek-V3
+(
+16
+)
+and Qwen3
+(
+37
+)
+, where merging is used to extend training, integrate specialized capabilities, or consolidate intermediate models during development.
+
+Despite its growing importance, existing LLM merging pipelines are largely implemented in a system-agnostic manner.
+Most current implementations treat model parameters as unstructured flat files and execute merging as a stateless, one-shot process
+(
+39
+;
+20
+)
+.
+Each merge invocation independently loads expert parameters, applies the merging logic, and materializes the output, without reuse across merges, explicit lineage tracking, or any notion of cost-aware planning.
+As a result, expert parameters are repeatedly scanned in full, even when merging the same base model with an increasing set of experts.
+In modern LLM pipelines, where checkpoints can span tens to hundreds of billions of parameters, this design causes merge I/O cost to scale linearly with the number of experts, quickly rendering large-scale merging expensive and impractical.
+Importantly, these inefficiencies stem not from the merging algorithms themselves, but from the absence of a system-level abstraction that treats parameters, merge plans, and execution state as first-class entities.
+Fig.
+1
+and Fig.
+2
+illustrate this contrast at the pipeline level, highlighting how naive merging repeatedly scans expert parameters across merge iterations.
+Specifically, this calls for database-style primitives over parameters: a persistent catalog over parameter blocks, declarative merge plans with explicit cost semantics, and transactional snapshotting with lineage for reproducibility.
+
+Figure 1
+.
+Naive LLM merging vs. MergePipe. Naive pipelines merge in a stateless, one-shot manner and repeatedly scans expert checkpoints (
+O(K)
+expert I/O), while MergePipe introduces planning, reuse, and budget-bounded expert reads.
+
+To understand why such execution models scale poorly, we examine the underlying cost structure of LLM merging.
+The end-to-end cost of a merge can be decomposed into three components: (i) reading the base model parameters, (ii) materializing the merged output checkpoint, and (iii) reading expert parameters.
+The first two components are intrinsic to the semantics of model merging, as any merge must access the base model and produce a new checkpoint.
+In contrast, expert parameter access exhibits fundamentally different behavior.
+Under naive execution, expert checkpoints are accessed independently for each merge invocation, causing expert I/O cost to grow linearly with the number of experts
+K
+.
+This
+O(K)
+scaling quickly dominates the overall merge cost and accounts for the majority of data movement in large-scale merging workloads.
+This decomposition exposes a crucial asymmetry for system design:
+base reads and output writes are semantic necessities, whereas the dominant expert-read cost is an execution artifact of stateless pipelines and can be controlled via planning and reuse.
+
+In other words, the cost of expert is the only term whose growth with
+K
+is not mandated by merge semantics, making it the primary optimization target.
+Consequently, controlling expert parameter access, rather than optimizing merge computation, becomes the primary strategy for scalable LLM merging.
+
+However, simply recognizing expert parameter access as the dominant cost is not sufficient to achieve scalable merging in practice.
+Expert access patterns vary substantially across merging algorithms and workloads.
+Some merging algorithms uniformly operate on all parameters, like model soup
+(
+34
+)
+and TA (Task Arithmetic)
+(
+15
+)
+, while others selectively access expert parameters based on conflict detection or similarity thresholds, like TIES
+(
+36
+)
+and DARE
+(
+40
+)
+.
+As a result, the potential benefit of reducing expert I/O differs widely across merging strategies, and cannot be captured by fixed heuristics or ad-hoc caching mechanisms.
+Therefore, effective optimization requires a principled way to model, predict, and reason about expert access cost under different merging plans.
+
+Moreover, introducing reuse, consistency, and lineage tracking into the merging process inevitably incurs system-level overheads.
+While such overheads may outweigh optimization benefits in small-scale merging scenarios, they become amortized as the number or size of expert checkpoints grows.
+This trade-off implies that no single execution strategy is optimal across all regimes.
+Instead, LLM merging calls for a system that can explicitly expose and control these trade-offs, allowing users to balance expert access and execution overheads according to workload characteristics.
+
+Figure 2
+.
+Naive merging scales poorly with experts.
+
+For 3B models, both TIES and DARE show near-linear growth in total I/O (bars) as
+K
+increases, and wall time rises accordingly.
+
+To address these challenges, we propose
+MergePipe
+, a parameter management system designed for scalable and reproducible LLM merging.
+Rather than introducing a new merging algorithm, MergePipe redefines model merging as a data management problem and provides a database-backed abstraction over model parameters, merge plans, and execution state.
+In MergePipe, merge plans are treated as
+first-class objects
+that explicitly capture which parameters are accessed, how they are combined, and under what resource constraints.
+This design decouples parameter storage, merge planning, and execution, enabling principled reuse across merges and explicit control over expert access.
+Specifically, MergePipe introduces a cost-aware planning framework that models expert parameter I/O as an explicit, budgeted resource.
+Given a user-specified I/O budget, the planner derives execution plans that selectively schedule expert access while preserving merge semantics.
+These plans are enforced by an execution engine that provides transactional writes and fine-grained lineage tracking, ensuring correctness, reproducibility, and incremental reuse across merge iterations.
+
+In summary, this work reveals three key insights:
+
+•
+
+I1: Expert reads dominate scalability rather than merge computation.
+
+Naive pipelines repeatedly scan expert checkpoints across invocations, causing expert I/O to grow nearly linearly with the number of experts
+K
+(Fig.
+1
+, Fig.
+2
+).
+
+•
+
+I2: Expert I/O is the primary controllable cost knob in LLM merging.
+
+Base model reads and output writes are intrinsic to merge pipelines, while scalable merging hinges on reducing expert reads via reuse and budget-aware access (Fig.
+4
+).
+
+•
+
+I3: Budget-aware planning enables predictable and operator-agnostic control.
+
+By modeling expert parameter access as an explicit resource, MergePipe enforces user-specified I/O budgets while generalizing across diverse merge operators (Table
+4
+).
+
+Our contributions are:
+(1) MergePipe, the first
+parameter management system
+for iterative LLM merging, which provides a catalog-driven data model over parameter blocks, merge plans, and execution lineage;
+(2) a budget-aware planning framework that binds the cost model to executable plans, enforcing an explicit expert-read budget to eliminate the
+O(K)
+expert-scan behavior of naive pipelines;
+(3) a execution engine with transactional snapshotting and fine-grained lineage, enabling reproducible and auditable materialization of merged checkpoints under the planned budget.
+
+Figure 3
+.
+MergePipe system overview.
+
+MergePipe decouples parameter storage, budget-aware planning, and streaming execution for scalable LLM merging.
+A persistent catalog supports block-level indexing/reuse; a cost- and conflict-aware planner selects expert blocks under an explicit I/O budget; and an execution engine enforces the plan via
+DeltaIterator
+with atomic publish and lineage/explainability records.
+
+2.
+System Overview
+
+To address the scalability and reproducibility challenges in large-scale LLM merging (Section
+1
+), we present
+MergePipe
+, a parameter management system that treats merging as a data management workload. Instead of optimizing specific merge algorithms, MergePipe targets the underlying execution model by decoupling parameter storage, merge planning, and execution.
+Figure
+3
+overviews the system: (i) a persistent catalog and storage I/O pipeline, (ii) a cost- and conflict-aware planner, (iii) a streaming execution engine, and (iv) transactional and explainability components for lineage. Together, they enable budgeted expert access, reuse across iterations, and auditable merges.
+
+2.1.
+Design Goals and Scope
+
+MergePipe targets
+iterative
+merging where a slowly evolving base model is repeatedly merged with a growing set of experts under constrained I/O. Guided by the cost structure in Section
+3
+, we adopt:
+
+G1: Bounded expert I/O.
+
+Expert reads dominate merge cost and grow as
+O(K)
+in naive pipelines; MergePipe
+treats expert access as a budgeted resource.
+
+G2: Explicit planning before execution.
+
+MergePipe separates planning from execution. Plans specify accessed parameters and resource constraints, enabling cost estimation, reuse, and budget-aware fallback.
+
+G3: Persistent execution.
+
+MergePipe persistently records decisions, access, and lineage to support auditability, reuse, and recomputation.
+
+Scope:
+
+MergePipe manages and executes merging without introducing new merge algorithms. It is operator-agnostic such as TIES, DARE and supports full weights, parameter deltas, and adapter-based experts. We focus on disk-dominated regimes where parameter I/O is the bottleneck, not training-time in-memory fusion.
+
+2.2.
+Data Model and Catalog
+
+MergePipe is built around a persistent catalog that manages model parameters and merge-related metadata as first-class data. The catalog provides (i) block-granular views for costing and reuse, and (ii) immutable snapshots with manifests for reproducible execution.
+
+Block:
+
+A model checkpoint
+M
+consists of named tensors. Each tensor
+T
+is partitioned
+by a deterministic function
+\textsc{Partition}(T;s)
+into fixed-size blocks
+
+\{b\}
+, where
+s
+is the block size. A
+block id
+is a stable identifier
+
+\langle\textit{model\_id},\textit{tensor\_id},\textit{block\_idx}\rangle
+that
+uniquely locates a physical block in storage.
+
+Snapshot and Manifest:
+
+A committed merge produces a
+snapshot
+identified by
+sid
+and a
+
+manifest
+
+\mathsf{man}(sid)
+.
+
+\mathsf{man}(sid)
+is an immutable mapping from each tensor-block key
+\langle\textit{tensor\_id},\textit{block\_idx}\rangle
+to a storage object reference (plus execution metadata such as inputs, operator, and plan digest). Snapshots are the unit of reuse, inspection, and incremental recomputation.
+
+Invariant (Immutability and Atomic Visibility).
+
+Committed snapshots are immutable: once
+\mathsf{man}(sid)
+is published, its
+block mapping and metadata never change. Each merge execution either atomically
+publishes a new snapshot
+sid^{\prime}
+with a complete manifest, or publishes nothing
+(i.e., no partial visibility).
+
+Core catalog records.
+
+To support block-level cost estimation, reuse detection, and auditable lineage,
+MergePipe stores a small set of structured records. Table
+1
+
+summarizes the core relations (logical schema; the physical backend can be a
+KV-store or embedded DB).
+
+Table 1.
+Core catalog records used by MergePipe for block-level planning, reuse,
+and reproducible snapshots.
+
+Record
+
+Key fields (PK underlined)
+
+BlockMeta
+
+model_id
+,
+tensor_id
+,
+block_idx
+;
+bytes, shape, dtype, hash, sketch, layout
+
+TouchMap
+
+sid
+,
+tensor_id
+; touched_blocks (bitmap / ranges)
+
+Coverage
+
+sid
+,
+tensor_id
+,
+block_idx
+;
+expert_set_digest (or list)
+
+Plan
+
+plan_id
+; base_id, expert_ids, op, budget_B,
+selected_blocks_digest,
+\widehat{C}_{\text{expert}}
+
+Manifest
+
+sid
+; plan_id, base_id, expert_ids, op, budget_B,
+(realized)
+C_{\text{expert}}
+, output_root, created_at
+
+How the catalog enables planning and reuse.
+
+BlockMeta
+provides the minimal statistics needed for block-level cost
+accounting and lightweight conflict signals.
+Plan
+records the
+selected expert blocks under a budget and can be reused across iterative merges.
+
+TouchMap
+and
+Coverage
+summarize what was actually materialized and which experts contributed, enabling explainability and incremental recomputation.
+Manifest
+binds a plan to an immutable snapshot boundary, making merges reproducible and auditable.
+
+2.3.
+Merge Planning and Execution Workflow
+
+MergePipe follows a staged workflow over
+immutable snapshots
+
+(Section
+2.2
+).
+ANALYZE
+and planning are metadata-only, while execution atomically publishes a new snapshot
+(Fig.
+3
+).
+
+Analysis.
+
+MergePipe checks the catalog for existing analysis results; on misses, it
+computes and persists block-level metadata like shapes, hashes, sketches, and
+coverage for reuse.
+
+Planning.
+
+Given a merge request and expert I/O budget, the planner estimates expert access costs from catalog metadata and produces a budget-feasible plan at block granularity when possible (with tensor-level fallback).
+
+Execution and commit.
+
+The engine enforces the plan by streaming blocks through
+DeltaIterator
+,
+incrementally applying merge operators and materializing only selected blocks.
+Writes are staged and atomically published via the transaction manager, while touch maps and coverage summaries are recorded for explainability and reuse.
+By separating analysis, planning, and execution, MergePipe achieves predictable resource usage, incremental reuse, and reproducible merging without constraining the merge operators.
+
+3.
+Cost Model for Model Merging
+
+This section introduces a cost model for large-scale LLM merging.
+The goal of the model is not to predict exact execution time, but to capture
+the dominant cost factors that determine scalability under constrained I/O
+resources.
+The model provides a principled abstraction that underlies MergePipe’s planner
+and execution design.
+
+3.1.
+Overview and Assumptions
+
+We consider the problem of merging a base model with a set of expert models.
+Let
+
+\mathcal{M}=\{M_{0},M_{1},\ldots,M_{K}\}
+
+denote the models involved in a merge, where
+M_{0}
+is the base model and
+
+M_{1},\ldots,M_{K}
+are expert models.
+Each model consists of a collection of tensors:
+
+M_{i}=\{T_{i,1},T_{i,2},\ldots,T_{i,n_{i}}\}.
+
+Each tensor is stored persistently on disk; we denote its physical size by
+
+\text{size}(T)
+.
+
+We focus on disk I/O cost as the dominant bottleneck in large-scale merging.
+This assumption is consistent with empirical observations that merging
+workloads involve reading and writing tens to hundreds of gigabytes of
+parameters, while computation remains comparatively lightweight.
+A key distinction in MergePipe is between costs that are intrinsic to the
+semantics of model merging and costs that can be controlled through planning
+decisions.
+Only the latter are subject to optimization.
+
+3.2.
+Cost Decomposition
+
+We decompose the total cost of a merge operation as:
+
+C_{\text{merge}}=C_{\text{base}}+C_{\text{expert}}+C_{\text{out}}+C_{\text{meta}}.
+
+The individual components are defined as follows.
+
+Base Model Read Cost.
+
+The base model must be fully read to construct the merged model:
+
+C_{\text{base}}=\sum_{T\in M_{0}}\text{size}(T).
+
+This cost is invariant across merge strategies and independent of the number
+of experts.
+
+Output Materialization Cost.
+
+The merged model must be fully materialized and written to storage:
+
+C_{\text{out}}=\sum_{T\in M_{\text{merged}}}\text{size}(T).
+
+The merged model preserves the tensor structure of the base model.
+
+Metadata Cost.
+
+Metadata operations include lineage recording, hashing, and transactional
+commit:
+
+C_{\text{meta}}=C_{\text{lineage}}+C_{\text{hash}}+C_{\text{commit}}.
+
+These are bounded and weakly dependent on the merge strategy.
+
+Expert Read Cost.
+
+The dominant and controllable component is the expert read cost:
+
+C_{\text{expert}}=\sum_{i=1}^{K}\sum_{T\in\mathcal{S}_{i}}\text{size}(T),
+
+where
+\mathcal{S}_{i}\subseteq M_{i}
+denotes the subset of tensors accessed from expert
+M_{i}
+.
+Under naive merging pipelines, all expert tensors are read:
+
+C_{\text{expert}}^{\text{naive}}=\sum_{i=1}^{K}\sum_{T\in M_{i}}\text{size}(T),
+
+which scales linearly with the number of experts
+K
+.
+In contrast, MergePipe aims to reduce
+C_{\text{expert}}
+by selectively accessing
+the expert paramaters.
+
+3.3.
+Block-Level Cost Estimation
+
+MergePipe refines expert cost estimation by operating at block granularity.
+Each tensor
+T
+is partitioned into a set of fixed-size blocks
+
+T=\{b_{1},\ldots,b_{m}\}
+.
+The expert read cost can be expressed as:
+
+C_{\text{expert}}=\sum_{i=1}^{K}\sum_{b\in\mathcal{B}_{i}}\text{size}(b),
+
+where
+\mathcal{B}_{i}
+denotes the selected blocks from expert
+M_{i}
+.
+
+Tensor-level estimation is a special case of this formulation in which all
+blocks of a tensor are selected.
+Block-level estimation enables finer-grained control over expert access and
+serves as the basis for MergePipe’s planning and fallback mechanisms.
+
+3.4.
+Budget-Constrained Planning Objective
+
+MergePipe introduces an explicit I/O budget constraint on the expert reads:
+
+C_{\text{expert}}\leq B,
+
+where
+B
+is a user-specified budget (like in MB).
+
+The budget applies exclusively to expert reads.
+Base model reads, output materialization, and metadata operations are treated
+as fixed overheads and are not subject to optimization.
+Under this constraint, the planner seeks to select expert blocks
+
+\{\mathcal{B}_{i}\}
+that respect the budget while following merge-specific
+heuristics:
+
+\min\;C_{\text{expert}}\quad\text{s.t.}\quad C_{\text{expert}}\leq B.
+
+The optimization problem is not solved exactly.
+Instead, the cost model provides a structured abstraction that guides
+budget-aware planning heuristics, described in
+Section
+4
+.
+By separating fixed and controllable costs, the model enables predictable
+scaling behavior as the number of experts increases: while naive pipelines
+exhibit
+O(K)
+expert I/O growth, MergePipe bounds I/O independently of
+K
+.
+
+4.
+Merge Planning
+
+This section describes the design of MergePipe’s planner, which generates budget-aware merge plans based on the cost model in Section
+3
+.
+The planner’s objective is to control expert parameter access while preserving the semantics of the specified merge operator.
+Rather than optimizing merge computation, the planner explicitly reasons about expert I/O cost and enforces user-specified budgets.
+
+4.1.
+Planner Interface and Scope
+
+The planner takes as input:
+(i) a merge request specifying a base model, a set of expert models, and a merge
+operator like AVG, TIES, DARE;
+(ii) a user-specified expert I/O budget
+B
+;
+and (iii) catalog metadata produced by prior
+ANALYZE
+phases
+(Section
+2.2
+).
+
+The planner outputs a
+merge plan
+that declaratively specifies:
+(a) which expert parameters (or blocks) are accessed,
+(b) which merge operator and parameters are applied, and
+(c) the expected expert read cost.
+The plan is a first-class object that can be inspected, reused, and executed
+independently by the execution engine.
+
+Planner scope.
+
+The planner does
+not
+modify merge formulas or introduce new merge
+algorithms.
+Instead, it determines
+which parameters are accessed
+under constrained
+resources.
+This separation ensures that MergePipe remains agnostic to merge operators while
+providing predictable system-level behavior.
+We formalize a merge plan as an explicit selection-and-execution contract.
+
+Definition 4.1 (Merge Plan).
+
+A merge plan is a tuple
+
+\pi=\big(\mathrm{op},\theta,\{\mathcal{B}_{i}\}_{i=1}^{K},\mathrm{order}\big),
+
+where
+\mathrm{op}
+is the merge operator,
+\theta
+denotes operator parameters,
+\mathcal{B}_{i}
+is
+the set of selected parameter blocks to be accessed from expert
+M_{i}
+, and
+
+\mathrm{order}
+is a deterministic tensor or block traversal order used by the execution engine.
+
+Definition 4.2 (Feasibility).
+
+Let
+\widehat{C}_{\text{expert}}(\pi)=\sum_{i=1}^{K}\sum_{b\in\mathcal{B}_{i}}\text{size}(b)
+
+be the planned expert read cost under block-level estimation.
+A plan
+\pi
+is
+budget-feasible
+under expert I/O budget
+B
+iff
+
+\widehat{C}_{\text{expert}}(\pi)\leq B.
+
+4.2.
+Cost Binding to the Model
+
+The planner instantiates the cost model in Section
+3
+by binding each candidate plan
+\pi
+to an estimated expert read cost
+\widehat{C}_{\text{expert}}(\pi)
+.
+Only
+\widehat{C}_{\text{expert}}(\pi)
+participates in feasibility checks, while
+C_{\text{base}}
+,
+C_{\text{out}}
+, and
+C_{\text{meta}}
+are treated as
+fixed overheads.
+A plan is accepted only if it satisfies the budget-feasibility condition in Definition
+4.2
+.
+
+4.3.
+Conflict-Aware Signals
+
+To prioritize expert parameters under budget constraints, the planner leverages
+conflict-aware signals derived from catalog metadata.
+These include lightweight sketches (e.g., cosine similarity hints) and coverage
+statistics computed during
+ANALYZE
+.
+Intuitively, these signals estimate how much an expert parameter diverges from the base model or overlaps with other experts.
+The planner uses these signals solely for
+ranking
+and
+selection
+.
+They do not alter merge operator semantics.
+For example, under AVG merging, selected parameters are still averaged; under TIES or DARE, the same thresholding or masking rules apply.
+Conflict-aware signals only influence
+which parameters are accessed
+when
+resources are limited.
+
+4.4.
+Budget-Aware Plan Generation
+
+MergePipe generates plans using a greedy procedure that incrementally selects
+expert blocks under the explicit budget
+B
+.
+Algorithm
+1
+formalizes this process: the planner (i) assigns a
+priority score
+s(i,b)
+to each candidate block using catalog signals (e.g.,
+sketches and coverage), (ii) iterates candidates in descending score, and (iii)
+adds a block to the plan iff the incremental cost preserves feasibility,
+i.e.,
+\text{cost}+\text{size}(b)\leq B
+.
+When the next candidate would violate the budget, the planner either skips the
+block or (when supported by the operator) applies a bounded adjustment to
+operator parameters (e.g., decreasing a threshold
+\theta
+for TIES/DARE);
+all such decisions are recorded in the plan metadata for reproducibility.
+The resulting plan
+\pi
+is budget-feasible by construction and maximizes the
+use of high-priority expert information within
+B
+.
+
+Input :
+Experts
+\{M_{i}\}_{i=1}^{K}
+; catalog
+\mathcal{C}
+; operator
+\mathrm{op}
+; budget
+B
+
+Output :
+A budget-feasible plan
+\pi
+
+Compute a priority score
+s(i,b)
+for each candidate expert block
+b
+using catalog sketches/coverage
+
+Sort candidates in descending
+s(i,b)
+
+Initialize
+\mathcal{B}_{i}\leftarrow\emptyset
+for all
+i
+, and cost
+\leftarrow 0
+
+foreach
+
+candidate
+(i,b)
+in sorted order
+
+do
+
+if
+
+\text{cost}+\text{size}(b)\leq B
+
+then
+
+\mathcal{B}_{i}\leftarrow\mathcal{B}_{i}\cup\{b\}
+;
+\text{cost}\leftarrow\text{cost}+\text{size}(b)
+
+end if
+
+optionally adjust
+\theta
+for
+\mathrm{op}
+and continue, otherwise skip
+
+end foreach
+
+Return
+\pi=(\mathrm{op},\theta,\{\mathcal{B}_{i}\},\mathrm{order})
+
+Algorithm 1
+
+PlanGen
+: greedy budget-aware plan.
+
+4.5.
+Fallback, Robustness, and Complexity
+
+When block-level metadata are missing or unreliable, the planner falls back to a
+coarser tensor-level selection, i.e., selecting whole tensors (equivalently, all
+blocks within selected tensors) and estimating
+\widehat{C}_{\text{expert}}(\pi)
+
+using the tensor-level formulation in Section
+3
+.
+Fallback events and their causes are recorded in the plan metadata for reproducibility.
+Let
+N_{b}
+denote the number of parameter blocks considered during planning.
+The planner runs in
+O(N_{b}\log N_{b})
+time due to priority ordering and budget
+checks.
+In practice, planning overhead is negligible compared to execution I/O and is
+amortized across iterative merge workflows via plan reuse.
+
+Input :
+Merge plan
+\pi
+; base model
+M_{0}
+; experts
+\{M_{i}\}_{i=1}^{K}
+; storage
+\mathcal{S}
+; catalog
+\mathcal{C}
+; transaction manager
+\mathcal{T}
+
+Output :
+Committed snapshot id
+sid
+and manifest
+\mathsf{man}
+
+Transaction and staging.
+
+\mathcal{T}.\textsc{Begin}()
+
+w\leftarrow\mathcal{S}.\textsc{OpenStagingWriter}()
+
+\textit{touch}\leftarrow\emptyset
+;
+\textit{coverage}\leftarrow\emptyset
+
+(1) Stream selected blocks under plan
+\pi
+.
+
+foreach
+
+tensor
+t\in\pi.\textsc{TensorOrder}()
+
+do
+
+D\leftarrow\textsc{InitDeltaIterator}(t,\pi,M_{0},\{M_{i}\})
+
+foreach
+
+block
+b\in\pi.\textsc{BlocksToMaterialize}(t)
+
+do
+
+\{\Delta_{i}\}\leftarrow D.\textsc{Pull}(b)
+
+//
+expert blocks iff selected
+
+x_{0}\leftarrow\mathcal{S}.\textsc{ReadBaseBlock}(M_{0},t,b)
+
+x\leftarrow\textsc{ApplyOperator}\!\left(x_{0},\{\Delta_{i}\},\pi.\textsc{Op}(t,b)\right)
+
+w.\textsc{WriteBlock}(t,b,x)
+
+\textit{touch}[t]\leftarrow\textit{touch}[t]\cup\{b\}
+
+\textit{coverage}[t,b]\leftarrow D.\textsc{UsedExperts}()
+
+end foreach
+
+end foreach
+
+(2) Validate and atomically publish snapshot.
+
+\mathcal{S}.\textsc{ValidateHashes}(w)
+
+\mathsf{man}\leftarrow\mathcal{C}.\textsc{BuildManifest}(\pi,\textit{touch},\textit{coverage})
+
+sid\leftarrow\mathcal{T}.\textsc{AtomicPublish}(w,\mathsf{man})
+
+\mathcal{C}.\textsc{CommitRecord}(sid,\mathsf{man})
+
+\mathcal{T}.\textsc{Commit}()
+
+return
+
+(sid,\mathsf{man})
+
+Algorithm 2
+
+ExecuteMerge
+: Budget-enforced streaming execution with atomic commit.
+
+5.
+Execution Engine
+
+MergePipe’s execution engine enforces a planner-produced merge plan
+\pi
+and
+materializes a merged
+snapshot
+under an explicit expert I/O budget.
+Algorithm
+2
+defines the execution semantics.
+
+5.1.
+Execution Semantics and Budget Soundness
+
+Definition (Realized expert reads).
+
+Let
+\mathrm{Sel}_{\pi}(t,b)\subseteq\{1,\ldots,K\}
+be the experts selected by
+\pi
+
+for output block
+(t,b)
+. Algorithm
+2
+realizes the expert
+read set
+
+(1)
+
+\displaystyle\mathcal{R}_{\text{expert}}(\pi)=\{(i,t,b)\mid i\in\mathrm{Sel}_{\pi}(t,b)\},
+
+(2)
+
+\displaystyle C_{\text{expert}}^{\text{run}}(\pi)=\sum_{(i,t,b)\in\mathcal{R}_{\text{expert}}(\pi)}\mathrm{size}(b).
+
+The output snapshot is a
+complete checkpoint
+: for every base block
+(t,b)
+,
+the engine reads
+x_{0}
+and writes an output block
+x
+(Algorithm
+2
+,
+Step (1)); only expert blocks are selectively read via
+D.\textsc{Pull}(b)
+.
+
+Property (Budget soundness).
+
+In Step (1), the engine calls
+D.\textsc{Pull}(b)
+
+iff
+
+(i,t,b)\in\mathcal{R}_{\text{expert}}(\pi)
+,
+thus the realized expert I/O is bounded by the plan and the user budget:
+
+C_{\text{expert}}^{\text{run}}(\pi)\ \leq\ \widehat{C}_{\text{expert}}(\pi)\ \leq\ B,
+
+up to accounting granularity used by the storage layer, like block-sized rounding in buffered I/O.
+This property follows directly because
+\pi
+explicitly enumerates all expert
+blocks the engine is allowed to access, and the engine does not perform any
+additional expert reads beyond those selected by
+\pi
+.
+
+5.2.
+DeltaIterator and Operator Application
+
+To support heterogeneous experts (full weights, deltas, adapters), the engine
+uses a unified
+DeltaIterator
+. For tensor
+t
+,
+InitDeltaIterator
+
+constructs
+D
+such that
+D.\textsc{Pull}(b)
+returns exactly the selected expert
+contributions
+\{\Delta_{i}\}
+for block
+b
+(Algorithm
+2
+,
+Step (1)). The engine computes each output block by
+
+x\leftarrow\textsc{ApplyOperator}\!\left(x_{0},\{\Delta_{i}\},\pi.\textsc{Op}(t,b)\right),
+
+without modifying operator semantics;
+\pi
+only controls
+which
+expert
+information is accessed.
+
+5.3.
+Atomic Publish and Manifested Lineage
+
+All writes are staged and hash-validated before publication
+(Algorithm
+2
+, Step (2)). The engine then builds a manifest
+
+\mathsf{man}\leftarrow\mathcal{C}.\textsc{BuildManifest}(\pi,\textit{touch},\textit{coverage})
+
+and atomically publishes the new snapshot id
+sid
+via
+
+\mathcal{T}.\textsc{AtomicPublish}(w,\mathsf{man})
+.
+
+Property (Atomic visibility).
+
+Algorithm
+2
+guarantees that a merge either commits a single
+new snapshot
+(sid,\mathsf{man})
+or leaves no externally visible partial state.
+
+6.
+Experiments
+
+The goal of this section is to empirically validate the key insights identified in Sections
+1
+and
+3
+, and to demonstrate that MergePipe delivers predictable and scalable performance by explicitly controlling expert parameter access.
+Specifically, our experiments are organized around the following insights:
+
+•
+
+I1. Expert I/O dominates scalability:
+
+Naive merging pipelines repeatedly scan expert checkpoints, causing expert I/O and end-to-end time to grow nearly linearly with the number of experts.
+
+•
+
+I2. Expert I/O is the primary controllable cost knob:
+
+While base model reads and output writes are unavoidable, selectively reducing expert reads is the key to scalable merging without modifying merge semantics.
+
+•
+
+I3. Budget-aware planning enables predictable control:
+
+Explicitly modeling expert I/O as a budgeted resource allows our MergePipe to
+generalize across different merge operators and model families.
+
+•
+
+I4. System overheads are small and amortized:
+
+The additional costs introduced by planning, metadata management, and transactional execution are negligible relative to end-to-end merging and become amortized at realistic scales.
+
+•
+
+I5. Block granularity admits a robust operating regime:
+MergePipe’s performance is stable across a practical range of block sizes and execution settings, indicating that its benefits do not rely on fragile tuning.
+
+All experiments are conducted without modifying the merging algorithms themselves,
+and directly reflect the cost decomposition and budget-constrained planning objective introduced in Section
+3
+, with a particular focus on
+controlling the expert read cost
+C_{\text{expert}}
+.
+
+1
+1
+
+1
+
+Our project is provided in
+https://github.com/wyy-code/mergepipe
+.
+
+Table 2
+.
+Evaluated models configuration in experiments.
+All models use official HuggingFace checkpoints.
+BF16 size is estimated assuming 2 bytes per parameter and reflects the approximate scale of parameter I/O during merging.
+
+Model
+
+Params
+
+Layers
+
+Hidden Dim
+
+BF16 Size
+
+Experts Number
+
+Qwen3-0.6B
+
+0.6B
+
+24
+
+1024
+
+\sim
+1.2 GB
+
+20
+
+Qwen3-1.7B
+
+1.7B
+
+28
+
+2048
+
+\sim
+3.4 GB
+
+20
+
+Qwen3-8B
+
+8.0B
+
+32
+
+4096
+
+\sim
+16.0 GB
+
+20
+
+Llama-3.2-3B
+
+3.0B
+
+26
+
+3072
+
+\sim
+6.0 GB
+
+25
+
+Llama-3.1-8B
+
+8.0B
+
+32
+
+4096
+
+\sim
+16.0 GB
+
+20
+
+Figure 4
+.
+
+Scaling with the number of experts.
+
+(a)
+Expert read I/O (top) and end-to-end wall time (bottom).
+Naive merging repeatedly scans expert checkpoints, leading to near-linear growth in expert I/O and runtime as the number of experts increases.
+MergePipe enforces an explicit expert I/O budget at execution time, keeping expert reads bounded and significantly reducing wall time.
+
+(b)
+Total I/O shows that naive pipelines become increasingly expert-read dominated, while MergePipe reduces total I/O by limiting expert access.
+
+(c)
+I/O composition at the maximum number of experts illustrates that MergePipe shifts the dominant cost from expert reads to unavoidable base reads and output writes.
+All experiments are conducted on CPU using the same merge operator (TIES).
+
+6.1.
+Experimental Setup
+
+Models and experts.
+
+We evaluate MergePipe on five representative open-source LLMs from the
+Llama and Qwen families:
+{
+Llama-3.1-8B
+,
+Llama-3.2-3B
+,
+Qwen3-0.6B
+,
+
+Qwen3-1.7B
+, and
+Qwen3-8B
+}.
+These models span parameter scales from 0.6B to 8B.
+All experiments use the official HuggingFace checkpoints.
+Table
+2
+summarizes the key model characteristics, including parameter count and approximate BF16 checkpoint size (estimated assuming 2 bytes per parameter).
+
+For each base model, we construct merging workloads by progressively increasing the number of expert checkpoints.
+Unless otherwise stated, experts are derived from the same base model and stored as full checkpoints or parameter deltas.
+
+Merging operators.
+
+We evaluate MergePipe using two widely adopted sparse merging algorithms,
+
+TIES
+
+(
+36
+)
+and
+DARE
+
+(
+40
+)
+.
+Both methods selectively incorporate expert parameters and therefore
+naturally benefit from budget-aware expert access.
+Although MergePipe also supports average merging, our evaluation focuses
+on TIES and DARE as they better reflect realistic large-scale merging
+workflows.
+
+Baselines.
+
+We compare MergePipe against naive merging pipelines that implement the
+same merging operators but treat model parameters as unstructured files.
+Each merge invocation independently scans all required expert parameters,
+with no reuse, planning, or budget enforcement, reflecting the execution
+model of existing open-source merging scripts.
+
+Metrics.
+
+We report (i)
+expert read I/O
+(MB),
+(ii)
+end-to-end wall-clock time
+, and
+(iii)
+relative improvement
+over naive execution.
+These metrics directly correspond to the cost components defined in
+Section
+3
+, with a focus on the dominant expert read cost
+
+C_{\text{expert}}
+.
+
+System configuration.
+
+All experiments are conducted on a CPU-only server with two Intel Xeon
+Platinum 8358 processors (64 physical cores, 128 hardware threads total)
+and SSD-backed storage.
+OS-level file caching is disabled unless otherwise stated.
+No GPU acceleration is used, ensuring that merge performance is
+I/O-bound rather than compute-bound.
+
+Reproducibility.
+
+MergePipe persists merge plans, execution manifests, and lineage metadata,
+enabling deterministic re-execution and post-hoc inspection.
+
+6.2.
+I1. Scaling with Number of Experts
+
+We study how MergePipe scales as the expert set grows, using TIES as the merge operator and varying the number of experts from 2 up to 20 (25 for Llama-3.2-3B). Figure
+4
+summarizes expert I/O, end-to-end wall time, and total I/O across five model families.
+
+Expert I/O scales from
+O(K)
+to budgeted.
+
+Figure
+4
+(a, top) shows that the naive pipeline exhibits near-linear growth in
+expert read
+I/O as
+K
+increases, matching the
+O(K)
+term
+C_{\text{expert}}
+in our cost model (Section
+3
+). In contrast, MergePipe keeps expert I/O
+nearly flat
+across
+K
+by enforcing the expert-read budget
+C_{\text{expert}}\leq B
+, yielding substantial reductions at the maximum
+K
+: e.g., for Qwen3-8B and Llama-3.1-8B at
+K{=}20
+, naive expert I/O reaches hundreds of GB, while MergePipe remains in the tens of GB range (roughly an order-of-magnitude reduction).
+
+Wall time follows expert I/O, with a few localized outliers.
+
+Figure
+4
+(a, bottom) reports wall-clock time. Overall, wall time tracks expert I/O: naive merging slows down steadily as
+K
+grows, while MergePipe remains significantly faster for all models and large
+K
+(e.g., the largest gains appear for Qwen3-1.7B and Qwen3-8B where naive repeatedly scans large expert checkpoints).
+We observe several
+localized
+spikes that are not explained by the cost model (since they do not coincide with increased expert I/O):
+(i)
+Qwen3-1.7B (naive)
+shows a sharp wall-time spike around
+K{\approx}13
+–
+14
+;
+(ii)
+Qwen3-8B (MergePipe)
+shows an isolated spike around
+K{\approx}6
+;
+(iii)
+Llama-3.1-8B (MergePipe)
+shows a spike around
+K{\approx}9
+–
+10
+.
+These outliers are consistent with transient
+system-level
+disturbances (CPU scheduling and frequency scaling, background disk contention, and NUMA effects) rather than merge semantics: importantly, they occur without corresponding jumps in expert I/O and the curves immediately return to their prior trend. Even at these points, MergePipe remains well below the naive runtime at comparable
+K
+for large models.
+
+Total I/O becomes dominated by unavoidable costs.
+
+Figure
+4
+(b) shows total I/O. Naive total I/O grows almost linearly with
+K
+because expert reads dominate
+C_{\text{merge}}
+. With MergePipe, total I/O grows slowly and is increasingly dominated by the fixed costs
+C_{\text{base}}
+and
+C_{\text{out}}
+.
+This shift is made explicit in Figure
+4
+(c): at maximum
+K
+, naive runs are largely
+expert-read dominated
+, whereas MergePipe substantially reduces the expert-read fraction, making base reads and output materialization the primary contributors.
+
+Where do the gains come from?
+
+To address concerns that improvements may stem from implementation details rather
+than our execution model, we further decompose I/O and overheads.
+Figure
+5
+shows that (i) pre-budget expert reads scale
+approximately linearly with
+K
+across models, (ii) varying the budget mainly
+changes expert reads while base reads and output writes remain nearly constant,
+and (iii) planning+flush+commit accounts for a small fraction of wall time over
+practical budgets.
+Together, these results indicate that MergePipe’s gains primarily arise from
+reducing the dominant expert-read term rather than metadata or transactional
+overheads.
+
+Baseline strengthening.
+
+To reduce the risk that our gains come from an under-engineered baseline, we additionally report a disable-budget ablation under the same metric interface.
+Table
+3
+shows that MergePipe remains substantially better than naive full-read, and disabling planner-side budget scaling degrades runtime under the same I/O cap.
+
+Table 3.
+Baseline & disable-budget ablation
+(Qwen3-0.6B,
+K{=}20
+, budget=8.57GB).
+MergePipe’s gains persist over naive full-read; disabling planner-side budget scaling increases wall time under the same I/O cap.
+
+Method
+
+Expert read (GB)
+
+Total I/O (GB)
+
+Wall (s)
+
+Naive (full-read)
+
+26.4
+
+31.8
+
+104.7
+
+MergePipe (budgeted)
+
+8.0
+
+8.8
+
+22.8
+
+MergePipe (disable-budget)
+
+8.0
+
+8.8
+
+34.5
+
+As the number of experts increases, naive merging quickly becomes I/O-bound due to
+O(K)
+expert scans. MergePipe enforces the budgeted expert-read term in Section
+3
+, achieving controlled scaling with substantially lower expert I/O and end-to-end time, while the remaining cost is increasingly limited by unavoidable base read and output write overheads.
+Across all models and expert scales, the relative trends are consistent, indicating that the observed benefits stem from the execution model rather than model-specific effects.
+
+Figure 5
+.
+
+(a) Planning+flush+commit is a small fraction of wall time.
+(b) Budgeting mainly reduces expert reads.
+(c) Pre-budget expert read I/O scales with
+K
+across models.
+
+6.3.
+I2. Budget-Aware Planning Behavior
+
+We next study how MergePipe’s planner behaves under explicit I/O budget
+constraints.
+Fixing the base model, merge operator (TIES), and the number of experts,
+we vary the expert-read budget from 10% to 100% of the full expert
+parameter size.
+Figure
+6
+summarizes expert I/O, end-to-end latency,
+and planner access behavior.
+
+Expert I/O follows the imposed budget.
+
+Figure
+6
+(a) shows the total expert read volume under
+different budgets for workloads with 10 and 20 experts.
+Actual expert I/O increases monotonically with the budget and always
+remains below the theoretical budget cap (dashed lines), confirming that
+MergePipe strictly enforces the user-specified constraint.
+At the same budget level, workloads with more experts incur higher expert
+I/O, indicating that planning decisions still reflect the underlying
+problem scale rather than collapsing to a fixed heuristic.
+
+End-to-end time tracks budget-controlled I/O.
+
+As shown in Figure
+6
+(b), wall-clock time increases
+monotonically with the I/O budget and closely follows the trend of expert
+I/O.
+This confirms that merging performance in this regime is I/O-bound, and
+that adjusting the budget provides a direct and predictable handle on
+end-to-end execution time.
+We observe mild non-linearities around mid-range budgets (e.g.,
+\sim
+50%),
+which stem from the discrete inclusion of additional expert blocks rather
+than unstable system behavior; beyond these points, execution time
+continues to grow smoothly.
+
+Planner access expands in a controlled and interpretable manner.
+
+Figure
+6
+(c) reports the fraction of expert parameter
+blocks accessed by the planner.
+The accessed-block ratio increases approximately linearly with the budget
+and exhibits nearly identical trends for 10 and 20 experts.
+This indicates that planner decisions are primarily budget-driven and
+scale-invariant with respect to the total number of experts.
+Together, these results demonstrate that MergePipe’s planner expands the
+accessed expert set gradually and predictably as the budget increases,
+providing fine-grained and user-controllable trade-offs between I/O cost
+and execution time.
+
+Figure 6
+.
+
+Budget-aware planning.
+
+(a)
+Expert read I/O grows monotonically with the I/O budget and is capped by the theoretical budget limit.
+
+(b)
+End-to-end merge time closely follows expert I/O.
+
+(c)
+Fraction of accessed expert blocks selected by the planner increases smoothly with the budget.
+
+6.4.
+I3. Generality Across Merge Operators
+
+Table 4
+.
+
+Generality across merge operators (Llama-3.1-8B).
+
+Comparison of naive execution and MergePipe under three merging operators.
+
+Top:
+total parameter I/O (MB) and the fraction of naive I/O consumed by MergePipe (
+Ratio
+).
+
+Bottom:
+end-to-end wall-clock time (seconds) and relative improvement
+(
+Improv.
+=
+(T_{\text{naive}}-T_{\text{MergePipe}})/T_{\text{naive}}
+).
+
+Total Expert I/O (MB)
+
+Average
+
+TIES
+
+DARE
+
+K
+
+Naive
+
+MergePipe
+
+Ratio
+
+Naive
+
+MergePipe
+
+Ratio
+
+Naive
+
+MergePipe
+
+Ratio
+
+2
+
+32127.62
+
+3461.73
+
+10.77%
+
+32127.62
+
+3461.73
+
+10.77%
+
+32127.62
+
+3461.73
+
+10.77%
+
+4
+
+44978.67
+
+3461.73
+
+7.70%
+
+45766.68
+
+3461.73
+
+7.56%
+
+44978.67
+
+3461.73
+
+7.70%
+
+6
+
+57829.73
+
+3461.73
+
+5.99%
+
+65831.24
+
+3461.73
+
+5.26%
+
+65831.24
+
+3461.73
+
+5.26%
+
+8
+
+70680.79
+
+3461.73
+
+4.90%
+
+79470.30
+
+3461.73
+
+4.36%
+
+79470.30
+
+3461.73
+
+4.36%
+
+10
+
+83531.85
+
+3461.73
+
+4.14%
+
+92321.36
+
+3461.73
+
+3.75%
+
+92321.36
+
+3461.73
+
+3.75%
+
+12
+
+102808.41
+
+3461.73
+
+3.37%
+
+105172.42
+
+3461.73
+
+3.29%
+
+105172.42
+
+3461.73
+
+3.29%
+
+14
+
+123660.97
+
+3461.73
+
+2.80%
+
+126024.99
+
+3461.73
+
+2.75%
+
+126024.99
+
+3461.73
+
+2.75%
+
+16
+
+137300.04
+
+3461.73
+
+2.52%
+
+140046.71
+
+3461.73
+
+2.47%
+
+139200.14
+
+3461.73
+
+2.49%
+
+18
+
+158152.60
+
+3461.73
+
+2.19%
+
+161316.03
+
+3461.73
+
+2.15%
+
+160200.60
+
+3461.73
+
+2.16%
+
+20
+
+171003.66
+
+3461.73
+
+2.02%
+
+174424.50
+
+3461.73
+
+1.98%
+
+173200.17
+
+3461.73
+
+2.00%
+
+End-to-End Wall Time (seconds)
+
+Average
+
+TIES
+
+DARE
+
+K
+
+Naive
+
+MergePipe
+
+Improv.
+
+Naive
+
+MergePipe
+
+Improv.
+
+Naive
+
+MergePipe
+
+Improv.
+
+2
+
+31.11
+
+41.17
+
+-32.34%
+
+404.27
+
+37.17
+
+90.81%
+
+79.27
+
+37.78
+
+52.34%
+
+4
+
+37.31
+
+50.98
+
+-36.64%
+
+491.77
+
+42.31
+
+91.40%
+
+78.14
+
+45.40
+
+41.90%
+
+6
+
+81.93
+
+56.69
+
+30.81%
+
+558.78
+
+46.32
+
+91.71%
+
+92.07
+
+43.59
+
+52.66%
+
+8
+
+136.17
+
+64.07
+
+52.95%
+
+614.27
+
+51.06
+
+91.69%
+
+99.10
+
+44.72
+
+54.87%
+
+10
+
+159.95
+
+77.36
+
+51.63%
+
+578.84
+
+62.89
+
+89.14%
+
+101.03
+
+67.22
+
+33.47%
+
+12
+
+191.94
+
+84.22
+
+56.12%
+
+633.06
+
+80.28
+
+87.32%
+
+127.99
+
+84.73
+
+33.80%
+
+14
+
+172.67
+
+127.30
+
+26.28%
+
+790.65
+
+90.97
+
+88.49%
+
+206.89
+
+153.13
+
+25.98%
+
+16
+
+195.17
+
+173.52
+
+11.09%
+
+941.36
+
+198.65
+
+78.90%
+
+248.91
+
+210.03
+
+15.62%
+
+18
+
+361.59
+
+334.47
+
+7.50%
+
+1051.48
+
+314.52
+
+70.09%
+
+395.30
+
+358.85
+
+9.22%
+
+20
+
+363.02
+
+338.36
+
+6.79%
+
+1203.65
+
+356.32
+
+70.40%
+
+464.16
+
+414.44
+
+10.71%
+
+We evaluate the generality of MergePipe across different merging algorithms.
+Table
+4
+compares naive execution and MergePipe under
+three representative operators: Average, TIES, and DARE, while varying the
+number of experts
+K
+from 2 to 20.
+
+Consistent expert I/O control across operators.
+
+Across all three operators and all expert set sizes, MergePipe reduces total
+parameter I/O by nearly an order of magnitude.
+While naive execution exhibits near-linear growth in total I/O as
+K
+
+increases (e.g., exceeding 170 GB at
+K{=}20
+), MergePipe keeps total I/O
+almost constant at approximately 3.5 GB.
+As a result, the I/O ratio (
+Ratio
+) steadily decreases with
+K
+,
+dropping to about 2% at
+K{=}20
+for all operators.
+This confirms that MergePipe’s I/O savings are independent of merge semantics
+and arise from budget-aware parameter access rather than operator-specific
+optimizations.
+
+Runtime benefits depend on merge sparsity.
+
+End-to-end runtime improvements vary across operators.
+For sparse merging algorithms such as TIES and DARE, MergePipe achieves
+substantial speedups across all
+K
+.
+For example, under TIES, MergePipe reduces wall time by over
+90\%
+at
+
+K{=}4
+–
+8
+and still delivers about
+70\%
+improvement at
+K{=}20
+.
+These gains occur because naive sparse merging repeatedly scans large expert
+checkpoints, whereas MergePipe selectively accesses a budgeted subset of
+parameters.
+
+In contrast, Average merging shows smaller and occasionally negative
+improvements at very small
+K
+(e.g.,
+K{=}2
+and
+4
+), where naive execution
+is already fast and planning overhead is not yet amortized.
+However, as
+K
+increases, MergePipe consistently outperforms naive execution,
+achieving over
+50\%
+runtime reduction at moderate scales (e.g.,
+K{=}8
+–
+12
+).
+
+Case analysis.
+
+At
+K{=}8
+, MergePipe reduces total I/O from 70–80 GB to 3.5 GB across all
+operators, while reducing wall time from 614 s to 51 s under TIES and from
+99 s to 45 s under DARE.
+At
+K{=}20
+, despite different merge semantics, all operators exhibit similar
+I/O ratios (around 4%), indicating that MergePipe’s planner enforces the same
+budgeted access pattern regardless of how expert parameters are combined.
+Overall, these results demonstrate that MergePipe generalizes across merge operators, consistently controls the dominant expert I/O cost, and delivers the largest performance benefits for realistic sparse merging workloads.
+
+6.5.
+I4. Execution Overheads and System Costs
+
+In this subsection, we want to answer the question "Does MergePipe introduce non-negligible system overheads from planning, metadata management, and transactional execution compared with end-to-end merging?"
+We evaluate whether these components incur meaningful overheads in practice.
+
+Table 5
+.
+
+Execution overheads and system costs of MergePipe under a representative configuration (Qwen3-0.6B, 16 experts).
+Planning and metadata overheads are small relative to execution time and total I/O.
+
+Metric
+
+Absolute Value
+
+Relative Cost
+
+Planning time (
+T_{\text{plan}}
+)
+
+1.21 s
+
+1.04% of execution
+
+Execution time (
+T_{\text{exec}}
+)
+
+116.62 s
+
+100%
+
+Estimated expert I/O (pre-plan)
+
+19 842 MB
+
+–
+
+Executed expert I/O
+
+23 349 MB
+
+1.18
+\times
+
+Total I/O volume
+
+91 447 MB
+
+100%
+
+Metadata catalog size (DB)
+
+3 468 MB
+
+3.79% of total I/O
+
+Execution manifest size
+
+812 KB
+
+<
+0.001%
+
+Planning overhead is negligible.
+
+As shown in Table
+5
+, planning incurs only 1.21 s, accounting for 1.04% of the end-to-end execution time.
+This confirms that MergePipe’s cost modeling, conflict resolution, and plan generation introduce minimal overhead compared with merge execution.
+Across different expert counts, we observe similarly small planning overheads, indicating that planner cost does not scale with the number of experts.
+
+Planner-induced I/O is amortized by execution savings.
+
+Conflict aware planning may introduce additional expert reads to validate candidate accesses.
+In this configuration, executed expert I/O increases by 1.18
+\times
+relative to the pre-planning estimate.
+However, this modest overhead is amortized by eliminating redundant expert scans during execution, resulting in substantially lower total I/O compared with naive merging.
+
+Metadata and transactional costs are modest.
+
+Persistent metadata, including the SQLite catalog and lineage information, accounts for only 3.79% of total I/O volume, while execution manifests are negligible in size.
+These costs remain small compared with model parameter I/O and do not affect end-to-end merge throughput.
+These results show that MergePipe introduces only minor system overheads, while effectively reducing dominant expert I/O costs.
+Planning, metadata management, and transactional execution scale favorably and do not offset the performance benefits of budget-aware merging.
+
+6.6.
+I5. Ablation and Sensitivity Analysis
+
+Table 6
+.
+
+Sensitivity to block size in MergePipe under fixed expert set and I/O budget.
+Very small blocks increase overhead, while overly large blocks reduce budget control granularity.
+
+Block size
+
+16 k
+
+32 k
+
+64 k
+
+128 k
+
+256 k
+
+512 k
+
+TIES
+
+Expert I/O (MB)
+
+4039.55
+
+3520.03
+
+3226.09
+
+3198.74
+
+3390.15
+
+3772.96
+
+Wall time (s)
+
+77.33
+
+61.50
+
+52.00
+
+45.32
+
+46.33
+
+45.04
+
+DARE
+
+Expert I/O (MB)
+
+4039.55
+
+3520.03
+
+3226.09
+
+3198.74
+
+3390.15
+
+3772.96
+
+Wall time (s)
+
+83.89
+
+62.47
+
+50.38
+
+46.31
+
+46.33
+
+46.82
+
+In this subsection, we want to answer "Which design choices are critical for MergePipe’s I/O reduction, and how sensitive is performance to key system parameters?" We study the sensitivity of MergePipe to the block granularity used during planning and execution.
+Block size determines the atomic unit of parameter access and directly affects both budget controllability and execution overhead.
+
+Sensitivity to block size.
+
+Table
+6
+reports total expert I/O volume and end-to-end wall-clock time under varying block sizes for both TIES and DARE operators.
+Across both operators, performance exhibits a clear and consistent trend.
+When blocks are too small, like 16 k or 32 k), total I/O and execution time increase noticeably.
+This is due to over-fragmentation: the planner must manage and access a large number of fine-grained blocks, increasing metadata lookups, index traversal, and I/O seek overhead.
+As block size increases, both expert I/O and wall-clock time decrease, reaching their minimum around 64 k–128 k.
+In this regime, blocks are sufficiently fine-grained to allow effective budget-aware selection, while avoiding excessive fragmentation.
+For overly large blocks (256 k and above), total I/O begins to rise again.
+Here, budget control becomes coarse: selecting a single large block may pull in unnecessary parameters, reducing the effectiveness of selective expert access.
+Despite this, wall-clock time remains relatively stable, indicating that MergePipe degrades gracefully rather than exhibiting pathological behavior.
+
+Robustness across merge operators.
+
+Notably, TIES and DARE exhibit nearly identical sensitivity curves across all block sizes.
+This suggests that block-size sensitivity is primarily a system-level phenomenon, independent of merge semantics. MergePipe therefore provides a robust operating regime with respect to block granularity, without requiring operator-specific tuning.
+These results show that while block size influences the efficiency of MergePipe, the system is not overly sensitive to this parameter.
+A broad range of block sizes yields near-optimal performance, validating the robustness of block-level planning in practical deployments.
+
+Figure 7
+.
+
+Stability across repeated runs.
+Mean and standard deviation over five identical executions under a fixed configuration (Qwen3-0.6B, TIES).
+End-to-end time and expert I/O exhibit low variance, indicating stable execution behavior.
+
+6.7.
+Stability Across Repeated Runs
+
+To assess the stability and repeatability of MergePipe under identical configurations, we conduct a repeated-run experiment by fixing the model, merge operator, I/O budget, and planner configuration, and varying only the number of experts.
+For each expert count
+K\in\{4,8,12,16,20\}
+, we execute the same merge workload
+five times
+and report the mean and standard deviation of key metrics.
+
+The overall results indicate that
+MergePipe’s execution behavior is deterministic
+given a fixed plan, and that observed variance is dominated by system-level noise rather than planning instability.
+Figure
+7
+summarizes the results. End-to-end wall-clock time exhibits a smooth and monotonic increase as the number of experts grows, from approximately
+12
+s at
+K{=}4
+to
+22
+–
+23
+s at
+K{=}20
+.
+Across all settings, the observed standard deviation is small (typically below
+5\%
+of the mean), indicating that end-to-end performance is highly stable under repeated execution. Even at larger expert counts, where absolute runtime is higher, variance remains limited like
+\pm 1
+s around a
+21
+–
+22
+s mean at
+K{=}16
+.
+
+Expert read volume is even more stable.
+As shown by the right axis in Figure
+7
+, the amount of expert parameters accessed under a fixed I/O budget is nearly deterministic, with negligible variance across runs.
+For example, at
+K{=}12
+,
+16
+, and
+20
+, the mean expert read remains close to
+1.00\times
+,
+0.83\times
+, and
+0.66\times
+of the full expert read, respectively, with no visible fluctuation across repetitions. This confirms that MergePipe’s planner makes consistent block-selection decisions under identical inputs, and that expert I/O variability does not contribute to runtime variance.
+
+Planner overhead is both small and stable. It is noticeable that Planner execution time remains below
+0.2
+s across all configurations, with very small standard deviation. Consequently, planner variability is negligible compared to the overall execution time and does not affect end-to-end stability.
+It demonstrates that MergePipe delivers
+stable and repeatable
+performance under repeated runs. The small runtime variance observed in practice is attributable to normal system-level effects such as CPU scheduling and background I/O rather than to unstable planning behavior or inconsistent expert access. All experimental results in this section are reported as averages over five runs.
+
+Table 7
+.
+Parameter deviation and downstream performance under different budgets
+(Qwen3-0.6B, TIES,
+K{=}20
+).
+
+Deviation
+
+Benchmarks
+
+Budget
+
+Touched Ratio
+
+Rel.
+\ell_{2}
+Err.
+
+P95 Block Err.
+
+HumanEval
+
+IFEval
+
+DROP
+
+1.0 (Full)
+
+0.247
+
+0
+
+0
+
+39.71
+
+68.56
+
+66.81
+
+0.9
+
+0.180
+
+7.23e-4
+
+3.66e-3
+
+42.68
+
+68.82
+
+67.23
+
+0.8
+
+0.159
+
+7.77e-4
+
+3.66e-3
+
+36.59
+
+68.94
+
+67.08
+
+0.7
+
+0.140
+
+8.30e-4
+
+3.98e-3
+
+37.80
+
+68.47
+
+66.26
+
+0.6
+
+0.119
+
+8.30e-4
+
+3.98e-3
+
+37.37
+
+67.87
+
+66.10
+
+0.5
+
+0.101
+
+8.84e-4
+
+3.98e-3
+
+40.24
+
+68.11
+
+66.00
+
+6.8.
+Correctness and Quality Preservation
+
+We assess whether budget-aware execution preserves the correctness and quality of the merged models.
+MergePipe does not change the merge performance; it only constrains expert parameter access under a budget.
+
+(A) Parameter-level deviation.
+
+Table
+7
+compares the budgeted output
+\theta_{B}
+against the full-read output
+\theta_{\text{full}}
+for the same setting (Qwen3-0.6B, TIES,
+K{=}20
+), reporting the relative
+\ell_{2}
+error
+\|\theta_{B}-\theta_{\text{full}}\|_{2}/\|\theta_{\text{full}}\|_{2}
+and a high-percentile block error.
+Across budgets down to
+B{=}0.5
+, deviations remain small (on the order of
+10^{-3}
+), and increase smoothly as fewer expert blocks are accessed (Touched Ratio), indicating controlled approximation.
+
+(B) Downstream quality.
+
+Table
+7
+reports task performance on three benchmarks covering code generation (HumanEval
+(
+6
+)
+), instruction following (IFEval
+(
+43
+)
+), and text reasoning (DROP
+(
+8
+)
+).
+Scores remain close to the full-read baseline across all budgets, with no consistent degradation as the budget decreases.
+Together, the parameter-level and task-level results suggest that MergePipe achieves substantial expert I/O reduction while preserving merged model quality in this representative configuration.
+
+7.
+Related Work
+
+LLM merging
+aims to consolidate multiple trained models into a single model without retraining from scratch and has become a common component in modern LLM development pipelines.
+Existing approaches can be broadly categorized into
+dense
+and
+sparse
+merging operators.
+Dense methods, such as weight averaging, model soups
+(
+34
+)
+, and Task Arithmetic (TA)
+(
+15
+)
+, combine parameters globally and implicitly assume that conflicts between task updates are resolved through averaging.
+Sparse merging methods instead selectively incorporate task-specific parameters to reduce interference, including TIES
+(
+36
+)
+, DARE
+(
+40
+)
+, and SVD-based operators that exploit low-rank structures in task vectors
+(
+21
+;
+19
+)
+.
+More recent activation-aware methods dynamically weight models based on input activations
+(
+23
+;
+17
+)
+, while MoE-style approaches introduce routing mechanisms to combine experts at inference time
+(
+26
+;
+18
+)
+.
+Several studies further investigate empirical scaling laws and theoretical properties of model merging
+(
+31
+)
+, and comprehensive surveys summarize this growing literature
+(
+44
+)
+.
+
+Despite their algorithmic diversity, existing merging methods predominantly focus on
+how
+parameters should be combined, while implicitly assuming that expert parameters can be accessed at negligible cost.
+In practical LLM pipelines, however, repeatedly reading expert checkpoints incurs substantial parameter I/O overhead that scales linearly with the number of experts.
+This cost is both dominant and controllable, yet is largely abstracted away in prior work.
+MergePipe addresses this orthogonal bottleneck by providing a budget-aware execution engine that enforces bounded expert reads, enabling large-scale merging without altering merge semantics.
+
+LLM fusion
+represents an alternative paradigm that aligns model behaviors through distillation or hybrid pipelines rather than direct parameter manipulation.
+Prior work studies alignment
+(
+32
+)
+at the level of logits, representations, or architectural components
+(
+33
+)
+, primarily focusing on algorithmic design and quality transfer across models.
+These approaches are complementary to MergePipe: while fusion methods aim to improve model performance, MergePipe focuses on making parameter-level merging
+executable, predictable, and cost-efficient
+under explicit resource constraints, which is critical for iterative expert merge in large-scale LLM systems.
+
+Machine Learning Management Systems.
+
+From a systems perspective, large-scale LLM development increasingly resembles a data-management workload over large immutable artifacts like checkpoints, deltas, and derived variants, where indexing, reuse, and provenance become first-class requirements.
+Prior systems have studied model- and experiment-management abstractions like ModelDB for model lifecycle tracking and queryable metadata
+(
+12
+;
+30
+)
+, as well as end-to-end ML platforms that record runs, parameters, and artifacts such as MLflow to improve reproducibility and operational visibility
+(
+42
+)
+.
+In parallel, data and version control tools for ML pipelines like DVC
+(
+2
+)
+and other works
+(
+29
+;
+28
+)
+emphasize dataset and artifact versioning, repeatable pipelines, and auditable diffs.
+Workflow engines and pipeline systems
+(
+9
+;
+5
+)
+provide orchestration and caching, but typically do not model
+parameter-access cost
+as an explicit optimization objective.
+More broadly, database research on lineage and provenance has established principled foundations and practical systems for tracking derivations and enabling post-hoc inspection in data workflows
+(
+4
+;
+10
+)
+.
+
+In contrast, MergePipe is complementary to prior provenance and pipeline systems, but focuses on a different system-level bottleneck.
+Existing provenance systems
+(
+24
+)
+typically treat model checkpoints as opaque artifacts, and therefore lack visibility into the cost structure of iterative LLM merging.
+As a result, they cannot reason about or control the dominant I/O pattern in such workloads, where repeatedly scanning expert checkpoints induces an
+\mathcal{O}(K)
+expert-read cost.
+MergePipe instead treats model parameters as manageable data.
+It (i) organizes checkpoints into tensors or blocks with persistent statistics, (ii) represents merge plans as reusable execution objects, and (iii) explicitly models expert parameter reads as a budgeted resource during planning and execution.
+This budget-aware, block-granular execution model distinguishes MergePipe from prior pipeline and provenance tooling, which primarily improves traceability but does not provide bounded or predictable expert I/O behavior for large-scale merging.
+
+8.
+Conclusion
+
+We presented
+MergePipe
+, a budget-aware execution pipeline that reframes large-scale LLM merging as a data management and execution problem. By treating
+expert parameter reads
+as the dominant and controllable cost, MergePipe uses catalog-driven planning and streaming execution to enforce explicit expert I/O budgets while remaining agnostic to merge operators. Across representative merging workloads, MergePipe cuts total I/O by up to an order of magnitude and achieves up to
+11\times
+end-to-end speedups (up to 70% wall-time reduction).
+MergePipe is most beneficial for offline merges with many experts where expert I/O dominates, while its gains naturally diminish for small expert sets or dense merges.
+
+The Use of Large Language Models
+
+In this manuscript, we employed an LLM exclusively as a writing assistant, including correction of grammatical errors, rephrasing for better readability, and minor stylistic improvements. All substantive analysis, experiments, and conclusions are the original work of the authors. This usage complies with prevailing academic standards on the responsible application of generative AI tools.
+
