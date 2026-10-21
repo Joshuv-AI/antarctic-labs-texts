@@ -1,0 +1,1442 @@
+Strata: Hierarchical Context Caching for Long Context Language Model Serving
+Zhiqiang Xie, Ziyi Xu, Mark Zhao, Yuwei An, Vikram Sharma Mailthody, Scott Mahlke, Michael Garland, Christos Kozyrakis
+
+Abstract
+. Large Language Models (LLMs) with expanding context windows face significant performance hurdles. While caching key–value (KV) states is critical for avoiding redundant computation, the storage footprint of long-context caches quickly exceeds GPU memory capacity, forcing production systems to adopt hierarchical caching across memory hierarchies. However, transferring large cached contexts back to the GPU introduces severe performance bottlenecks: fragmented I/O from paged layouts prevents full bandwidth utilization, and existing schedulers fail to account for cache-loading delays, leaving systems loading-bound rather than compute-bound. We present Strata, a hierarchical context caching framework designed for efficient long-context LLM serving. Strata introduces GPU-assisted I/O to combat KV cache fragmentation, decoupling GPU and CPU memory layouts and employs cache-aware request scheduling to balance compute with I/O latency and overlapping unavoidable stalls with complementary tasks. Built on SGLang and deployed in production, Strata achieves up to 5 × 5\times lower Time-To-First-Token (TTFT) compared to vLLM + LMCache and 3.75 × 3.75\times speedup over NVIDIA TensorRT-LLM on long-context benchmarks, without degrading short-context performance.
+
+
+
+1.
+Introduction
+
+Large Language Models (LLMs) represent a significant advancement in machine learning, achieving remarkable proficiency in understanding and generating natural language. Their adoption is now widespread, and they are rapidly evolving towards more robust problem-solving capabilities.
+A prominent trend in this evolution is the expansion of context windows, allowing LLMs to parse longer input prompts.
+This has enabled an important set of applications that require understanding large amounts of text, including coding assistants, retrieval-augmented generation (RAG), document analysis, and conversational AI agents.
+Leading models, including Google’s Gemini series
+(
+Google DeepMind 2023
+)
+and the Qwen series
+(
+Team 2025
+)
+, already support context windows of up to one million tokens, with expectations of two million tokens emerging soon.
+Other frontier models like DeepSeek-V3
+(
+DeepSeek-AI 2025
+)
+, Llama3.1 and Llama-4 series
+(
+meta ai 2024
+;
+meta ai 2025
+)
+, and Anthropic’s Claude 3.5
+(
+Anthropic 2024a
+)
+also offer substantial context lengths, typically in the range of 128K to 200K tokens.
+
+While long contexts enable new capabilities such as multi-turn conversations, RAG, and document-centric tasks (e.g., querying books, manuals, or scripts), recomputing them from scratch is prohibitively expensive.
+Caching previously computed key–value (KV) states offers a practical solution, as these prefixes and sources are frequently reused across applications. This technique, often referred to as context or prefix caching
+(
+Zheng et al. 2024
+;
+DeepSeek [n. d.]
+;
+OpenAI [n. d.]
+;
+Google [n. d.]
+;
+Anthropic 2024b
+)
+, avoids redundant prefill computation and significantly reduces response latency.
+However, the storage footprint of cached KV states is substantial. For example, 40 GB of GPU High-Bandwidth Memory (HBM) can only hold roughly 0.3M tokens for Llama-8B, which can be quickly consumed by a handful of documents or hundreds of conversation turns. As a result, production systems adopt hierarchical caching, storing KV states in CPU memory
+(
+Yu et al. 2025
+)
+, local SSDs
+(
+Gao et al. 2024
+)
+, or even remote memory pools
+(
+Hu et al. 2024
+;
+Qin et al. 2025
+)
+to extend capacity and preserve reuse benefits.
+
+However, transferring large cached contexts back to the GPU introduces a major performance bottleneck. Bulk KV transfers often cause memory stall, directly inflating TTFT and degrading throughput.
+Figure
+1
+illustrates this effect: when serving the LooGLE dataset
+(
+Li et al. 2023
+)
+with SGLang offloading KV caches to CPU memory, configured in line with standard practices reported in prior work
+(
+Gao et al. 2024
+)
+, 74% of prefill time is blocked on KV transfers (the red curve), resulting in up to a
+4\times
+throughput reduction.
+In these cases, I/O delays rather than compute become the dominant limiting factor. This inefficiency arises from two main sources.
+
+Figure 1.
+
+Benchmark profile for Qwen2.5-14B on the LooGLE dataset. The x-axis shows the Load / Compute Ratio (tokens loaded from CPU memory relative to new input tokens) per prefill batch. The right axis displays the I/O stall percentage, representing the amount of prefill execution time attributed to I/O stall. See §
+5.3
+for full benchmark details.
+
+First, as context lengths grow, the sheer volume of KV cache data requiring transfer between memory tiers (e.g., CPU memory to GPU HBM) increases substantially.
+However, current systems achieve only a fraction of the maximum hardware bandwidth between memory tiers.
+As we further explore in §
+3.1
+, this is because current systems adopt PagedAttention
+(
+Kwon et al. 2023
+)
+to reduce GPU memory fragmentation.
+However, paging causes
+data
+fragmentation, as the KV cache for a given sequence is spread across multiple non-contiguous pages.
+This leads to small data transfers, sometimes only a few kilobytes, which fail to saturate PCIe bandwidth.
+
+In addition to the inefficient I/O, current schedulers fail to account for the fact that loading cached context itself can become a bottleneck.
+Specifically, existing systems
+(
+Zheng et al. 2024
+;
+Kwon et al. 2023
+;
+NVIDIA 2025b
+)
+assumes that the computation needed to prefill new tokens is sufficient to hide the latency of loading historical KV cache from slower memory tiers.
+However, as context lengths grow, this assumption no longer holds: caching loading time can exceed the compute time needed for prefill, leaving the system loading-bound rather than compute-bound.
+Figure
+1
+highlights this effect. Even with our optimized I/O mechanism presented in §
+4.2
+, which removes the overhead of small page transfers (the green line), up to 24% of prefill execution time remains stalled on cache loading.
+Schedulers that ignore these I/O-bound characteristics generate imbalanced batches, unable to effectively hide cache-loading delays.
+
+To address the critical bottlenecks identified above, we propose Strata, a hierarchical context caching framework designed for long context language model serving, without performance degradation in small context scenarios.
+Strata introduces a novel I/O mechanism to enable more efficient data transfer among GPU HBM, CPU memory, and disk storage.
+Specifically, Strata employs GPU-assisted data transfer to combat KV cache fragmentation and decouples the GPU’s memory layout from that of other memory tiers.
+Furthermore, Strata reduces long-context overheads through cache-aware request scheduling. It constructs balanced batches that pair sufficient prefill computation to cover I/O latency, and, when cache loading stalls are unavoidable, schedules insert useful complementary tasks (e.g., decoding batches) to fully utilize available compute resources.
+Together, these techniques ensure that scheduling remains efficient even under highly variable latency budgets.
+
+Our implementation of Strata builds upon SGLang
+(
+Zheng et al. 2024
+)
+, a widely adopted open-source framework for LLM serving. Our system also has been deployed in production environments at a leading AI company.
+We conducted a comprehensive evaluation using popular long-context benchmarks, testing across a range of models and representative hardware platforms.
+The results demonstrate that Strata outperforms vLLM + LMCache
+(
+LMCache 2025
+)
+, a state-of-the-art open-source hierarchical context caching solution on TTFT, by up to
+5\times
+, and NVIDIA’s TensorRT-LLM, a highly optimized serving engine, by up to
+3.75\times
+on these demanding workloads, without performance degradation on short-context scenarios.
+
+2.
+Background
+
+2.1.
+Long Context LLM Inference
+
+LLM inference operates in two phases:
+prefill
+and
+decode
+.
+During prefill, the model typically processes both (i) new tokens from the user query and (ii) context tokens, drawn from sources such as documents or prior interactions.
+The intermediate outputs of this step, known as KV caches, are critical for efficiency, as they eliminate the prohibitive cost of recomputation.
+In the subsequent decode phase, the model generates tokens autoregressively, continually reusing and extending the KV cache.
+Thus, efficient cache management is essential to sustaining high-performance serving.
+
+2.2.
+Memory Management of KV Cache
+
+Inspired by virtual memory, PagedAttention
+(
+Kwon et al. 2023
+)
+avoids reserving large contiguous blocks for KV caches by using dynamic, page-based allocation.
+The cache is partitioned into small fixed-size pages that preserve logical sequence order but can be placed non-contiguously in memory, improving utilization.
+Typical page sizes are small—e.g., 32, 16, and 1 tokens in TensorRT-LLM, vLLM, and SGLang—where each token may span from tens of kilobytes to several megabytes.
+While such fine granularity is manageable for compute kernels, it poses serious efficiency challenges for data movement across memory tiers, as we will discuss in §
+3.1
+.
+
+2.3.
+Context Caching in LLM Serving
+
+Beyond intra-request reuse, systems exploit
+context caching
+across requests by identifying common prefixes using structures like prefix trees or hash maps
+(
+Qin et al. 2025
+;
+Kwon et al. 2023
+)
+, widely adopted by providers such as OpenAI
+(
+OpenAI [n. d.]
+)
+and Google
+(
+Google [n. d.]
+)
+.
+To extend capacity, caches are stored in slower tiers such as CPU memory
+(
+Yu et al. 2025
+;
+Jin et al. 2024b
+;
+Gim et al. 2024
+)
+, distributed memory pools
+(
+Hu et al. 2024
+;
+Liu et al. 2024
+;
+Qin et al. 2025
+)
+, or even disk
+(
+Gao et al. 2024
+;
+Jeong and Ahn 2025
+;
+LMCache 2025
+)
+. Recent systems, e.g., CachedAttention
+(
+Gao et al. 2024
+)
+, overlap cache loading with computation on a layer-by-layer basis to minimize stalls, while asynchronously backing up newly generated caches to lower tiers.
+
+3.
+Challenges of Long Context Caching
+
+This paper addresses the challenge of managing large context caches for long-context (i.e., prefill-dominated) workloads.
+While this is not the only LLM scenario (i.e., short context, long generation, or single-turn workloads exist), long-context workloads represent a significant set of important, real-world workloads
+(
+Li et al. 2023
+;
+Kočiskỳ et al. 2018
+)
+.
+We next explore the systems challenges that arise in long-context workloads.
+
+Figure 2.
+Large page sizes decrease cache hit rate and increase TTFT, benchmarked on H200 for Mistral-24B using the ShareGPT dataset.
+
+Figure 3.
+Latency and bandwidth utilization of loading KV caches of 8192 tokens (using page size 32) of Llama-3.1-8B from CPU to GPU on different platforms.
+
+3.1.
+Low Bandwidth Utilization in KV Cache Transfers
+
+The achievable throughput of an I/O subsystem is fundamentally constrained by the relationship described by Little’s Law.
+Let
+\lambda
+be the arrival rate of I/O operations,
+C
+be the average number of concurrent I/O operations, and
+L
+be the average latency per operation.
+According to Little’s Law, we have
+C=\lambda\cdot L
+.
+Let
+X
+represent the sustained data throughput (e.g., in GB/s),
+S
+be the average data size per I/O operation, the throughput can be described as
+X=\lambda\cdot S
+. Combining with Little’s law we have
+X=C\cdot S/L
+describing attainable throughput in a stable state.
+This equation highlights that maximizing data throughput (
+X
+) requires either high concurrency (
+C
+), large transfer sizes (
+S
+), or low latency (
+L
+).
+
+To transfer data between CPU and GPU memory, asynchronous operations like cudaMemcpyAsync are typically used to engage the GPU’s Direct Memory Access (DMA) engine
+(
+Min et al. 2020
+)
+.
+However, the latency (
+L
+) in this scenario includes non-negligible CPU-GPU communication overhead and scheduling delays
+(
+Hwang et al. 2023
+)
+. While concurrency (
+C
+) can be increased by launching numerous asynchronous I/O operations, practical limits arise from the available application-level parallelism (e.g., on the CPU) and the queue capacities within the GPU driver (e.g., CUDA driver) and hardware
+(
+Min et al. 2020
+;
+Qureshi et al. 2023
+)
+.
+Consequently, increasing the transfer size (
+S
+) often becomes the most practical lever for improving bandwidth utilization.
+Saturating modern high-bandwidth interconnects underscores this point; for example, achieving 75-80% of theoretical PCIe 5.0 bandwidth necessitates transfer sizes (
+S
+) in the megabyte range (i.e., 1-2MB).
+This principle is not limited to CPU-GPU transfers; achieving high throughput on other media like SSDs or network interfaces often demands even large transfer sizes
+(
+Eisenman et al. 2019
+;
+McAllister et al. 2021
+;
+Cai et al. 2021
+)
+.
+
+Cost of Large Pages.
+
+However, contrary to requirement of transfer efficiency, LLM inference systems favor small granularity.
+Smaller pages, e.g., in the range of 1-32 tokens, generally lead to better memory utilization
+(
+Kwon et al. 2023
+)
+and can improve cache hit rate
+(
+NVIDIA 2024
+)
+, as cache matching is performed on a per-page basis.
+While increasing the page size (i.e., compacting more tokens into a single continuous page and effectively increasing
+S
+) may appear to improve bandwidth utilization based on the formula, it introduces substantial performance penalties for LLM inference.
+To demonstrate this trade-off, we benchmarked a Mistral-24B model using the popular ShareGPT dataset, varying the KV cache page size from 1 to 1024 on the SGLang framework.
+As shown in Figure
+2
+, increasing the page size leads to a significant drop in the KV cache hit rate. This degradation directly results in a substantial increase in both the average and P90 TTFT, which rise by up to
+2\times
+and
+2.9\times
+, respectively, at the largest page sizes tested.
+We also observed similar trends in long context benchmarking scenario as shown in Figure
+10
+.
+
+This preference for small pages results in significantly small effective transfer sizes (
+S
+) for KV cache operations,
+leading to severely underutilized I/O bandwidth.
+As illustrated in Figure
+3
+, transferring KV cache data for 8192 tokens, achieves only approximately 22% of the theoretical PCIe 5.0 bandwidth.
+Page size is set to 32, a value recommended in prior works on hierarchical KV cache
+(
+Hu et al. 2024
+;
+Gao et al. 2024
+;
+Jeong and Ahn 2025
+;
+Yu et al. 2025
+)
+and a maximum supported size in vLLM for CUDA GPUs
+(
+vLLM Contributors 2025
+)
+.
+This underutilization is exacerbated on platforms with even higher interconnect bandwidths, falling to as low as 5% on systems like NVIDIA’s Grace-Hopper platform that replaces PCIe with NVLink and offers 6x higher peak bandwidth.
+This fundamental trade-off between transfer efficiency and caching benefit underscores the need for a more effective I/O mechanism that can achieve the best of both worlds.
+
+3.2.
+Resource Orchestration and Delay Hits
+
+Typical LLM serving engines often treat GPU compute and HBM as first-class resources, since sub-tasks are usually either compute-bound (e.g., dense and attention computation in prefill) or memory-bound (e.g., decoding).
+With the introduction of hierarchical KV caching, this picture largely remains unchanged. Existing works either regard KV cache loading from CPU to GPU as negligible
+(
+Yu et al. 2025
+;
+Gao et al. 2024
+)
+, assuming the latency of loading cache data of layer
+N+1
+via PCIe can be effectively hidden by overlapping I/O with the computation of layer
+N
+; or else opt for recomputation when the cost is justified
+(
+Jin et al. 2024a
+)
+.
+However, when serving requests with long cached contexts but relatively few new tokens to prefill, this assumption breaks down.
+On one hand, the latency of bulk KV cache transfers can exceed what layer-level computation can hide;
+on the other hand, recomputation becomes increasingly costly as context length grows, making it an unattractive alternative.
+Consequently, layer-wise overlapped prefill can degrade into a PCIe bandwidth–bound task.
+Figure
+1
+illustrates this bottleneck: even with an I/O mechanism achieving 75% of theoretical PCIe bandwidth, stalls still account for up to 24% of prefill execution time.
+
+Compounding this challenge is the
+delay hit phenomenon
+
+(
+Atre et al. 2020
+)
+, previously studied in the networking community, which arises when multiple requests for the same data object arrive and queue while an initial cache miss is still being resolved.
+We observe an analogous effect in LLM serving: under high traffic, multiple requests may target the same (or a prefix of the same) context.
+As illustrated in Figure
+7
+, when such requests are grouped into the same batch, redundant prefill computation occurs. This problem is exacerbated by the asynchronous schedulers widely adopted in modern serving engines
+(
+Team 2024
+;
+Zhu et al. 2025
+)
+, which prepare the next batch before the ongoing one completes, extending the cache-miss resolution window to the full execution time of a batch and making delay hits more likely.
+The impact is especially severe in long-context scenarios, where both recomputation cost and cache-miss resolution time scale unfavorably.
+
+These observation highlight the need to re-think scheduling policies in LLM serving. In particular, schedulers must explicitly treat CPU-GPU bandwidth as a first-class resource, balancing computation and data transfer when batching requests, more strategically overlapping I/O with compute, and mitigating delay hits to avoid redundant work while sustaining throughput.
+
+4.
+Strata’s Design and Implementation
+
+Figure 4.
+System Architecture of Strata
+
+4.1.
+Overview
+
+Motivated by challenges discussed in §
+3
+, we built Strata, a system with two key components.
+The Strata
+Cache Controller
+(§
+4.2
+) manages the data plane elements throughout the memory hierarchy.
+It introduces an optimized GPU-CPU data transfer mechanism and manages KV cache memory layouts to support efficient small page transfers as motivated in §
+3.1
+.
+The Strata
+Scheduler
+(§
+4.3
+) implements the control plane that intelligently schedules requests in a cache resource-aware manner as motivated in §
+3.2
+.
+It references a
+HiRadixTree
+, which is an extension to SGLang’s RadixTree
+(
+Zheng et al. 2024
+)
+, effectively serving as a page table and stores metadata about each KV cache page.
+
+Figure
+4
+presents the Strata architecture.
+When a request is submitted, it enters a request waiting queue.
+During the execution of the ongoing batch, the
+Scheduler
+continuously estimates available system resources and the resource demands of queued requests, and selects a subset to form the next batch.
+The
+Scheduler
+then sends this batch to GPU executor and initiates a KV cache loading request to the
+Cache Controller
+.
+During the execution of the prefill batch, the GPU executor synchronizes with
+Cache Controller
+to ensure that the KV cache of certain layer is available before the execution.
+Once prefill is complete, the prefilled requests are merged into a consolidated decoding batch via continuous batching
+(
+Yu et al. 2022
+)
+.
+Strata uses a P-D co-location design, alternating the execution of prefill and decoding batches temporally on the same GPU, and follows SGLang’s practice to prioritize the execution of prefill batch for shorter response time (TTFT) and to form a larger decoding batch for higher throughput.
+Finally, the
+Cache Controller
+actively manages the backup and eviction of any KV cache pages to lower memory hierarchies asynchronously.
+
+4.2.
+Efficient KV Cache I/O
+
+To address the limitations discussed in §
+3.1
+, inspired by established practices within the computer architecture community
+(
+Min et al. 2020
+;
+Qureshi et al. 2023
+)
+, Strata leverages
+GPU-assisted I/O
+to transfer KV cache pages between CPU and GPU memory for low-latency I/O on small, fragmented data.
+Specifically, instead of invoking standard
+cudaMemcpyAsync
+API repetitively with small data transfers, a GPU-assisted I/O job operates by launching a CUDA kernel. This kernel spawns thousands of threads. Each thread is responsible for loading a small chunk of data from a source (either GPU global memory or CPU registered pinned memory) into its local register files and then streaming this data to a destination (which can also be GPU global memory or registered CPU pinned memory).
+
+GPU-assisted I/O offers several advantages:
+First, it enables
+enhanced concurrency
+(
+C
+): GPUs provide massive, cost-effective parallelism, supporting thousands of concurrent I/O operations compared to typically only tens on CPUs.
+Second, it is
+compatible with small transfers
+(efficient
+S
+): the granularity required for efficient GPU-assisted I/O is only 128 bytes on most architectures
+(
+NVIDIA Corporation 2025
+)
+, which is sufficiently fine for single-page KV caches (kilobytes), eliminating the need to inflate page size for efficiency.
+Finally, it allows
+flexible memory layout
+: since light computation in I/O kernels is virtually free, layout transformations between GPU and CPU memory can be performed at negligible cost, enabling flexible and efficient data organization (see §
+4.2.1
+for details).
+
+Figure 5.
+
+Performance interference vs. resources allocated to the KV-cache I/O kernel. Measurement on concurrently running Strata ’s I/O kernel with a prefill pass (batch of two requests with 4k input each) and a decode pass (batch of 16 requests with 4k input each), respectively.
+
+However, a challenge associated with GPU-assisted I/O, as highlighted in prior work
+(
+Hwang et al. 2023
+)
+, is runtime interference when co-running with other kernels.
+Without dedicated hardware handling the fine-grained I/O tasks, GPU threads consume valuable resources, such as register files and execution cycles, and can lead to cache pollution.
+Prior work
+(
+Ma et al. 2020
+)
+also demonstrated that GPU hardware schedulers often struggle to effectively manage this resource contention, potentially degrading the performance of both the I/O operations and concurrent computational kernels.
+
+We observe that efficient data transfer does not need to monopolize the entire GPU.
+Strata employs a strategy of launching a small number of large CUDA blocks to incentivize the GPU’s hardware scheduler to confine these I/O kernels to a small subset of Streaming Multiprocessors (SMs), as few as 1.
+This targeted allocation, when combined with low-level instructions to bypass the cache and thereby mitigate pollution, minimizes interference with concurrent workloads.
+Moreover, with the ROCm backend
+(
+Advanced Micro Devices, Inc. 2025
+)
+, these kernel implementations are also compatible with AMD GPUs.
+To balance resources for overall efficiency, we conducted microbenchmarks co-running I/O kernels with prefill and decoding kernels on an NVIDIA H200 GPU.
+As shown in Figure
+5
+, using only two CUDA blocks of 1024 threads each, Strata achieves nearly 50 GB/s transfer throughput while incurring less than 5% performance degradation on prefill and 10% on decoding. Based on these results, we select two blocks as the default quota for loading data from CPU to GPU (a critical path operation), and one block for backing up data from GPU to CPU (a non-critical path),
+where the bandwidth is already sufficient and overhead must be minimized.
+Our end-to-end evaluation confirms that this configuration sustains high I/O bandwidth while keeping overall performance impact under 5%, demonstrating that carefully tuned GPU-assisted I/O can be both efficient and non-intrusive.
+
+Figure 6.
+Layer-first v.s. Page-first layouts
+
+4.2.1.
+Data Management Beyond Host Memory
+
+When external storage is involved, the cache controller opportunistically prefetches data from storage to host memory when a cache hit is detected at the storage layer.
+The latency of this prefetch overlaps the request’s queuing delay.
+Once the scheduler dispatches the request for execution, the cache controller terminates any in-flight prefetch and leverages the available cache already in host or GPU memory.
+This best-effort approach is motivated by the significantly higher and less predictable latency of the storage layer compared to the data transfers between host and GPU memory, which Strata adopts a layer-wise overlapping approach.
+
+Furthermore, the data transfer inefficiency caused by fragmented memory layout, as motivated in §
+3.1
+, also extends to other storage media.
+In addition to small pages, LLM serving systems also favor a layer-first memory layout in the GPU memory pool (shown in Figure
+6
+), as it aligns with the layer-wise nature of LLM computation.
+However, this layout further fragments data, hindering bulk data transfer efficiency.
+An alternative, transfer-friendly layout that arranges layers of a page contiguously would be ideal for I/O but would require an layer of indirection for computation, complicating kernel implementation.
+
+By leveraging GPU-assisted I/O, Strata resolves this conflict by enabling a virtually free, on-the-fly transformation between the compute-friendly and transfer-friendly layouts.
+To perform the layout transformation, a thread simply applies one additional arithmetic operation to its assigned offset to calculate the correct destination address.
+This operation has negligible overhead. As illustrated in Figure
+6
+, this capability decouples the layout requirements across the memory hierarchy: the GPU can maintain its computation-friendly layer-first layout, while other media, such as host memory and external storage, can adopt a page-first layout that maximizes transfer efficiency with larger, contiguous data blocks.
+In §
+5.3.4
+, we demonstrate how this decoupled layout strategy significantly reduces data loading time.
+
+Figure 7.
+Scheduling Policies of Strata, where orange blocks indicate prefill batches experiencing cache miss, green indicates cache hit on device, purple indicates cache hit on host memory, blue indicates data transfer, and the one decoding batch is colored in gray.
+
+4.3.
+Cache Aware Scheduling
+
+As motivated in §
+3.2
+, the goal of the scheduler is to maximize caching benefit by avoiding delay hit and loading stall.
+The
+Scheduler
+does so through three stages.
+First, it identifies requests that are potentially susceptible to delay hits and
+defer the execution
+to right after the delay hit resolved.
+This eliminates unnecessary cache miss without impacting on TTFT.
+Secondly, it
+formulates a balanced batch
+that aims to pair with loading (from host memory) with sufficient computation to hide the loading latency.
+Finally, in the event that batches are still loading-bound, the
+Scheduler
+
+hides I/O stalls
+by inserting useful compute inside bubbles.
+
+4.3.1.
+Deferral on Delay Hit
+
+As discussed in §
+3.2
+, delay hits can cause redundant computation in two scenarios: (i) when multiple requests sharing the same cache miss are scheduled into the same batch (Figure
+7
+), and (ii) when the execution of a request is prepared asynchronously without awareness that the corresponding context cache is still being computed.
+To keep track of potential delay hit, we introduce
+transient nodes
+in the HiRadixTree. Similar to standard nodes, they use token IDs as traversal keys, but instead of pointing to memory indices, they carry one of two marks:
+in-queue
+, indicating that a request is referencing a new context, and
+in-flight
+, indicating that the cache for the corresponding tokens is under computation. When iterating over the request queue, Strata inserts transient nodes marked
+in-queue
+as needed. If a request matches existing transient nodes, it is deferred to the next scheduling round but placed at the front of the waiting queue to benefit from the soon-to-be-hot cache and minimize its impact on TTFT.
+
+When a request proceeds to execution, its associated transient nodes are marked
+in-flight
+. Upon completion, the nodes are converted into standard nodes, with indices pointing to the ready context cached in memory.
+To prevent unnecessary deferrals, Strata uses a configurable threshold: a request is deferred only when the number of token matches on transient nodes exceeds this value. In practice, a default threshold of 100 active token matches proved effective.
+
+Algorithm 1
+
+Balanced Batch Formation
+
+1:
+
+procedure
+
+AddBundleHit
+(
+Q,B
+)
+
+2:
+
+for
+each
+r
+in
+Q
+
+do
+
+3:
+
+if
+
+B.\mathrm{is\_bundle\_hit}(r)
+
+then
+
+4:
+
+B.\mathrm{add}(r)
+;
+Q\leftarrow Q-r
+
+5:
+
+function
+
+BatchFormation
+(
+Q
+)
+
+6:
+
+B\leftarrow\mathrm{Batch}()
+;
+D\leftarrow[]
+
+7:
+
+B.\mathrm{add}(Q.\mathrm{pop}(0))
+;
+AddBundleHit
+(
+Q,B
+)
+
+8:
+
+while
+
+|Q|>0
+
+and
+
+\neg B.\mathrm{is\_full}()
+
+do
+
+9:
+
+r\leftarrow Q.pop(0)
+
+10:
+
+if
+
+B.\mathrm{loading\_bound}(r)
+
+then
+
+11:
+
+D.\mathrm{append}(r)
+
+12:
+
+else
+
+13:
+
+B.\mathrm{add}(r)
+;
+AddBundleHit
+(
+Q,B
+)
+
+14:
+
+for
+each
+r
+in
+D
+
+do
+
+15:
+
+if
+
+B.\mathrm{is\_full}()
+
+then
+
+break
+
+16:
+
+B.\mathrm{add}(r)
+
+17:
+
+return
+
+B
+
+4.3.2.
+Balanced Batch Formation.
+
+After removing candidates susceptible to delay hits, the scheduler selects requests to form the next prefill batch.
+In most LLM serving engines
+(
+Zheng et al. 2024
+;
+Kwon et al. 2023
+)
+, batch formation follows a FIFO policy by default, where requests are taken in arrival order until the batch is full (either reaching a preset token limit or exhausting GPU memory).
+To address the loading-bound issue discussed in §
+3.2
+, Strata introduces a new batch formation mechanism that balances data loading with sufficient computation.
+An example is illustrated in Figure
+7
+, a batch containing requests C and D0 would require loading both contexts, causing a loading stall.
+In contrast, forming a different batch (C, F) could get the loading of C overlapped.
+A special case worth noting is the other new batch (D0, D1): since they share the same context, batching them not only balances loading with compute but also reduces GPU memory usage and on-device bandwidth pressure, further improving efficiency.
+We refer to this as a
+bundle hit
+, on the opposite of
+delay hit
+.
+
+The procedure is detailed in Algorithm
+1
+. Before each batch is formed, the scheduler obtains the
+load
+and
+compute
+requirements of each request using the HiRadixTree.
+During batch formation, as it iterates through the queue, the scheduler checks whether adding a request would reach the loading-bound limit (‘loading_bound’ in line 11), defined as the ratio of aggregated load to compute.
+When this ratio exceeds a threshold, the batch is considered loading-bound.
+This threshold is hardware- and model-dependent and thus can be profiled separately; in practice, Strata uses a default ratio of 100, corresponding to the point where stalls begin to appear showed in Figure
+1
+.
+If the request would fit into the batch without making it loading-bound, it will be added into the batch, then the scheduler will iterate through all the rest requests to preferentially add requests that bundle-hit with it.
+Otherwise, the request is moved to a deprioritized list.
+If the batch is not full till the end of the queue, the scheduler supplements it with deprioritized requests (line 17).
+To prevent starvation, deprioritized requests retain their original order, and each batch formation always begins with the first request in the queue.
+
+4.3.3.
+Hide Loading Stall with Bubble Filling
+
+Even with balanced batching, some batches can still be loading-bound.
+The final strategy of the scheduler is
+bubble filling
+that overlaps loading stalls with useful computation.
+An example is illustrated in Figure
+7
+, when request G requires a long context load, the scheduler defers computation of the prepared prefill batch and instead issues a decoding batch to the model executor to run concurrently with the context loading.
+This strategy complements SGLang’s default prefill-first policy (as discussed in §
+4.1
+), allowing some flexibilities when choosing between prefill and decoding for improved overall utilization.
+Although decoding batches are also I/O-bound, they primarily saturate HBM bandwidth, whereas loading tasks saturate PCIe bandwidth. This distinction enables the two operations to overlap with minimal resource contention.
+It is also possible to insert an prefill batch to fill the bubble if available, which will be more applicable to P-D disaggregated systems
+(
+Zhong et al. 2024
+)
+.
+
+5.
+Evaluation
+
+5.1.
+Methodology
+
+Testbed.
+
+We evaluate Strata and baselines on two platforms.
+The
+H200
+platform is a node equipped with 8 NVIDIA H200 GPUs interconnected with NVLink, an Intel Sapphire Rapids CPU, and 1.6TB of DRAM.
+Each GPU is connected to the CPU via a PCIe 5.0 x16 link, offering up to 64 GB/s of peak bandwidth (unidirectional).
+The
+GH200
+platform is a GH200 Grace Hopper superchip
+(
+NVIDIA 2025a
+)
+node, which contains one NVIDIA H100 GPU integrated with one NVIDIA Grace 64-core ARM CPU.
+The
+GH200
+system is equipped with 464GB of LPDDR5X DRAM, providing up to 384 GB/s of memory bandwidth (unidirectional) to the CPU.
+
+Baselines.
+
+We compare Strata with following state-of-the-art baselines.
+
+vLLM
+
+(
+Kwon et al. 2023
+)
+is a popular open-source serving engine.
+Additionally,
+vLLM-LMCache
+enables hierarchical caching on vLLM using the official community extension of LMCache
+(
+LMCache 2025
+)
+.
+For our benchmarks, we used vLLM v0.8.5 and LMCache v0.2.1.
+The LMCache chunk size is set to 256 as default and vLLM page size was set to 32 in line with prior work
+(
+Gao et al. 2024
+)
+.
+
+TensorRT-LLM
+
+(
+NVIDIA 2025b
+)
+is an open-source serving library from NVIDIA, specialized for NVIDIA GPUs.
+Additionally,
+TensorRT-HiCache
+enables hierarchical caching on top of TensorRT-LLM through its automatic CPU memory offloading feature.
+We used TensorRT-LLM v0.17.0 in our benchmarks, with the page size also set to 32 as default.
+
+SGLang
+
+(
+Zheng et al. 2024
+)
+is an open-source serving engine that delivers comparable performance to vLLM, while offering a more lightweight and customizable architecture.
+To enable a direct comparison to Strata, we implemented
+SGLang-HiCache
+which incorporates a state-of-the-art layer-wise KV cache transfer overlapping and hierarchical caching implementation using
+cudaMemcpyAsync
+transfers, which is in line with prior work including CachedAttention
+(
+Gao et al. 2024
+)
+, Pensieve
+(
+Yu et al. 2025
+)
+and FlashGen
+(
+Jeong and Ahn 2025
+)
+.
+We used SGLang v0.4.5 for all three systems.
+We set the page size for
+SGLang
+and Strata to 1 (SGLang’s default), and the page size for
+SGLang-HiCache
+to 32 to be consistent with other hierarchical cache baselines.
+
+Models.
+
+We utilize three popular open-source LLMs with long context capabilities, spanning small, medium, and large sizes: Llama-3.1-8B-Instruct
+(
+meta ai 2024
+)
+(128k context window), Qwen2.5-14B-Instruct-1M
+(
+Team 2025
+)
+(1M context window), and Llama-3.1-70B-Instruct
+(
+meta ai 2024
+)
+(128k context window).
+We served the 8B and 14B models using a single GPU, and served the 70B model using 4 GPUs configured with tensor parallelism.
+
+LooGLE
+
+NarrativeQA
+
+ReviewMT
+
+ShareGPT
+
+avg. in
+
+21613
+
+54797
+
+17708
+
+680.9
+
+avg. out
+
+15.60
+
+13.00
+
+208.3
+
+260.9
+
+# contexts
+
+105
+
+50
+
+100
+
+-
+
+# queries
+
+2410
+
+1461
+
+1092
+
+200869
+
+Table 1.
+Dataset statistics.
+
+Datasets.
+
+We construct workloads from three long context datasets.
+
+LooGLE
+
+(
+Li et al. 2023
+)
+features long documents from diverse sources such as arXiv, Wikipedia, and movie/TV scripts.
+In our benchmarks, we use its Wikipedia portion, which provides both long and short queries paired with the documents.
+
+NarrativeQA
+
+(
+Kočiskỳ et al. 2018
+)
+is an influential long-context dataset for testing models’ reading comprehension capabilities, featuring even longer context examples than LooGLE. We filtered documents exceeding 128k tokens because of context window limit of the test models, and sampled 50 documents from the remainder.
+These two datasets mirror classic RAG use cases, in which extensive contexts are repeatedly queried by multiple users over time like question
+-
+answering systems over technical manuals
+(
+Gao et al. 2023
+)
+.
+
+ReviewMT
+
+(
+Tan et al. 2024
+)
+is a multi-agent conversation dataset, where agents simulate reviewers to converse about the quality of technical papers to make final decisions. This represents a typical agentic workflow involving long contexts.
+We also include a dataset to evaluate Strata’s performance in short-context scenarios.
+
+ShareGPT
+is a popular conversational dataset comprised of a large collection of conversation histories from thousands of users, and was used in prior hierarchical KV caching studies
+(
+Gao et al. 2024
+;
+Yu et al. 2025
+)
+.
+Table
+1
+summarizes the characteristics of these datasets.
+
+Since individual query timestamps are not available in these datasets, we simulate query arrivals using a Poisson distribution to benchmark the system using varying request rates, following prior works
+(
+Yu et al. 2025
+;
+Jeong and Ahn 2025
+)
+.
+For conversational benchmarks (ReviewMT and ShareGPT), we preserve dependencies across conversation rounds. Consistent with the methodology in Pensieve
+(
+Yu et al. 2025
+)
+, we insert a 60-second “thinking time” between an LLM’s response and the user’s subsequent query for ShareGPT.
+For the long-context benchmarks, queries are randomly sampled from the dataset. In §
+5.3.3
+, we further examine the performance characteristics under different workload patterns.
+To avoid execution timeouts, we cap the maximum number of in-flight queries at 128 across all benchmarks.
+GPU memory is allocated according to each serving engine’s default policy to ensure fairness and performance.
+An exception is the ShareGPT dataset, where we restrict GPU memory to approximately 500K tokens to highlight the behavior of hierarchical caching baselines.
+For caching configurations that utilize CPU memory, we allocate 1 TB of system DRAM as pinned memory (400 GB on GH200 due to platform limits).
+Disk storage is not used in all benchmarks due to limited support in baseline systems.
+
+Figure 8.
+
+End-to-end benchmark performance comparison on H200.
+
+5.2.
+End-to-end Performance Comparison
+
+Strata is designed to improve long-context serving by reducing response latency and increasing overall throughput.
+Accordingly, we evaluate the system using two primary metrics: average Time To First Token (TTFT) and output token throughput. TTFT captures query response time, a key determinant of user experience, while output token throughput is a widely adopted metric for characterizing LLM serving system performance
+(
+art [n. d.]
+)
+.
+
+5.2.1.
+How does the performance of Strata compare to state-of-the-art LLM serving systems on long-context workloads?
+
+Figure
+8
+presents the achieved token throughput and corresponding average TTFT for each system under varying request rates across three models and four datasets.
+First, we observe that
+hierarchical caching is essential for high-performance long-context serving
+.
+Across all three models, non-hierarchical caching solutions perform poorly on LooGLE. Without hierarchical caching, long-context workloads rapidly exhaust GPU memory capacity, leading to frequent cache misses during prefills. This, in turn, triggers repeated recomputation, resulting in low throughput and high latency. By contrast, systems equipped with hierarchical caching achieve substantially higher throughput and lower latency, consistently reaching approximately 95% cache hit rate by leveraging CPU memory.
+
+Second,
+Strata delivers substantial improvements over existing hierarchical caching solutions
+.
+For Llama-8B on LooGLE, Strata achieves up to
+3.2\times
+,
+2.6\times
+, and
+1.9\times
+higher throughput at the same TTFT compared to
+SGLang-HiCache
+,
+vLLM-LMCache
+, and
+TensorRT-HiCache
+, respectively. Similar gains are observed for Qwen-14B and Llama-70B: with Qwen-14B, Strata achieves up to
+3.9\times
+,
+2.1\times
+, and
+1.9\times
+improvements; with Llama-70B, the gains reach
+5\times
+,
+5\times
+, and
+3.75\times
+.
+A consistent trend is seen on ReviewMT. Despite longer decoding reduces the dominance of prefill time, with Llama-8B, Strata outperforms
+vLLM-LMCache
+by
+2.3\times
+,
+TensorRT-HiCache
+by
+2.3\times
+and
+SGLang-HiCache
+by
+1.7\times
+.
+These performance gains stem from Strata ’s enhanced I/O efficiency and scheduling mechanisms, as further analyzed in §
+5.3.1
+.
+
+5.2.2.
+How does Strata perform with a warm cache at steady state?
+
+NarrativeQA presents much longer average context lengths, resulting in an extensive prefill phase that made non-hierarchical caching solutions impractical.
+Because this scenario presented the highest amount of memory pressure, we augmented this experiment to better understand steady-state performance characteristics (i.e., after the cache hierarchy has been filled)
+1
+1
+
+1
+
+NarrativeQA without pre-warming achieves similar results to the Loogle workload. We omit results for this scenario due to space.
+.
+In this setup, we first warmed up the CPU memory by pre-computing KV caches for all contexts in the evaluation set and then flush the KV cache on GPU memory to set initial state.
+Second row of Figure
+8
+reports the throughput-latency curve after restarting the workload post-warmup.
+We report Strata,
+SGLang-HiCache
+, and
+vLLM-LMCache
+, as
+TensorRT-HiCache
+does not support pre-warming.
+In this setting, Strata achieves up to
+2.3\times
+,
+2.6\times
+and
+2.5\times
+throughput compared with
+vLLM-LMCache
+on Llama-8B, Qwen-14 and Llama-70B models respectively.
+
+5.2.3.
+How does the performance of Strata compare to state-of-the-art LLM serving systems on short-context workloads?
+
+Strata was explicitly designed for long-context workloads.
+To understand the performance of Strata on short-context workloads, the final row of Figure
+8
+shows the average TTFT of the baseline systems, across three models, on the ShareGPT dataset.
+Note that underlying SGLang engine exhibits a slight performance disadvantage compared to the base engines of vLLM and TensorRT-LLM on the Llama-8B and -70B models due to kernel differences.
+Taking this into account,
+Strata demonstrates comparable performance to the other state-of-the-art systems on short-context workloads
+.
+
+5.3.
+In-depth Performance Analysis
+
+In this section, we conduct several breakdown analyses to better understand the performance benefits offered by Strata. All analyses presented here were conducted using the Qwen-14B model on an H200 platform.
+
+Figure 9.
+Breakdown of I/O and scheduling of Strata.
+
+5.3.1.
+How much does efficient I/O and scheduling benefit Strata?
+
+Figure
+9
+presents the throughput–latency curves of Strata compared to three baselines.
+On top of
+SGLang-HiCache
+, we build and evaluate three ablated variants:
+
+Strata-IO
+, which incorporates the GPU-assisted I/O mechanism from §
+4.2
+,
+
+Strata-Schedule-Only
+, which applies the scheduling policy from §
+4.3
+, and
+Strata-IO-LPM
+, which integrates a longest prefix match (LPM) policy
+(
+Zheng et al. 2024
+)
+.
+
+The results show that both the
+Strata-scheduling
+and
+Strata-IO
+components significantly improves the baseline hierarchical design, achieving up to
+1.8\times
+and
+2.3\times
+higher peak throughput, respectively. Each component alleviates the loading stall problem from a different perspective. Under low request rates,
+Strata-scheduling
+tends to deliver greater gains than
+Strata-IO
+, since smaller batch sizes generate lighter I/O pressure that can be more effectively mitigated by advanced scheduling. As the request rate increases, however, the I/O subsystem becomes the dominant bottleneck, making the GPU-assisted I/O mechanisms essential for sustaining high throughput.
+
+We further compare
+vLLM-LMCache
+and
+TensorRT-HiCache
+directly with
+Strata-IO
+, since all three employ CUDA kernels to accelerate KV-cache I/O. As shown in Figure
+9
+, their performance is comparable at low request rates, but
+Strata-IO
+maintains higher throughput as the request rate rises, indicating more effective mitigation of interference at scale.
+We also compare Strata with
+Strata-IO-LPM
+, which increases the reuse count of on-device pages, thereby indirectly reducing host-side loading pressure and improving performance under low request rates.
+However, at higher request rates, it fails to sustain performance gains due to more frequent cache evictions.
+In contrast, Strata consistently delivers improvements because it explicitly accounts for bandwidth resources in its design.
+
+Figure 10.
+
+Performance comparison between Strata +IO and SGLang+HiCache with different page sizes.
+
+5.3.2.
+Can Strata alleviate the burden of choosing a page size?
+
+As discussed in §
+3.1
+, page size introduces inherent trade-offs among cache hit rate, I/O efficiency, and overall performance. This makes selecting the optimal page size a practical but non-trivial problem.
+In contrast, with the GPU-assisted I/O mechanisms described in §
+4.2
+, Strata achieves consistently high I/O efficiency regardless of page size, effectively removing this burden from users.
+To validate this claim, Figure
+10
+reports the peak throughput of
+SGLang-HiCache
+across different page sizes, normalized to
+Strata-IO
+. For
+SGLang-HiCache
+, increasing the page size initially improves throughput, since larger pages reduce loading stalls. However, beyond a certain threshold, throughput declines as cache hit rate deteriorates. Even at its best-performing setting (page size 512),
+SGLang-HiCache
+achieves only 93% of
+Strata-IO
+’s performance, primarily due to a 2.4% lower cache hit rate.
+
+5.3.3.
+Can Strata adapt to varying cache distances?
+
+Cache distance is an important property of a trace for testing cache system performance.
+To further augment the cache distance (i.e., access patterns between similar requests) of our workloads, we generate two additional workloads based on the LooGLE dataset.
+In addition to our original (
+shuffle
+) workload, we create a
+minimum cache distance
+workload, where requests sharing the same context are lined up together, and a
+maximum cache distance
+workload, where queries sharing the same context evenly distributed in the queue.
+
+As shown in Figure
+11
+, we observe that with minimal cache distance, there is no need for hierarchical caching due to the perfect locality.
+In this scenario, delay hit mitigation benefits the most by improving effective cache hit rate, increasing peak throughput by
+42\%
+.
+However, delay hit mitigation offers no benefit on max cache distance scenario because the high distance between similar requests naturally reduces the likelihood of the delay hit phenomenon.
+In contrast,the I/O efficiency mechanisms presented in §
+4.2
+result in an improvement of
+76\%
+and
+95\%
+for the shuffle and maximum cache distance, respectively, as larger cache distances result in more cache hits to CPU DRAM.
+On top of that, balance batch further introduces
+11\%
+and
+12\%
+of the peak throughput improvement, respectively.
+Stall hiding further introduce
+8\%
+and
+3\%
+for shuffle and max cache distance, with higher benefit to the shuffle pattern due to higher variance.
+
+Figure 11.
+
+Breakdown of Strata’ optimization attributions on different workload patterns.
+
+Figure 12.
+Latency of loading KV caches of 8192 tokens (using page size 32) of different models from a local disk to CPU memory with different memory layouts.
+
+5.3.4.
+Does the decoupled memory layout benefit disk caching?
+
+GPU-assisted I/O enables the use of a page-first layout in CPU memory without requiring changes to the GPU memory layout, as discussed in §
+4.2.1
+.
+Figure
+6
+presents a micro-benchmark demonstrating the benefit.
+Using the same page size of 32, the page-first layout achieves significantly larger transfer sizes, reducing latency by up to
+4\times
+when loading 8192 tokens from disk.
+
+5.4.
+Benchmark on GH200 machine
+
+Figure 13.
+
+A zooming in comparison between benchmarks on PCIe-5.0 and Grace-Hopper platform.
+
+Figure 14.
+
+Sustained Bandwidth comparison.
+
+Finally, we explored how Strata aligns with emerging hardware trends that dramatically increase the bandwidth between CPU and GPU.
+To do so, we benchmarked
+SGLang-HiCache
+,
+Strata-IO
+and
+Strata
+on both our H200 and GH200 platform.
+We also report an
+Strata-Oracle
+platform, which simulates the TTFT achieved by a system that had infinite bandwidth between the CPU and GPU.
+
+Figure
+13
+report the average TTFT achieved by
+SGLang
+,
+Strata-IO
+, and
+Strata
+across both of these platforms benchmarking Llama-3.1-8B models with LooGLE dataset.
+Figure
+14
+reports the averaged sustained bandwidth for the same task.
+We observe that, in line with our previous evaluation results, standard DMA-managed memory copy is not able to effectively utilize hardware improvement without using larger pages.
+While the improved bandwidth of GH200 improves latency for the SGLang baseline, only hardware improvements alone cannot outperform even Strata-IO on the H200 platform.
+
+In contrast, using
+Strata-IO
+can boost the sustained throughput from
+40
+to
+150
+GB/s.
+However, scheduling improvements are still needed to take full advantage of platforms like Grace Hopper.
+While
+Strata-IO-GH
+achieves higher throughput with higher bandwidth mitigating the I/O stall, it still does not even outperform
+Strata-PCIe
+.
+In summary, Strata’s improved I/O transfer mechanisms
+with
+its bandwidth-aware scheduler can take full advantage of emerging platforms like Grace Hopper, achieving comparable performance to the Oracle platform.
+These benchmarks reveal that while increased interconnect bandwidth is beneficial, it’s often under-utilized by existing software. Ideally, leveraging new hardware capabilities, as demonstrated by
+Strata-GH
+’s near-oracle performance, could unlock new possibilities. Specifically, this platform shows promise for specialized, cost-effective, and high-performance long-context serving.
+
+6.
+Related Work
+
+Context Caching and Sharing.
+
+Prior studies have explored various mechanisms for reusing KV caches to eliminate redundant recomputation. For instance, SGLang
+(
+Zheng et al. 2024
+)
+employs a RadixTree for tracking shared context.
+Other serving engines, such as vLLM
+(
+Kwon et al. 2023
+)
+and Mooncake
+(
+Qin et al. 2025
+)
+, utilize hashing mechanisms that generate unique page identifiers based on token IDs and prefix page hashes.
+LMDeploy
+(
+Contributors 2023
+)
+adopts a hybrid approach by constructing coarser-grained tries.
+Strata builds upon SGLang by extending its RadixTree to a HiRadixTree.
+Other studies explore KV cache sharing beyond exact prefix contexts, exemplified by CacheGen
+(
+Liu et al. 2024
+)
+, CacheBlend
+(
+Yao et al. 2025
+)
+.
+Unlike these approximate caching schemes,
+Strata does not impact the accuracy of requests.
+
+KV Cache Offloading.
+
+Several recent works have explored utilizing secondary memory tiers (e.g., CPU DRAM, SSDs) for KV cache storage, loading them for computation on demand.
+CachedAttention
+(
+Gao et al. 2024
+)
+and Pensieve
+(
+Yu et al. 2025
+)
+both adopt a layer-wise strategy to overlap KV cache loading with computation. FlashGen
+(
+Jeong and Ahn 2025
+)
+further enhances this pipeline with re-order execution scheduling, which has been implemented in SGLang and used in our baseline settings.
+
+Large-scale KV Cache Disaggregation
+
+Recent works propose building large-scale disaggregated KV cache memory pools and global resource coordinators to achieve caching benefits at a larger scale.
+Mooncake
+(
+Qin et al. 2025
+)
+exploits using resources including CPU, DRAM, SSD and NIC to establish a disaggregated KV
+Cache. MemServe
+(
+Hu et al. 2024
+)
+unifies inter-request and intra-request KV cache optimizations via a global scheduler and an elastic memory pool.
+Strata can benefit from these designs by integrating with their KV cache transfer engines.
+However, Strata focuses on memory management and scheduling within single compute instances and does not inherently rely on specialized hardware, such as high-speed networking, to realize its caching benefits.
+
+7.
+Conclusion
+
+This paper introduced Strata, a hierarchical context caching framework that addresses the key bottlenecks of long-context LLM serving. By combining GPU-assisted I/O to mitigate KV cache fragmentation with cache-aware scheduling to balance computation and data transfer, Strata enables efficient utilization of system resources across diverse latency budgets. Our evaluation demonstrates that Strata consistently outperforms state-of-the-art systems on long-context benchmarks, while maintaining strong performance on short-context workloads. These results establish Strata as a practical and scalable solution for efficient long-context LLM serving. Looking ahead, we plan to further reduce the overhead of GPU-assisted kernels, motivating the design of more versatile on-chip memory I/O accelerators.
+
+Acknowledgements.
+
+We thank Lingfan Yu for insightful discussions on Pensieve.
+We are grateful to NVIDIA and Nebius for providing computational resources.
+We also thank Sicheng Pan, Tingwei Huang, Zhangheng Huang, Arnav Balyan, Zhenwei Pi, Yi Zhang, Shangming Cai, Shiyang Chen, Ke Yang and Ying Sheng from the SGLang open-source community for their valuable feedback and contributions.
+
