@@ -1,0 +1,2847 @@
+StarSD: One-for-Many Speculative Decoding
+Junhao He, Feiran You, Hongyang Du
+
+Abstract
+Speculative decoding accelerates autoregressive generation by separating token proposal from verification, but most existing approaches are designed for single-node execution and do not scale well to multi-accelerator clusters used for serving modern Large Language Models (LLMs). We present StarSD, a one-for-many speculative decoding framework that uses a single draft model to serve multiple target models across distributed nodes via a star topology. StarSD decouples drafting and verification, enabling effective sharing of draft computation, and preventing distributed accelerators from remaining idle under bursty workloads. We provide a system-level analysis that characterizes when and why a single draft model can remain fully utilized by multiple verifiers, yielding predictable latency and utilization gains. Extensive experiments in real-world distributed inference settings demonstrate that StarSD simplifies deployment and supports flexible resource allocation across heterogeneous accelerators, while maintaining output quality. These results indicate that StarSD is a practical and scalable framework for bringing speculative decoding to modern cloud and edge inference infrastructures.
+
+
+
+1
+Introduction
+
+Large Language Models (LLMs) have become a central interface for a wide range of applications, and their deployment increasingly involves serving large volumes of concurrent inference requests in shared accelerator clusters. Under such workloads, inference systems face sustained pressure on latency, throughput, and hardware efficiency, often operating near the limits of memory and compute. A key source of this pressure is
+autoregressive
+decoding, where each output token requires a serial forward pass, directly constraining end-to-end latency and limiting achievable throughput.
+This bottleneck has motivated many decoding acceleration methods that restructure generation to reduce the cost of sequential decoding. Among them, speculative decoding offers a
+lossless
+acceleration approach by introducing a lightweight
+draft
+model to propose multiple tokens that a large
+target
+model verifies in parallel, preserving the target model’s output distribution while reducing decoding time
+(
+8
+;
+2
+)
+.
+Unlike batching or approximate decoding, this separation mechanism preserves exact generation semantics while exposing additional parallelism, which makes speculative decoding suitable for latency-sensitive serving. Building on this advantage, several methods are proposed to improve draft quality and reduce verification costs, thereby further increasing acceptance rates and achieving decoding speedups
+(
+13
+;
+16
+;
+12
+)
+.
+
+However, most speculative decoding designs implicitly adopt a centralized execution mode, in which the draft and target models are co-located on a single accelerator, e.g., a Graphics Processing Unit (GPU).
+This pattern is increasingly misaligned with production inference systems, as modern LLMs continue to grow in parameter scale and deployment workloads impose sustained memory pressure through large Key-Value (KV) caches, causing the combined footprint to approach or even exceed the capacity of a single accelerator.
+For instance, co-locating a Vicuna-7B
+(
+24
+)
+target model with the lightweight EAGLE draft model can leave little memory headroom
+(
+13
+)
+for an RTX 4090 (24GB), restricting support for long-context serving.
+Moreover, as LLMs expand into vertical domains and are increasingly deployed on resource-constrained edge devices, e.g., PCs, mobile phones, or NVIDIA Jetson, co-location becomes even less practical due to tighter memory and compute budgets.
+Although substantial work has explored memory-efficient inference techniques
+(
+7
+;
+19
+)
+, these methods do not remove the need to host the target-draft model pair on every accelerator, which constrains batching efficiency and scheduling flexibility.
+
+Consequently, LLM inference systems require a spatial degree of freedom, enabling distributed placement that allows drafting and verification to be placed independently while cooperating tightly to share accelerator resources. In principle, this flexibility supports higher utilization by decoupling compute-intensive drafting from request-driven verification, and applies both within a single server across multiple accelerators and distributed clusters across machines.
+However, simply separating the draft and target models reveals an accelerator-level inefficiency due to a mismatch between the model inference pattern and the operating characteristics of modern accelerators. Specifically, the draft-then-verify workflow alternates between drafting, verification, and communication, while the target model verifies proposed tokens, the draft model remains idle.
+This alternating execution introduces
+idle gaps
+that limit end-to-end throughput.
+In addition, disaggregation makes the draft execution
+bursty
+, with short compute phases separated by millisecond-scale gaps.
+Such bursty execution can prevent the draft model from staying in a warm compute state, increasing per-token latency and its variance compared to continuous execution.
+
+Addressing these challenges requires a novel speculative decoding framework that can coordinate drafting and verification across machines while sustaining steady execution on modern accelerators. We propose StarSD, a one-for-many distributed speculative decoding framework where a single draft model concurrently assists multiple target instances.
+StarSD multiplexes asynchronous returns through a global request buffer and executes requests in a work-conserving loop with per-instance state isolation, ensuring continuous utilization of the draft accelerator whenever work is available.
+To analyze performance under concurrency, we develop an analytical system model that decouples
+progress
+, measured as the expected number of accepted tokens per round, from
+time
+, measured as the round duration. The model characterizes under-loaded and fully-loaded regimes and identifies the transition point at which idle gaps vanish.
+
+StarSD yields two complementary benefits under multi-instance workloads.
+By amortizing verification and communication return latency across multiple targets, it reduces idle gaps and increases aggregate throughput.
+Furthermore, a continuous request stream keeps the draft side closer to a steady-state execution regime, improving draft-side per-token compute efficiency and stability.
+These effects make speculative decoding more effective in disaggregated and memory-constrained deployments without changing model weights or the output distribution. Our contributions are summarized as
+
+•
+
+We propose StarSD in the one-for-many distributed speculative decoding setting, a framework that isolates per-target state and enables work-conserving draft execution in the presence of asynchronous verification returns from targets.
+
+•
+
+We develop an analytical system model that separates per-iteration progress from per-iteration time, characterizes load regimes, and explains scaling behavior, saturation effects, and the tradeoff between per-target throughput and system-wide throughput.
+
+•
+
+We evaluate StarSD across various deployments, including intra-machine multi-GPU, inter-machine multi-GPU, and heterogeneous platforms such as a Computer-Jetson setup. The results show that StarSD scales throughput with the number of target instances until saturation, with continuous drafting reducing per-token compute time and latency variance compared with bursty execution.
+
+2
+Preliminary
+
+Speculative decoding speeds up autoregressive inference by splitting decoding into two roles, i.e., a lightweight
+draft
+model proposes candidate continuations, and a large
+target
+model verifies them.
+Following the original speculative decoding formulation
+(
+8
+)
+, we denote the target and draft model types by
+\mathcal{M}_{p}
+and
+\mathcal{M}_{q}
+, and use
+M_{p}
+and
+M_{q}
+to refer to their deployed instances, respectively.
+When StarSD serves
+N
+target instances concurrently, we index them as
+\{M_{p}^{(i)}\}_{i=1}^{N}
+. In the single-instance case, we drop the index and write
+M_{p}\equiv M_{p}^{(1)}
+for notational simplicity.
+
+Per-request primitive.
+
+Given a verified prefix, one speculative decoding step contains of two stages:
+(i)
+proposal
+, where the draft instance
+M_{q}
+generates candidate continuations from the prefix, and
+(ii)
+verification
+, where the target instance
+M_{p}
+verifies the proposals and returns an
+accepted prefix
+defined as the longest prefix that passes verification.
+Both models then advance to the accepted prefix and continue decoding.
+
+Tree-based proposals.
+
+SpecInfer
+(
+16
+)
+popularizes
+tree-based
+speculative proposals to better exploit accelerator parallelism.
+Rather than proposing a single token chain,
+M_{q}
+expands a token tree of depth
+d
+with branching factor
+k
+, i.e., top-
+k
+candidates per step, so that the target model can score many candidate continuations in parallel within a batched forward pass.
+Following this design, advanced systems such as EAGLE
+(
+13
+)
+adopt tree-style expansion to increase the likelihood of finding a long verifiable prefix while maintaining high verification throughput.
+In this work, we also adopt the tree-based drafting and use the depth
+d
+to parameterize the draft workload.
+
+Acceptance intuition.
+
+The number of accepted tokens mainly depends on how well
+\mathcal{M}_{q}
+matches
+\mathcal{M}_{p}
+under the current prefix. A smaller draft-target mismatch typically yields longer accepted prefixes.
+Beyond architectural designs, several works explicitly align
+\mathcal{M}_{q}
+to
+\mathcal{M}_{p}
+via training, e.g., DistillSpec
+(
+26
+)
+and AdaSPEC
+(
+6
+)
+use distillation tailored to speculative decoding, while Online Speculative Decoding
+(
+15
+)
+reduces mismatch after deployment by periodically updating
+\mathcal{M}_{q}
+using the corrections from
+\mathcal{M}_{p}
+.
+EAGLE
+(
+13
+;
+14
+)
+complements these training-based approaches by conditioning
+\mathcal{M}_{q}
+on additional signals from
+\mathcal{M}_{p}
+, i.e., last-layer hidden states, making proposals more target-aware.
+
+3
+System Model
+
+We present the system model for StarSD, where one
+M_{q}
+serves
+N
+target instances
+\{M_{p}^{(i)}\}_{i=1}^{N}
+. The model characterizes system throughput as a function of
+N
+and the per-request workload by capturing the expected accepted tokens and the iteration time under different load conditions.
+
+3.1
+Iteration Definitions
+
+System iterations are indexed by
+\gamma=\{1,\ldots,\gamma_{\mathrm{end}}\}
+, where each iteration corresponds to one draft-side scheduling round, and
+\gamma_{\mathrm{end}}
+denotes the total number of scheduling rounds executed during a decoding session. In the
+\gamma
+-th iteration, the draft instance
+M_{q}
+processes one speculative request for each active target instance
+M_{p}^{(i)}
+in a work-conserving order.
+For a given request,
+M_{q}
+generates a speculative draft with depth
+d
+, which is verified by the corresponding
+M_{p}^{(i)}
+, and the verification result is returned to
+M_{q}
+before the next iteration.
+The draft depth
+d
+upper-bounds the per-iteration progress and determines the amount of work for each
+M_{p}^{(i)}
+. This abstraction allows us to analyze system progress and time cost on a per-iteration basis.
+
+3.2
+Per-iteration Acceptance Length
+
+We first quantify the per-iteration progress made by all target instances in one iteration, measured by the number of tokens accepted by
+\{M_{p}^{(i)}\}_{i=1}^{N}
+.
+
+Acceptance probability.
+
+We start from a token-level acceptance notion that captures the agreement between
+\mathcal{M}_{q}
+and
+\mathcal{M}_{p}
+.
+We consider that all target instances
+\{M_{p}^{(i)}\}_{i=1}^{N}
+are instantiated from the same target model type
+\mathcal{M}_{p}
+, which is common in multi-session serving scenarios, e.g., LLM-based multi-agent systems
+(
+9
+;
+3
+;
+23
+)
+.
+The index
+i
+distinguishes concurrent decoding sessions that may have different prefixes and thus different next-token distributions.
+Conditioned on a prefix
+y
+, let the next-token distributions of target
+M_{p}^{(i)}
+and draft
+M_{q}
+be
+p_{i}(\cdot\mid y)
+and
+q(\cdot\mid y)
+, respectively.
+We define the token-level acceptance probability at prefix
+y
+as
+
+\displaystyle\beta_{i}(y)
+
+\displaystyle\triangleq\sum_{x}\min\{p_{i}(x\mid y),\,q(x\mid y)\}
+
+(1)
+
+\displaystyle=1-D_{\mathrm{LK}}\!\left(p_{i}(\cdot\mid y),\,q(\cdot\mid y)\right),
+
+where
+D_{\mathrm{LK}}(p,q)=\frac{1}{2}\sum_{x}|p(x)-q(x)|
+denotes the total variation distance between
+p
+and
+q
+
+(
+8
+)
+.
+This quantity measures how likely a draft proposal from
+M_{q}
+is accepted by
+M_{p}^{(i)}
+under the given prefix
+y
+.
+
+Expected accept length.
+
+We lift token-level acceptance to an iteration-level quantity by defining the accept length.
+Let
+l_{i}(d)\in\{0,1,\dots,d\}
+denote the accept length of
+M_{p}^{(i)}
+in one iteration, i.e., the number of consecutive proposed tokens accepted by
+M_{p}^{(i)}
+.
+This random variable represents the realized per-iteration progress for
+M_{p}^{(i)}
+.
+To obtain the expected accept length, we use a standard tail-sum identity that converts
+\mathbb{E}[l_{i}(d)]
+into a sum of acceptance events.
+
+Lemma 3.1
+
+(Tail-sum identity for bounded accept length)
+.
+
+For any
+l_{i}(d)\in\{0,1,\dots,d\}
+, we have
+
+\mathbb{E}\!\left[l_{i}(d)\right]=\sum_{j=1}^{d}\Pr\!\left(l_{i}(d)\geq j\right).
+
+(2)
+
+The term
+\Pr\left(l_{i}\left(d\right)\geq j\right)
+is the probability that the first
+j
+proposed tokens are all accepted, and their sum yields the expected accept length.
+
+Proof.
+
+Since
+l_{i}(d)
+is non-negative and bounded by
+d
+, it can be written as
+
+l_{i}(d)=\sum_{j=1}^{d}\mathbf{1}\{l_{i}(d)\geq j\},
+
+where
+\mathbf{1}\{\cdot\}
+is the indicator function.
+Taking the expectation on both sides and using the linearity of expectation gives
+
+\mathbb{E}[l_{i}(d)]=\sum_{j=1}^{d}\mathbb{E}[\mathbf{1}\{l_{i}(d)\geq j\}]=\sum_{j=1}^{d}\Pr(l_{i}(d)\geq j).
+
+∎
+
+Closed-form Expression.
+
+A common approximation in speculative decoding analysis is that, within one iteration, token acceptances are i.i.d. Bernoulli with an acceptance rate
+\beta_{i}
+
+(
+8
+)
+. However, later drafts depend on earlier acceptances in practice, so the independence assumption is an analytical simplification
+(
+2
+)
+.
+Under this approximation
+
+\mathbb{E}\!\left[l_{i}(d)\right]\approx\sum_{j=1}^{d}\beta_{i}^{\,j}=\frac{\beta_{i}\left(1-\beta_{i}^{\,d}\right)}{1-\beta_{i}}.
+
+(3)
+
+This expression shows diminishing returns in
+d
+when
+\beta_{i}<1
+, as the marginal gain scales with
+\beta_{i}^{d+1}
+.
+
+Finally, the expected total accepted tokens across
+\{M_{p}^{(i)}\}_{i=1}^{N}
+in one iteration is
+
+\mathbb{E}[l]_{\gamma}\triangleq\sum_{i=1}^{N}\mathbb{E}\!\left[l_{i}(d)\right]\approx\sum_{i=1}^{N}\frac{\beta_{i}\left(1-\beta_{i}^{\,d}\right)}{1-\beta_{i}}.
+
+(4)
+
+This quantity aggregates per-iteration progress and serves as the system progress term when interpreting throughput.
+
+3.3
+Per-iteration Time Decomposition
+
+We turn to the
+time
+component of throughput by characterizing the duration of a single iteration under concurrent service.
+In each iteration,
+M_{q}
+serves
+N
+depth-
+d
+requests, one from each active target instance
+M_{p}^{(i)}
+.
+The service time for a single depth-
+d
+request is
+
+S(d)\triangleq d\,t_{s},
+
+(5)
+
+where
+t_{s}
+is the time for
+M_{q}
+to generate one layer of draft tokens, which remains nearly constant due to parallel execution within a modern accelerator.
+
+After
+M_{q}
+finishes serving a given
+M_{p}^{(i)}
+, the earliest time that
+M_{q}
+can receive the next request from the same
+M_{p}^{(i)}
+is determined by the return time as
+
+Z(d)\triangleq t_{c}+t_{v},
+
+(6)
+
+where
+t_{c}
+is the communication time in one iteration and
+t_{v}
+is the time taken for
+M_{p}^{(i)}
+to verify the received draft tokens.
+
+We consider
+M_{q}
+is work-conserving, whenever the request buffer is non-empty,
+M_{q}
+continuously serves pending requests according to a policy such as first-in-first-out.
+Each target instance
+M_{p}^{(i)}
+issues a new request only after completing verification of its previous one.
+Under these settings, system load is fully determined by the number of concurrent target instances, without additional effects from scheduling or request reordering.
+
+We next characterize the condition under which the draft instance
+M_{q}
+remains continuously busy in StarSD pipeline.
+
+Lemma 3.2
+
+(A sufficient non-idling condition for
+M_{q}
+)
+.
+
+If
+
+Z(d)\leq(N-1)\,S(d),
+
+(7)
+
+then a work-conserving
+M_{q}
+does not idle due to waiting for verification results from any target instance
+M_{p}^{(i)}
+.
+
+Proof.
+
+After
+M_{q}
+completes serving a request from some target instance
+M_{p}^{(i)}
+, the earliest time at which
+M_{p}^{(i)}
+can issue its next request is
+Z(d)
+. During this interval,
+M_{q}
+can serve at most one pending request from each of the remaining
+N-1
+target instances, incurring a total service time of
+(N-1)S(d)
+.
+∎
+
+3.4
+Per-iteration Throughput
+
+As shown in Fig.
+1
+, we consider two cases depending on whether (
+7
+) holds.
+
+Fully-loaded case.
+
+Figure 1
+:
+Execution cases of StarSD under different load conditions.
+
+Fully-loaded case
+where verification and communication delays of each
+M_{p}^{(i)}
+are overlapped, keeping
+M_{q}
+work-conserving with no idle gaps.
+
+Under-loaded case
+where the draft server idles while waiting for a target to return the next request.
+
+When (
+7
+) holds, the return time
+Z(d)
+of any active
+M_{p}^{(i)}
+can be covered by the
+M_{q}
+-side service spent on the other
+N-1
+active
+M_{p}^{(i)}
+.
+As a result, once the request buffer is populated,
+M_{q}
+can continuously serve requests without observable idle gaps.
+In this case, the per-iteration time is
+
+T_{\gamma_{\rm full}}=NS(d),
+
+(8)
+
+since one iteration corresponds to serving
+N
+depth-
+d
+requests (one per active
+M_{p}^{(i)}
+), each taking
+S(d)
+time on
+M_{q}
+.
+
+Under-loaded case.
+
+When (
+7
+) does not hold, serving the other
+N-1
+active
+M_{p}^{(i)}
+for a total of
+(N-1)S(d)
+time may still be insufficient for the original
+M_{p}^{(i)}
+to complete its return within
+Z(d)
+.
+In this case,
+M_{q}
+can become idle due to a temporary lack of pending requests.
+We quantify this additional waiting time by defining the idle gap per iteration
+
+T_{\mathrm{idle}}\triangleq\max\!\left\{0,\;Z(d)-(N-1)S(d)\right\}.
+
+(9)
+
+Thus, the general per-iteration time can be expressed as
+
+T_{\gamma}=NS(d)+T_{\mathrm{idle}}.
+
+(10)
+
+Finally, we define the throughput in the
+\gamma
+-th iteration as
+
+O_{\gamma}\triangleq\frac{\mathbb{E}[l]_{\gamma}}{T_{\gamma}}.
+
+(11)
+
+This definition decouples the expected progress
+\mathbb{E}[l]_{\gamma}
+from the time cost
+T_{\gamma}
+, making clear whether throughput is limited by acceptance or by the iteration time overheads.
+It also enables case-wise interpretation through (
+8
+) and (
+10
+).
+
+4
+StarSD Implication
+
+This section translates the analytical conditions into StarSD implication principles and examines how throughput scales as the number of target instances increases.
+
+4.1
+StarSD Design
+
+Algorithm 1
+
+StarSD One-for-Many Serving Runtime
+
+Input:
+
+M_{q}
+,
+\{M_{p}^{(i)}\}_{i=1}^{N}
+, Prefix
+\hat{y}
+.
+
+Preparation:
+
+\boldsymbol{\cdot}
+Handshake: assign each target a unique
+
+\boldsymbol{\cdot}
+
+tag
+and establish a dedicated port.
+
+\boldsymbol{\cdot}
+
+\mathcal{C}[\texttt{tag}]
+: per-session KV cache for
+tag
+.
+
+\boldsymbol{\cdot}
+
+\mathcal{Q}_{in}
+: global request buffer
+(\texttt{tag},y)
+.
+
+\boldsymbol{\cdot}
+
+\mathcal{Q}_{out}
+: outgoing queue of replies
+(\texttt{tag},\hat{y})
+.
+
+1:
+
+## In machine hosting
+M_{p}^{(i)}
+
+2:
+
+if
+
+recv
+
+\hat{y}
+from
+M_{q}
+
+then
+
+3:
+
+y\leftarrow M_{p}^{(i)}(\hat{y})
+
+// refer to Algorithm
+2
+for verification details
+
+4:
+
+send
+
+y
+to
+M_{q}
+on the port identified by
+tag
+
+5:
+
+end
+
+if
+
+6:
+
+7:
+
+## In machine hosting
+M_{q}
+
+8:
+
+// Receiver
+
+9:
+
+while
+true
+do
+
+10:
+
+(\texttt{tag},y)\leftarrow
+
+recv
+from any
+M_{p}^{(i)}
+
+11:
+
+push
+
+(\texttt{tag},y)
+to
+\mathcal{Q}_{in}
+
+12:
+
+end
+
+while
+
+13:
+
+// Draft inference
+
+14:
+
+if
+
+\mathcal{Q}_{in}
+is non-empty
+then
+
+15:
+
+(\texttt{tag},y)\leftarrow
+
+pop
+
+\mathcal{Q}_{in}
+
+16:
+
+(\hat{y},\mathcal{C}[\texttt{tag}])\leftarrow M_{q}(y;\ \mathcal{C}[\texttt{tag}])
+// refer to Algorithm
+2
+for inference details
+
+17:
+
+push
+
+(\texttt{tag},\hat{y})
+to
+\mathcal{Q}_{out}
+
+18:
+
+end
+
+if
+
+19:
+
+// Sender
+
+20:
+
+if
+
+\mathcal{Q}_{out}
+not empty
+
+then
+
+21:
+
+(\texttt{tag},\hat{y})\leftarrow
+
+pop
+
+\mathcal{Q}_{out}
+
+22:
+
+send
+
+\hat{y}
+back to
+M_{p}^{(i)}
+on the port identified by
+tag
+
+23:
+
+end
+
+if
+
+We design StarSD by considering the following runtime properties.
+
+Work-conserving draft execution.
+
+To match (
+8
+)-(
+10
+) under asynchronous returns,
+M_{q}
+maintains a global request buffer
+\mathcal{Q}_{in}
+, a outgoing buffer
+\mathcal{Q}_{out}
+, and runs a non-blocking loop that always serves any pending request, making uncovered return time appear as
+T_{\mathrm{idle}}
+in (
+9
+).
+
+Per-target state isolation.
+
+To preserve the correctness of (
+1
+) and (
+2
+) under concurrency, StarSD isolates all per-target state, including KV cache and metadata, across target instances by
+tag
+via
+\mathcal{C}[\texttt{tag}]
+.
+
+Independent return paths.
+
+To preserve the return-time decomposition
+Z(d)=t_{c}+t_{v}
+in (
+6
+), we assign each target a unique
+tag
+and a dedicated port during a one-time handshake, and reuse these ports for steady-state payload transfer in Algorithm
+1
+.
+
+Algorithm
+1
+provides one concrete realization of these properties, and Fig.
+2
+summarizes the resulting execution pipeline. Verified prefixes from multiple target instances are collected into a shared request buffer and served by the draft instance in a work-conserving manner. Drafted tokens are routed back to their corresponding targets for parallel verification, and the verified prefixes re-enter the pipeline for subsequent iterations. By decoupling request arrival, draft execution, and verification returns, this pipeline avoids cross-target head-of-line blocking and enables continuous draft-side execution under concurrent service.
+
+Figure 2
+:
+StarSD Pipeline. Use the global request buffer and outgoing buffer to guarantee the work continuity of the draft model.
+
+4.2
+Insights
+
+Figure 3
+:
+StarSD framework behavior when scaling the number of target instances. Baseline 1 stands for the throughput of SOTA speculative decoding that is deployed on a single accelerator. Baseline 2 is the standalone inference speed of an LLM.
+
+While StarSD enables one-for-many serving, its throughput exhibits a trade-off. Figure
+3
+shows a two-stage behavior as the number of active target instances grows.
+
+Stage I: Under-loaded.
+
+When
+N
+is small,
+M_{q}
+is under-loaded, the global request buffer is frequently empty, so
+M_{q}
+exhibits idle gaps, and adding more active
+M_{p}^{(i)}
+primarily improves utilization.
+In this regime, the per-
+M_{p}^{(i)}
+throughput
+O_{\gamma}^{(i)}
+stays approximately constant, while the system throughput
+O_{\gamma}
+increases with
+N
+because the uncovered return time is gradually amortized across more concurrent requests.
+This corresponds to the violation of (
+7
+), where the uncovered return time appears as
+T_{\mathrm{idle}}
+in (
+9
+), and thus
+T_{\gamma}
+follows (
+10
+).
+
+Stage II: Fully-loaded.
+
+As
+N
+increases, the idle gap vanishes, the global request buffer becomes persistently non-empty, and
+M_{q}
+turns work-conserving.
+Beyond this point, increasing
+N
+no longer increases the service capacity of
+M_{q}
+but introduces queueing in the global request buffer.
+Consequently, the waiting time before a request is served increases
+T_{\gamma}
+, which reduces the per-
+M_{p}^{(i)}
+throughput
+O_{\gamma}^{(i)}
+, while
+O_{\gamma}
+saturates near its maximum.
+Formally, the full-load onset is the smallest
+N
+such that (
+7
+) holds.
+Equivalently, for
+
+N\geq N_{\mathrm{full}}\triangleq\left\lceil\frac{Z(d)}{S(d)}\right\rceil+1,
+
+(12)
+
+we have
+T_{\mathrm{idle}}=0
+and
+T_{\gamma}
+follows (
+8
+).
+
+Importantly, admitting more
+M_{p}^{(i)}
+can still be beneficial after full load as long as the resulting
+O_{\gamma}^{(i)}
+remains above the throughput of a standalone
+M_{p}^{(i)}
+.
+We denote by
+N_{\max}
+the largest active set size such that
+O_{\gamma}^{(i)}
+does not fall below this point. Beyond
+N_{\max}
+, additional concurrency degrades per-
+M_{p}^{(i)}
+throughput below what
+M_{p}^{(i)}
+can achieve without
+M_{q}
+.
+This observation motivates a practical admission rule at
+M_{q}
+, reject new
+M_{p}^{(i)}
+requests when
+N>N_{\max}
+to preserve per-
+M_{p}^{(i)}
+throughput higher than the standalone inference speed of
+M_{p}^{(i)}
+.
+
+Packing advantage in practice.
+
+Beyond throughput, StarSD improves practical memory packing on accelerators. Colocating one target instance with its draft model forms fixed pairs that occupy large, indivisible memory blocks.
+Under a fixed accelerator memory budget, such coarse-grained pairing limits how many target instances can be placed concurrently and leaves fragmented memory regions.
+By decoupling drafting from verification and providing the draft model as a shared service, StarSD’s finer-grained placement allows accelerator memory to be primarily filled with target instances, increasing target density and enabling either more concurrent replicas or longer context lengths under the same hardware budget.
+
+5
+Experiments
+
+We evaluate StarSD along three dimensions, i.e., its distributed execution characteristics, its scalability under one-for-many concurrency, and its practical draft-side performance behavior under different runtime regimes.
+
+5.1
+Distributed Behavior of StarSD
+
+(a) Performance Comparison.
+
+(b) Communication Cost.
+
+Figure 4
+:
+Throughput loss due to distribute deployment of EAGLE and communication overhead.
+
+Since StarSD does not modify model weights or the speculative decoding algorithm, performance differences arise solely from system effects, namely communication overhead introduced by distribution and potential gains from parallel execution. Thus, we evaluate StarSD on the full MT-Bench benchmark
+(
+24
+)
+using EAGLE 2
+(
+12
+)
+as a representative backend.
+To isolate the cost of distribution, we consider the
+N=1
+case, where the draft instance
+M_{q}
+and the target instance
+M_{p}
+are placed on different accelerators. In this configuration, StarSD reduces to a distributed deployment of EAGLE 2, enabling a direct measurement of cross-device communication overhead.
+
+As shown in Fig.
+4
+(
+a
+), we report throughput from two perspectives,
+(1) system throughput
+O_{\gamma}
+, which fluctuates noticeably across MT-Bench due to prompt-dependent acceptance lengths, and
+(2) the round speed
+R_{q}
+of
+M_{q}
+which is proportional to
+O_{\gamma}
+and prove in
+C.1
+, it provides a smoother perspective to observe performance.
+To reflect the cost of distributed deployment, we measure end-to-end serving performance in the deployed setting, so the experiment results naturally include cross-device overheads such as communication latency shown in Fig.
+4
+(
+b
+), message serialization and deserialization, and GPU-CPU memory transfers. Our implementation is deployment-agnostic and supports multi-accelerator execution either within a single machine or across machines. Accordingly, we use socket-based communication rather than hardware-specific backends, e.g., NVLink, trading some performance for portability. This observation aligns with recent findings in distributed LLM serving that cross-accelerator data movement can incur non-trivial overhead and lead to a measurable performance drop under equivalent accelerator resources
+(
+10
+)
+.
+
+5.2
+Scaling Behavior of StarSD
+
+Figure 5
+:
+Round speed
+R_{q}
+and
+R_{p}
+, load of
+M_{q}
+under varying numbers of target instances
+N
+.
+
+Table 1
+:
+System performance metrics as the number of target instances
+N
+increases.
+
+Metric
+
+EAGLE
+
+StarSD with different numbers of target instances
+N
+
+1
+
+2
+
+3
+
+4
+
+5
+
+6
+
+Throughput (tokens/s)
+
+O_{\gamma}
+
+94.3
+
+79.9
+
+167.6
+
+246.3
+
+266.6
+
+285.5
+
+288.7
+
+O_{\gamma}^{(i)}
+
+118.5
+
+86.6
+
+100.9
+
+98.3
+
+80.94
+
+69.49.
+
+57.78
+
+Time breakdown (ms)
+
+t_{s}
+
+1.78
+
+2.24
+
+1.36
+
+1.36
+
+1.42
+
+1.46
+
+1.46
+
+T_{\text{wait}}
+
+—
+
+0.01
+
+0.50
+
+0.60
+
+3.90
+
+13.0
+
+22.3
+
+T_{\text{idle}}
+
+—
+
+30.6
+
+9.8
+
+3.4
+
+0.6
+
+0.0
+
+0.0
+
+Round speed (round/s)
+
+R_{q}
+
+26.8
+
+20.90
+
+49.25
+
+72.26
+
+81.54
+
+85.52
+
+85.84
+
+R_{p}
+
+26.8
+
+20.90
+
+24.07
+
+23.38
+
+19.73
+
+16.64
+
+14.10
+
+Utilization (%)
+
+M_{q}
+load
+
+—
+
+33.3
+
+50.3
+
+75.4
+
+91.4
+
+99.5
+
+99.6
+
+To evaluate one-for-many scaling, we vary the number of concurrent target instances
+N
+served by a single draft instance
+M_{q}
+and examine how system performance evolves with increasing concurrency. Fig.
+5
+reports the round speeds
+R_{q}
+and
+R_{p}
+under different
+N
+.
+As
+N
+increases from 1 to 3,
+R_{q}
+grows substantially, while
+R_{p}
+changes only modestly. This behavior matches the
+under-loaded
+regime in Section
+4.2
+, where serving additional targets reduces draft-side idle gaps by overlapping verification and communication latency across requests.
+At
+N=4
+,
+R_{q}
+approaches its maximum, indicating that
+M_{q}
+is close to full utilization and the system begins to enter the
+fully-loaded
+regime described in Section
+4.2
+.
+Further increasing
+N
+provides only marginal improvement in
+R_{q}
+, while
+R_{p}
+decreases noticeably due to queueing delays before requests are processed by
+M_{q}
+.
+
+To demonstrate the universality of StarSD, we evaluate both intra-node and inter-node configurations as detailed in Appendix
+H
+, and summarize system performance for up to six target instances in Table
+1
+.
+In the intra-node setting, multiple target instances run on distinct GPUs within a single server, while in the inter-node setting, target instances are distributed across multiple servers connected by a local-area network. Specifically, our deployment uses seven GPUs across two servers. One server hosts four RTX 4090 GPUs, running a draft model
+M_{q}
+and three target instances, while the other server hosts three A100 GPUs, each running one target instance. As
+N
+increases, targets are first activated on the RTX 4090 server, and targets on the A100 server are used when
+N>3
+. The shared
+M_{q}
+server serves all active targets across both machines.
+All metrics are measured end-to-end and therefore include communication latency and cross-machine serialization overhead, showing that StarSD remains portable and effective across both single-server and multi-server deployments. Beyond throughput and round speed, we report two delay metrics, i.e., the draft-side idle time
+T_{\text{idle}}
+, which captures how long
+M_{q}
+remains idle between requests, and the queueing wait time
+T_{\text{wait}}
+, which measures how long a request waits in the global buffer before service. These metrics explain a counter-intuitive trend in Table
+1
+, i.e., when
+N=1
+,
+R_{p}
+is lower than at
+N=2
+, consistent with a large
+T_{\text{idle}}
+. Empirically, excessive idle gaps push
+M_{q}
+into an unfavorable operating regime and degrade its per-token inference speed.
+
+5.3
+Execution Regimes and Performance Dynamics
+
+(a) Effect of locking GPU frequency.
+
+(b) Effect of
+T_{\text{idle}}
+.
+
+(c) Effect of warm-up rounds.
+
+Figure 6
+:
+Per-token generation time analysis of
+M_{q}
+under warm-up at
+T_{\text{idle}}=0.03\,
+s, GPU frequency control, and
+T_{\text{idle}}
+variation.
+
+As suggested by the results in Table
+1
+, a major source of StarSD’s system-level performance gain comes from eliminating cold-start and idle gaps on the draft side. To further analyze this effect and verify that the observed variation in the inference speed of
+M_{q}
+is not specific to a particular accelerator, we conduct controlled experiments by forming a single draft–target pair and evaluating it independently on an RTX 4090 GPU and on an A100 GPU.
+
+We first rule out GPU frequency scaling as a confounding factor by instrumenting the graphics clock before each inference. As shown in Fig.
+6
+(
+a
+), the same slowdown trend appears under both the default Dynamic Voltage and Frequency Scaling (DVFS) policy and a fixed clock of 2400 MHz, indicating that frequency changes are not the cause.
+To precisely control idle behavior, we then inject artificial delays on the draft side by pausing
+M_{q}
+for a prescribed duration after receiving each request, thereby inducing a target
+T_{\text{idle}}
+. Figure
+6
+(
+b
+) shows that per-token inference time remains stable when
+T_{\text{idle}}
+is either small or large, but degrades in an intermediate regime where increasing
+T_{\text{idle}}
+leads to a monotonic slowdown and higher run-to-run variance. Together, these results indicate that sustained, continuous execution keeps the draft model in a favorable operating state, while intermittent idle gaps introduce transient inefficiencies that increase both latency and variability.
+
+We further examine the warm-up effect shown in Fig.
+6
+(
+c
+) by inserting additional draft-side executions after an idle gap and before normal generation begins.
+In this setup,
+M_{q}
+generates a small number of warm-up tokens to transition back toward a steady execution state.
+As the number of warm-up rounds increases, the per-token inference speed improves and then stabilizes, with diminishing gains beyond a modest threshold.
+At low warm-up counts, the execution behavior is comparable to the
+N=1
+setting in Table
+1
+, which exhibits an idle gap of approximately
+T_{\text{idle}}\approx 0.03
+second and degraded performance.
+As warm-up rounds increase, the effective idle impact is reduced to about
+0.014
+second, leading to faster and more stable inference.
+
+6
+Related Work
+
+Speculative Decoding.
+
+Speculative decoding accelerates autoregressive generation by having a lightweight draft propose tokens and a stronger target verify them while preserving the target distribution
+(
+8
+;
+2
+)
+.
+Follow-up work improves efficiency by proposing and verifying multiple candidates per iteration.
+Tree-based speculative inference verifies a token tree in parallel to better exploit GPU parallelism
+(
+16
+;
+4
+;
+22
+)
+, and other variants expand proposals via multi-branch or multi-head drafting under exact acceptance rules
+(
+1
+)
+.
+
+LLM Serving Under Memory Pressure.
+
+LLM serving is often bottlenecked by the KV-cache footprint, which limits batch size and makes co-locating an additional draft model challenging.
+vLLM reduces KV-cache fragmentation via paging-style management
+(
+7
+)
+.
+Beyond single-GPU settings, systems disaggregate prefill and decode to reduce interference and improve goodput
+(
+25
+)
+, and phase-splitting designs similarly separate prompt and token phases across machines
+(
+18
+)
+.
+These results suggest that, under realistic batch sizes and KV-cache pressure, hosting both a large target and a draft on one accelerator can be impractical.
+
+Distributed and Networked Speculative Decoding.
+
+Placing draft and target on different accelerators turns speculative decoding into a distributed pipeline where communication and asynchronous returns shape utilization.
+Prior work explores edge settings, e.g., lightweight edge drafts with server-side verification
+(
+11
+)
+, and distributed speculative inference that leverages multiple drafters, targets and task parallelism
+(
+20
+;
+21
+;
+5
+)
+.
+SpecEdge further splits inference between edge and server GPUs via speculative decoding and pipeline-aware scheduling, exchanging only token outputs over the network
+(
+17
+)
+.
+Overall, once drafting and verification are disaggregated, performance depends not only on acceptance behavior but also on communication efficiency and scheduling.
+
+7
+Conclusion
+
+StarSD is a one-for-many speculative decoding framework that allows a single draft model to efficiently serve multiple target instances.
+By keeping the draft side work-conserving under asynchronous verification, StarSD eliminates idle gaps that limit the efficiency in distributed deployments.
+Experiments across heterogeneous settings show that this design improves utilization and throughput without modifying model weights or generation semantics, making speculative decoding more practical under realistic memory and deployment constraints.
+
+Impact Statement
+
+StarSD enables one-for-many speculative decoding by decoupling drafting and verification across distributed accelerators, allowing a single draft model to serve multiple target instances in a work-conserving manner. This can improve utilization and reduce deployment overheads under memory and resource constraints, supporting more flexible allocation across heterogeneous devices in both cluster and edge serving environments.
+However, StarSD may also introduce risks. By lowering the cost of LLM inference, it can make large-scale misuse easier. More importantly, the shared draft model can become a concentrated trust point, it may transiently hold multiple sessions’ prompts, intermediate prefixes, and cached decoding state across served targets. If the draft service is compromised, an attacker could potentially access sensitive user inputs or session traces, leading to severe privacy leakage.
+To mitigate these risks, deployments should treat the draft service as a high-sensitivity component. Enforce strong isolation between sessions, minimize and protect in-memory and on-disk artifacts including KV caches and logs, use authenticated and encrypted channels for inter-node communication, and apply access control, rate limiting, and auditing to detect abuse and intrusion.
+
+Appendix A
+Overview of Supplementary Material
+
+This appendix provides supplementary algorithmic descriptions, deployment illustrations, and experimental artifacts that support the results in the main text.
+For reproducibility, command-line snippets and representative log excerpts are highlighted in
+typewriter font
+.
+The appendix is organized as follows:
+
+1.
+
+Motivation of StarSD:
+We motivate StarSD from practical deployment constraints and the resulting inefficiencies of distributed speculative decoding, explaining why a one-for-many draft service is desirable in
+Appendix
+
+B
+.
+
+2.
+
+Mathematical Justification:
+
+We provide further mathematical Justification in
+Appendix
+
+C
+.
+
+3.
+
+Algorithm Details:
+
+We describe the EAGLE-based speculative decoding procedure used in StarSD, including the key steps of proposal, verification, and correction, in
+Appendix
+
+D
+.
+
+4.
+
+Implementation Details:
+
+We present system-level implementation details of StarSD, including the one-time connection establishment protocol, the steady-state request execution loop, the decoupled communication that computes runtime at the draft server, and tag-indexed per-session state management, e.g., KV cache lifecycle and speculative metadata in
+Appendix
+
+E
+.
+
+5.
+
+Extended GPU Experiment Details:
+
+We provide additional reproducibility artifacts for the GPU frequency-control study and draft-side inference-time measurements in
+Appendices
+
+F
+and
+G
+.
+
+6.
+
+Deployment Illustrations:
+
+We summarize representative deployment topologies and illustrate the end-to-end distributed pipeline in
+Appendix
+
+H
+.
+
+7.
+
+Discussion and Future Directions:
+
+We discuss limitations of the current design and outline future directions in
+Appendix
+
+I
+.
+
+Appendix B
+Motivation
+
+Recent advances in speculative decoding have largely focused on improving the draft model by better aligning its token distribution with the target model. However, most existing frameworks implicitly assume that the draft instance
+M_{q}
+and the target instance
+M_{p}
+can be co-located on a single accelerator, e.g., a GPU. In practical deployments, this assumption often does not hold. Many real systems operate under heterogeneous and resource-constrained settings, including edge clusters and mid-scale cloud servers, where accelerator memory is limited and shared by multiple services. The weights may barely fit, but the remaining memory must still accommodate KV cache and runtime buffers. In practice, this sharply reduces the KV cache budget, hence affect the context length, which is especially problematic in multi-tenant deployments where one GPU also serves other inference tasks. Even with compression or quantization, co-locating
+M_{q}
+and
+M_{p}
+can remain impractical or introduce nontrivial accuracy, engineering, and operational costs.
+
+A natural response is to disaggregate the deployed instances
+M_{q}
+and
+M_{p}
+across different accelerators, e.g., GPU. Distributed speculative decoding has been explored in prior work, but most existing designs do not address a core inefficiency inherent to the draft-then-verify workflow. When the target instance
+M_{p}
+is verifying draft tokens, the accelerator hosting the draft instance
+M_{q}
+is idle; when
+M_{q}
+is drafting, the
+M_{p}
+accelerator is underutilized. This alternating execution pattern reduces effective hardware utilization and makes
+M_{q}
+execution bursty, with short compute phases separated by idle gaps induced by verification latency and inter-accelerator communication. These idle gaps have system-level consequences that are also largely overlooked in prior work. Even when the decoding depth is unchanged, bursty execution prevents
+M_{q}
+from sustaining a stable high-throughput execution state and may trigger repeated per-iteration transients (e.g., kernel reactivation and cache coldness), leading to increased draft-step latency and higher variance across decoding iterations.
+
+More fundamentally, the generated output is ultimately dictated by the target instance
+M_{p}
+, while
+M_{q}
+serves as auxiliary compute overhead. From a system perspective, this overhead should be amortized across multiple target instances rather than dedicated to a single
+M_{p}
+. These observations motivate a one-for-many design in which a single
+M_{q}
+multiplexes requests from multiple
+M_{p}^{(i)}
+. Such a design allows verification responses to arrive more continuously, reduces idle gaps on the draft accelerator, and improves system-level utilization.
+
+Appendix C
+Mathematical Justification
+
+C.1
+Metric Justification of Draft and Verify Round Speed
+
+We consider a fixed dataset
+\mathcal{D}
+, a fixed decoding configuration, and a fixed model pair
+(M_{p},M_{q})
+with depth
+d
+.
+Across deployments, we keep the model weights and the decoding algorithm unchanged.
+Hence, for any prefix
+y
+encountered during decoding on
+\mathcal{D}
+, the next-token distributions
+p(\cdot\mid y)
+and
+q(\cdot\mid y)
+are invariant up to numerical nondeterminism, and the induced acceptance behavior is invariant in expectation.
+Under the standard approximation, the expected accepted length per draft proposal
+
+\bar{\ell}\triangleq\mathbb{E}[l(d)],
+
+(C.1)
+
+is deployment-invariant.
+
+Round speeds.
+
+Let
+R_{q}
+denote the rate per unit time at which the draft model executes the token-generation routine that produces a depth-
+d
+proposal, each such execution yields an accepted length
+l(d)
+in the subsequent verification step.
+Let
+R_{p}
+denote the rate per unit time at which a target instance executes a verification routine.
+Both
+R_{q}
+and
+R_{p}
+are measured in the steady state.
+
+Throughput as tokens per unit time.
+
+Recall that the system throughput (
+11
+) from the draft-side view is
+
+O_{\gamma}\triangleq\frac{\mathbb{E}[l]_{\gamma}}{T_{\gamma}},
+
+(C.2)
+
+where
+\mathbb{E}[l]_{\gamma}
+is the expected number of accepted tokens contributed in an interval of duration
+T_{\gamma}
+.
+From the target-side view, we similarly define the per-target throughput for instance
+i
+as
+
+O_{\gamma}^{(i)}\triangleq\frac{\mathbb{E}[l]_{\gamma}^{(i)}}{T_{\gamma}}.
+
+(C.3)
+
+Positive correlation with
+R_{q}
+.
+
+Over any time window of length
+T_{\gamma}
+, the number of draft-generation executions is approximately
+R_{q}T_{\gamma}
+in expectation.
+Each execution contributes an accepted length with expectation
+\bar{\ell}
+.
+Therefore,
+
+\mathbb{E}[l]_{\gamma}\;\approx\;(R_{q}T_{\gamma})\,\bar{\ell},\qquad O_{\gamma}\;=\;\frac{\mathbb{E}[l]_{\gamma}}{T_{\gamma}}\;\approx\;\bar{\ell}\,R_{q}.
+
+(C.4)
+
+Since
+\bar{\ell}>0
+under fixed
+\mathcal{D}
+and decoding setup,
+O_{\gamma}
+is monotone increasing in
+R_{q}
+, i.e.,
+R_{q}
+is positively correlated with
+O_{\gamma}
+.
+
+Positive correlation with
+R_{p}
+.
+
+Fix a target instance
+M_{p}^{(i)}
+.
+Over a window of length
+T_{\gamma}
+, the expected number of verification executions by this instance is approximately
+R_{p}T_{\gamma}
+.
+Each verification round finalizes one proposal and advances the decoded sequence by an accepted length with expectation
+\bar{\ell}
+.
+Thus,
+
+\mathbb{E}[l]_{\gamma}^{(i)}\;\approx\;(R_{p}T_{\gamma})\,\bar{\ell},\qquad O_{\gamma}^{(i)}\;=\;\frac{\mathbb{E}[l]_{\gamma}^{(i)}}{T_{\gamma}}\;\approx\;\bar{\ell}\,R_{p},
+
+(C.5)
+
+which implies that
+O_{\gamma}^{(i)}
+is monotone increasing in
+R_{p}
+and hence
+R_{p}
+is positively correlated with the throughput of the
+i
+-th target instance.
+
+Bottleneck regime.
+
+In practice, draft and verification must be matched, so the realized throughput is governed by the slower side.
+This is consistent with the upper-bound intuition
+
+O_{\gamma}\;\lesssim\;\bar{\ell}\,\min\{R_{q},\,R_{p}\},
+
+(C.6)
+
+and increasing either
+R_{q}
+or
+R_{p}
+cannot decrease throughput.
+
+Special case: 1-for-1 in StarSD.
+
+When there is only one target instance, i.e.,
+N=1
+, the system has a single verification stream, so the per-target throughput coincides with the system throughput
+
+O_{\gamma}^{(i)}=O_{\gamma}.
+
+(C.7)
+
+Moreover, the execution forms a tightly coupled loop, where
+each draft-generation round on
+M_{q}
+produces exactly one proposal, and each proposal triggers exactly one verification round on
+M_{p}
+.
+Therefore, in steady state, the number of draft rounds and verification rounds are equal over any long horizon, implying
+
+R_{q}=R_{p}.
+
+(C.8)
+
+Combining (
+C.5
+) and (
+C.7
+), both metrics induce the same monotone proxy for throughput in the 1-for-1 setting:
+
+O_{\gamma}=\bar{\ell}\,R_{q}=\bar{\ell}\,R_{p}.
+
+(C.9)
+
+Appendix D
+EAGLE Algorithm Details
+
+Setting and notation.
+
+Let
+y
+denote the
+verified prefix
+at the beginning of one speculative iteration.
+EAGLE uses a draft model
+M_{q}
+to construct a
+k
+-ary proposal tree of depth
+d
+, and a target model
+M_{p}
+to verify candidate paths.
+A candidate path is represented as
+\texttt{tree\_path}=[x_{1},\ldots,x_{d}]
+.
+During tree expansion, the draft model
+M_{q}
+produces next-token distributions at each depth. We denote the distribution at depth
+t
+by
+q_{t}(\cdot)
+.
+The correction step uses the corresponding draft probability
+q_{l+1}(x)
+in
+
+\texttt{norm}(\max(0,p_{l+1}(x)-q_{l+1}(x)))
+.
+During verification, running
+M_{p}
+along the prefixes induced by a path produces target-side distributions
+p_{1}(\cdot),\ldots,p_{d+1}(\cdot)
+.
+
+Algorithm 2
+
+EAGLE Speculative Decoding
+
+1:
+
+Input:
+
+M_{q}
+,
+M_{p}
+, verified prefix
+y
+, depth
+d
+, top-
+k
+
+k
+
+2:
+
+Output:
+
+y+\texttt{target\_path}
+and updated
+hidden_state
+
+3:
+
+accept_length
+
+\leftarrow 0
+
+// best accepted length among all verified paths
+
+4:
+
+target_path
+
+\leftarrow[\ ]
+
+// path selected for this iteration
+
+5:
+
+6:
+
+if
+
+First Iteration
+
+then
+
+7:
+
+// Initialize root token and hidden state to start
+M_{q}
+
+8:
+
+x,\ \texttt{hidden\_state}\sim p(y)
+
+9:
+
+tree
+
+\leftarrow x
+
+// root of the proposal tree
+
+10:
+
+else
+
+11:
+
+// Use the last verified token as the tree root
+
+12:
+
+tree
+
+\leftarrow y[-1]
+
+13:
+
+end
+
+if
+
+14:
+
+15:
+
+// Build a depth-
+d
+proposal tree with branching factor
+k
+
+16:
+
+for
+
+t=1
+to
+d
+
+do
+
+17:
+
+// KV-cache maintenance for draft expansion (prefix init or incremental update)
+
+18:
+
+if
+
+kv_cache
+is empty
+then
+
+19:
+
+kv_cache
+
+\leftarrow
+
+InitKV
+(y,\ \texttt{hidden\_state})
+
+// cache corresponds to the verified prefix
+
+20:
+
+else
+
+21:
+
+kv_cache
+
+\leftarrow
+
+UpdateKV
+(\texttt{target\_path},\ \texttt{kv\_cache},\ \texttt{hidden\_state})
+
+// follow the currently selected path
+
+22:
+
+end
+
+if
+
+23:
+
+// Expand one tree layer in parallel using
+M_{q}
+(top-
+k
+per node)
+
+24:
+
+tree
+
+\leftarrow
+
+ExpandLayer
+(\texttt{tree},\ \texttt{hidden\_state},\ M_{q},\ k)
+
+25:
+
+end
+
+for
+
+26:
+
+27:
+
+// Verify candidate paths in parallel
+
+28:
+
+for
+
+n=1
+to
+k^{d}
+
+do
+
+29:
+
+tree_path
+
+\leftarrow
+
+tree
+[
+n
+]
+
+30:
+
+//
+tree_path
+corresponds to
+\pi=[x_{1},\ldots,x_{d}]
+
+31:
+
+// Run
+M_{p}
+along prefixes induced by the path, can be executed in parallel
+
+32:
+
+p_{1}(x),\ldots,p_{d+1}(x)\leftarrow M_{p}(y),\ldots,M_{p}(y+[x_{1},\ldots,x_{d}])
+
+33:
+
+// Determine accept length on this path via stochastic test
+
+34:
+
+r_{1}\sim U(0,1),\ldots,r_{d}\sim U(0,1)
+
+35:
+
+l\leftarrow\min\left(\{i-1\mid 1\leq i\leq d,\ r_{i}>p_{i}(x)\}\cup\{d\}\right)
+
+36:
+
+// Prepare continuation (either accept full prefix, or apply one-step correction)
+
+37:
+
+p^{\prime}(x)\leftarrow p_{l+1}(x)
+
+38:
+
+if
+
+l<d
+
+then
+
+39:
+
+p^{\prime}(x)\leftarrow\texttt{norm}\!\left(\max(0,\ p_{l+1}(x)-q_{l+1}(x))\right)
+
+40:
+
+tree_path
+
+\leftarrow
+
+tree_path
+[:
+l
+].
+append
+(t\sim p^{\prime}(x))
+
+// accept first
+l
+tokens, then sample one corrected token
+
+41:
+
+else
+
+42:
+
+tree_path
+
+\leftarrow
+
+tree_path
+[:
+l
+]
+
+// accept the whole depth-
+d
+path
+
+43:
+
+end
+
+if
+
+44:
+
+// Select the path with the largest accept length
+
+45:
+
+if
+
+l>
+
+accept_length
+
+then
+
+46:
+
+accept_length
+
+\leftarrow l
+
+47:
+
+target_path
+
+\leftarrow
+
+tree_path
+
+48:
+
+end
+
+if
+
+49:
+
+end
+
+for
+
+50:
+
+51:
+
+return
+
+y+\texttt{target\_path}
+,
+hidden_state
+
+Initialization.
+
+EAGLE starts each iteration from a verified prefix
+y
+.
+In the first iteration,
+M_{q}
+samples a root token
+x
+and an accompanying
+hidden_state
+from the distribution conditioned on
+y
+provided by
+M_{p}
+, in later iterations, it anchors the new proposal tree at the last verified token
+y[-1]
+.
+
+Tree expansion with caching.
+
+The proposal tree is expanded layer-by-layer to depth
+d
+with top-
+k
+branching.
+Before expanding each layer, the algorithm initializes the draft KV cache from
+y
+or incrementally updates it following the currently selected
+target_path
+.
+The expansion routine
+ExpandLayer
+is executed in parallel over the current tree frontier, and the draft probabilities
+q_{t}(\cdot)
+needed by the correction step are stored in the tree metadata.
+
+Verification and accept-length computation.
+
+For each candidate path
+\pi=[x_{1},\ldots,x_{d}]
+, the target model
+M_{p}
+is evaluated on the sequence of induced prefixes
+
+y
+,
+y+x_{1}
+, …,
+y+[x_{1},\ldots,x_{d}]
+to produce
+p_{1}(\cdot),\ldots,p_{d+1}(\cdot)
+.
+The algorithm samples
+r_{1},\ldots,r_{d}
+and gets the accepted length
+l
+using the test in Alg.
+2
+.
+
+Correction and best-path selection.
+
+If
+l<d
+, the algorithm forms a corrected distribution
+
+p^{\prime}(x)\leftarrow\texttt{norm}(\max(0,\,p_{l+1}(x)-q_{l+1}(x)))
+and appends one corrected token after the accepted prefix.
+Otherwise, it keeps the accepted prefix of length
+l
+(which equals
+d
+in this case).
+Finally, it selects the path with the largest accepted length and returns
+y+\texttt{target\_path}
+along with the updated
+hidden_state
+of the selected path.
+
+Appendix E
+Implementation Details of StarSD
+
+This appendix provides implementation-level details and covers the following topics.
+
+•
+
+One-time connection establishment protocol.
+
+•
+
+Steady-state request execution loop and payload handling.
+
+•
+
+Decoupling communication from draft inference on
+M_{q}
+using separate logical components or threads.
+
+•
+
+Tag-indexed state management, including KV cache lifecycle and other per-session metadata.
+
+•
+
+How these details realize the design requirements in Section 5.
+
+•
+
+Work-conserving execution to support (
+8
+)-(
+10
+).
+
+•
+
+Per-session isolation to keep
+\beta_{i}(y)
+in (
+1
+) and
+l_{i}(d)
+in (
+2
+) well-defined.
+
+•
+
+Clean time decomposition to preserve
+Z(d)=t_{c}+t_{v}
+in (
+6
+) and
+S(d)=dt_{s}
+in (
+5
+).
+
+E.1
+Connection Establishment
+
+One-time handshake per
+M_{p}^{(i)}
+.
+
+Each
+M_{p}^{(i)}
+performs an initial handshake with
+M_{q}
+through a public port.
+Upon the first request from this
+M_{p}^{(i)}
+,
+M_{q}
+allocates (i) a private communication port and (ii) a unique tag.
+All subsequent messages between this
+M_{p}^{(i)}
+and
+M_{q}
+are sent through the private port, and the tag is attached to every request to identify the corresponding per-session states at
+M_{q}
+.
+By isolating the control plane, i.e., handshake from the data plane, i.e., per-iteration messages, we ensure
+t_{c}
+in (
+6
+) corresponds to the minimal, repeated payload transfer rather than connection management overhead.
+
+E.2
+Steady-State Request Execution
+
+Request execution loop.
+
+Given a user prompt,
+M_{p}^{(i)}
+begins decoding and produces an initial token.
+Then, in each iteration,
+M_{p}^{(i)}
+sends the verified prefix or the newly verified token, along with its tag, to
+M_{q}
+via the private port.
+The payload follows the minimal-transfer design of the distributed EAGLE setting to reduce the per-iteration communication cost.
+Upon receiving a tagged request,
+M_{q}
+pushes it into the global request buffer.
+When the
+M_{q}
+inference worker becomes available, it selects a buffered request using a work-conserving scheduling policy (e.g., first-in-first-out).
+Before inference,
+M_{q}
+retrieves the corresponding KV cache using the tag, executes draft inference, and updates the KV cache upon completion.
+The draft output is written to the per-
+M_{p}^{(i)}
+communication channel and sent back to
+M_{p}^{(i)}
+via the corresponding private port, where it is verified and used to form the next request.
+
+E.3
+Decoupling Communication and Draft Inference on
+M_{q}
+
+Separate communication and inference components.
+
+As shown in Fig.
+2
+,
+M_{q}
+consists of two logical components: (i) a communication component that receives requests and appends them to the global request buffer, and (ii) an inference component that repeatedly selects and executes buffered requests as long as the buffer is non-empty.
+Each active
+M_{p}^{(i)}
+is associated with its own private port and a dedicated communication channel at
+M_{q}
+, preventing cross-session interference while keeping
+M_{q}
+work-conserving.
+This decoupling is required for the service-time model
+S(d)=dt_{s}
+in (
+5
+) in which I/O stalls do not backpressure the compute loop, so the measured draft-side service remains dominated by pure compute rather than network latency.
+In addition, it helps keep the per-iteration transfer cost accounted for in
+Z(d)=t_{c}+t_{v}
+in (
+6
+), rather than being mixed into the compute-side service time.
+
+E.4
+Tag-Indexed State Management
+
+KV cache isolation and lifecycle.
+
+M_{q}
+maintains a mapping from tag to KV cache.
+When an
+M_{p}^{(i)}
+starts a new decoding session,
+M_{q}
+initializes an empty KV cache entry for its tag; during each iteration, the inference component loads and updates this KV cache to avoid recomputation of historical activations.
+When the decoding session finishes, the KV cache entry associated with the tag is released to reclaim memory.
+This tag-indexed management prevents cross-session contamination and enables efficient lookup and update with many active
+M_{p}^{(i)}
+.
+Importantly, this isolation is necessary for session-conditioned quantities such as
+\beta_{i}(y)
+in (
+1
+) and
+l_{i}(d)
+in (
+2
+) to remain well-posed, where each return must advance the
+same
+session prefix and KV state associated with that tag.
+
+Extending to other per-
+M_{p}^{(i)}
+metadata.
+
+The same tag-indexed design applies to other per-
+M_{p}^{(i)}
+states maintained at
+M_{q}
+, such as speculative metadata and bookkeeping information required by the execution loop.
+By enforcing strict per-tag isolation, StarSD preserves correctness under concurrency while keeping
+M_{q}
+scalable in both memory usage and scheduling.
+
+Appendix F
+Extended GPU Experiment Details
+
+This section supplements the frequency-sensitivity study in Fig.
+6
+(
+b
+) by verifying that GPU frequency control is indeed taking effect during our experiments. To verify whether GPU frequency control is effective, we log the measured frequency just before each draft-side inference begins in both the default setting and when the GPU graphics clock is locked.
+
+GPU frequency lock command.
+
+We enable persistence mode and lock the graphics clock to 2400  MHz using the following commands:
+
+⬇
+
+sudo
+
+nvidia
+-
+smi
+
+-
+pm
+
+1
+
+sudo
+
+nvidia
+-
+smi
+
+-
+i
+
+0
+
+-
+lgc
+
+2400,2400
+
+Unless otherwise specified, the “Default (unlocked)” setting means leaving the GPU in its default DVFS behavior, without applying a fixed graphics clock.
+
+Frequency probing via NVML.
+
+After applying the frequency lock or leaving it unlocked for the default setting, we probe the instantaneous graphics clock
+immediately before
+the draft model starts inference in each iteration. Concretely, we query NVML through
+pynvml
+by using the following command:
+
+⬇
+
+pynvml
+.
+nvmlDeviceGetClockInfo
+(\
+_gpu
+\
+_handle
+,
+
+pynvml
+.
+NVML
+\
+_CLOCK
+\
+_GRAPHICS
+)
+
+We record these measurements for each experimental configuration, which means different numbers of target instances
+N
+. In post-processing, we discard spurious outliers where the returned frequency is very low, which can occur during handle initialization or end of string task, and then aggregate the remaining samples to produce the summary shown in Fig.
+7
+.
+
+Observed frequency stability.
+
+Figure.
+7
+confirms that the locked configuration stays at 2400 MHz across all tested
+N
+, whereas the default configuration exhibits higher and varying graphics clocks. This verification ensures that the trends reported in Fig.
+6
+(
+b
+) are valid.
+
+Figure 7
+:
+Measured GPU graphics clock frequency before each draft-side inference under the default DVFS setting versus a fixed 2400  MHz lock.
+
+Appendix G
+Draft Inference Time Under Different Experimental Settings
+
+Draft inference speed
+
+We report the draft-side inference time measured during our experiments.
+To obtain accurate GPU kernel timing under CUDA’s asynchronous execution, we use
+torch.cuda.Event(enable_timing=True)
+and compute elapsed time via
+event.elapsed_time()
+with an explicit
+torch.cuda.synchronize()
+to ensure all kernels have completed.
+
+⬇
+
+starter
+
+=
+
+torch
+.
+cuda
+.
+Event
+(
+enable_timing
+=
+True
+)
+
+ender
+
+=
+
+torch
+.
+cuda
+.
+Event
+(
+enable_timing
+=
+True
+)
+
+starter
+.
+record
+()
+
+#
+
+draft
+
+forward
+
+pass
+
+ender
+.
+record
+()
+
+torch
+.
+cuda
+.
+synchronize
+()
+
+infer_ms
+
+=
+
+starter
+.
+elapsed_time
+(
+ender
+)
+
+#
+
+milliseconds
+
+Draft inference time trend.
+
+Figure.
+8
+plots the measured draft-side inference time under different numbers of target instances
+N
+on RTX 4090 server.
+As
+N
+increases from 1 to 2 or above, the inference time drops markedly, where
+N{=}1
+trace concentrates around
+\sim
+16  ms with pronounced jitter and frequent spikes, whereas the
+N{=}2
+and
+N{=}3
+traces form much tighter bands around
+\sim
+9  ms with only occasional outliers.
+
+Figure 8
+:
+Draft-side inference time under different numbers of target instances
+N
+.
+
+Summary statistics.
+
+Table
+2
+summarizes the draft-side inference time. As
+N
+increases from 1 to 2-3, the mean inference time decreases substantially and the variance drops sharply, indicating a faster and much more stable draft-side execution.
+
+Table 2
+:
+Draft-side inference time statistics.
+
+N
+
+Mean (ms)
+
+Variance (
+\mathrm{ms}^{2}
+)
+
+1
+
+16.06
+
+6.34
+
+2
+
+8.86
+
+0.30
+
+3
+
+9.17
+
+0.12
+
+Appendix H
+Deployment Illustrations
+
+StarSD is designed to support disaggregated speculative decoding across a range of deployment topologies as shown in Fig.
+9
+, from intra-node multi-GPU setups to networked multi-node clusters and heterogeneous edge-server environments.
+To make these supported scenarios explicit, we summarize three representative deployment modes:
+
+•
+
+Intra-Node Multi-GPU (Intra-MG)
+:
+machine-internal cross-GPU
+within a single machine.
+
+•
+
+Inter-Node Cluster (Inter-CL)
+:
+cross-machine
+deployment over a network.
+
+•
+
+Edge-Server Hybrid (Inter-ES)
+:
+cross-device
+deployment (e.g., Jetson-PC) emphasizing heterogeneity and portability.
+
+Figure 9
+:
+Deployment illustrations for StarSD.
+
+(A) Intra-MG:
+draft instance runs on one GPU and serves multiple target instances on other GPUs within the same machine, where communication can leverage intra-machine high-speed GPU interconnects, e.g., NVLink.
+
+(B) Inter-CL:
+draft instance runs as a draft server on one machine while target instances are placed on other machines, communication crosses the network boundary and is implemented via socket-based messaging.
+
+(C) Inter-ES:
+draft instance runs on one edge device, e.g., a laptop, whereas the target instances run on other edge devices, e.g., NVIDIA Jetson, and communication follows the same Inter-CL setup.
+
+Demo A: Intra-Node Multi-GPU (Intra-MG).
+
+In Intra-MG, the draft server hosting
+M_{q}
+is placed on one GPU, while the target instances
+\{M_{p}^{(i)}\}
+are placed on other GPUs within the same node.
+A representative configuration is to place
+M_{q}
+on a single GPU and run three target instances on the remaining GPUs of a 4-GPU server.
+This topology matches the
+machine-internal cross-GPU
+scenario and is a natural fit when co-locating
+M_{q}
+and
+M_{p}^{(i)}
+on the same device is infeasible due to memory pressure.
+Since all communication stays within one machine, StarSD can exploit high-bandwidth intra-host GPU transport, e.g., NVLink, to reduce transfer overhead. The real-world setup is shown in Fig.
+10
+(
+a
+).
+
+Demo B: Inter-Node Cluster (Inter-CL).
+
+In Inter-CL, the draft server and target instances are placed on different machines, corresponding to the
+cross-machine
+deployment over a network.
+A representative configuration is to host the draft instance alongside a subset of target instances on a single multi-GPU server, e.g., one GPU for draft and three GPUs for targets, while placing additional target instances on another server equipped with a different GPU type to form a heterogeneous cluster.
+Because the dataflow must traverse the network, we use a socket-based messaging layer for portability across commodity Ethernet and heterogeneous cluster environments, while keeping the StarSD execution logic unchanged.
+More specialized transports, e.g., RDMA or cluster-specific collectives, can be integrated as an optimization, but are not required for StarSD to function. The real-world setup is shown in Fig.
+10
+(
+b
+).
+
+Demo C: Edge-Server Hybrid (Inter-ES).
+
+To demonstrate
+cross-device
+portability, we also include an edge-server deployment in which one side runs on an embedded edge device, e.g., a Jetson, and the other side runs on a desktop/server GPU machine.
+This scenario stresses heterogeneous compute capability and network constraints, and therefore uses the same socket-based messaging layer as Inter-CL. The real-world setup is shown in Fig.
+10
+(
+c
+).
+
+(a) Intra-MG
+
+(b) Inter-CL
+
+(c) Inter-ES
+
+Figure 10
+:
+Photograph of the inter-server node deployment, the intra-server node deployment, and the Jetson-PC hybrid deployment.
+
+Appendix I
+Limitations and Future Directions
+
+Limitations.
+
+While StarSD demonstrates that a one-for-many speculative decoding framework can reduce draft-side idle gaps and improve overall utilization, the current design has several limitations.
+
+•
+
+Fairness and per-target quality of service are not explicit goals.
+
+StarSD is primarily optimized for high utilization and aggregate throughput.
+Without explicit fairness constraints, e.g., per-target rate limits, weighted scheduling, or latency service level objective (SLOs), some targets may experience worse tail latency under contention.
+
+•
+
+State isolation and memory pressure at scale.
+
+Maintaining per-
+tag
+KV caches and speculative metadata is necessary for correctness, but it increases the memory footprint at the draft side.
+With many concurrent sessions, cache growth and fragmentation can reduce effective capacity and complicate eviction policies.
+
+•
+
+Hardware heterogeneity is under-explored.
+
+When targets run on heterogeneous accelerators, e.g., different GPUs or edge devices, the variance in verification time increases, and scheduling becomes more challenging.
+The current system does not explicitly optimize for heterogeneous service rates or energy trade-offs.
+
+Future directions.
+
+We see multiple promising directions to extend StarSD beyond the current one-for-
+N
+design.
+
+Toward an M-for-N draft-target fabric.
+
+A natural extension is an
+M-for-N
+framework, where multiple draft instances
+\{M_{q}^{(j)}\}_{j=1}^{N_{q}}
+collaboratively serve multiple target instances
+\{M_{p}^{(i)}\}_{i=1}^{N_{p}}
+.
+Compared with one-for-
+N
+, the key objective is to remove the single-draft bottleneck while preserving high utilization and correctness under asynchronous returns.
+Concretely, this raises several system and algorithmic questions.
+(i)
+Dynamic pairing and load balancing:
+route each incoming verified prefix to a suitable draft instance based on queue length, predicted service time, and recent acceptance statistics.
+(ii)
+State placement:
+decide whether per-
+tag
+KV caches live with a fixed draft instance, migrate across drafts, or reside in a shared cache layer.
+(iii)
+Consistency and replay:
+ensure correctness when requests may be retried or migrated across drafts, requiring idempotent protocols and explicit versioning of speculative metadata.
+(iv)
+Scheduling with heterogeneity:
+incorporate heterogeneous compute and network costs to achieve both high throughput and bounded tail latency.
+
+Adaptive and learning-based control.
+
+Another direction is to make key system parameters adaptive to workload dynamics and latency SLOs, including the speculation depth
+d
+, batching policy, and routing strategy.
+For example, the system can adjust
+d
+online using lightweight predictors of acceptance length and verification latency, or learn scheduling policies that optimize a multi-objective target, e.g., throughput, latency, fairness, and energy.
+

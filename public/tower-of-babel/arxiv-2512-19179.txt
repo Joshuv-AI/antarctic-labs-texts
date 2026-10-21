@@ -1,0 +1,1481 @@
+L4: L ow-Latency and L oad-Balanced L LM Serving via L ength-Aware Scheduling
+Yitao Yuan, Chenqi Zhao, Bohan Zhao, Zane Cao, Yongchao He, Wenfei Wu Hfootnote.2
+
+Abstract
+Efficiently harnessing GPU compute is critical to improving user experience and reducing operational costs in large language model (LLM) services. However, current inference engine schedulers overlook the attention backend’s sensitivity to request-length heterogeneity within a batch. As state-of-the-art models now support context windows exceeding 128K tokens, this once-tolerable inefficiency has escalated into a primary system bottleneck, causing severe performance degradation through GPU underutilization and increased latency. We present L4, a runtime system that dynamically reschedules requests across multiple instances serving the same LLM to mitigate per-instance length heterogeneity. L4 partitions these instances into length-specialized groups, each handling requests within a designated length range, naturally forming a pipeline as requests flow through them. L4 devises a dynamic programming algorithm to efficiently find the stage partition with the best QoE, employs runtime range refinement together with decentralized load (re)balance both across and within groups, achieving a balanced and efficient multi-instance service. Our evaluation shows that, under the same configuration, L4 reduces end-to-end latency by up to 67% and tail latency by up to 69%, while improving overall system throughput by up to 2.89 × \times compared to the state-of-the-art multi-instance scheduling systems.
+
+
+
+1
+Introduction
+
+Large Language Models (LLMs) are increasingly deployed in production to support long-context, multi-turn applications such as chat assistants and agents
+[
+19
+,
+29
+]
+. To sustain massive request volumes, providers operate clusters of replicated inference instances (e.g., vLLM
+[
+10
+]
+, SGLang
+[
+35
+]
+), forming
+multi-instance LLM serving
+(
+MILS
+) systems.
+
+A growing mismatch.
+
+In MILS deployments, each instance executes requests in fine-grained decoding iterations using continuous batching
+[
+32
+]
+. Under short-context workloads, this abstraction worked well: batching available requests was sufficient to achieve high GPU utilization.
+However, modern long-context models routinely support token windows of 128K or more
+[
+14
+,
+5
+,
+19
+]
+. With long-context workloads, we observe a fundamental mismatch between this
+scheduling abstraction
+and the
+hardware characteristics
+of attention kernels. Our analysis of production traces and public dialogue datasets
+[
+22
+]
+shows highly skewed request-length distributions: many short requests coexist with a small but increasingly common set of extremely long ones.
+
+Attention computation—whose cost scales with sequence length—dominates decoding latency not only for a single long request (up to 80% for length at 64K context length
+[
+33
+]
+) but also for large batches (up to 81% for 1K sequences with a batch size of 250, as demonstrated in
+Section
+
+2.2
+).
+Critically, modern attention backends exhibit strong performance sensitivity to
+length heterogeneity
+: when a batch mixes short and long sequences, GPU utilization collapses due to unavoidable load imbalance and synchronization stalls. These inefficiencies stem from fundamental hardware execution constraints and persist even with advanced kernels such as FlashAttention
+[
+3
+]
+and Triton-based implementations
+[
+26
+,
+35
+]
+. In short,
+the attention backend wants homogeneous lengths, but the serving stack keeps giving it heterogeneous batches
+.
+
+Why existing schedulers fall short.
+
+State-of-the-art (SOTA) serving systems attempt to hide heterogeneity through intra-instance scheduling
+[
+10
+,
+35
+,
+28
+,
+2
+]
+. Yet an instance’s memory capacity and latency constraints fundamentally limit its ability to buffer enough requests to form homogeneous batches—an inherent consequence of Little’s Law
+[
+12
+]
+.
+Inter-instance schedulers (e.g., Llumnix
+[
+24
+]
+) distribute requests across instances to balance load or memory usage, but they are
+length-agnostic
+. As a result, every instance still receives heterogeneous batches and suffers the same backend inefficiency. No existing solution reshapes global request flow to match the backend’s computational needs.
+
+We argue that the remedy must occur above the instance level. We observe that the massive scale of MILS, while typically viewed as a source of complexity, actually offers the solution to this problem.
+By scheduling requests among global instances, L4 turns the scale of MILS from a management burden into an optimization opportunity. Guided by this insight and the strong backend preference for homogeneous lengths, we propose to restructure MILS scheduling around the principle of:
+“Global homogenization for local efficiency.”
+
+Instead of having every instance cope with global heterogeneity, we reshape the cluster into a
+length-aware pipeline
+where each instance (or group of instances) processes requests of similar length. As requests grow during decoding, they move downstream through the pipeline, so every instance naturally forms length-homogeneous batches
+without modifying
+its internal scheduler.
+
+This paper presents L4, a decentralized, length-aware inter-instance scheduling system for MILS clusters.
+L4 plans and maintains a multi-stage pipeline over the sequence-length space, routes incoming requests to the appropriate stage, and migrates them as they grow. To adapt to workload dynamics, L4 performs:
+
+(1) Workload-aware stage boundary adjustment
+: neighboring instances exchange lightweight length summaries and recompute boundaries to minimize predicted latency.
+
+(2) Decentralized bid-ask scheduling
+: overloaded instance offer requests while underloaded peers bid to acquire them, equalizing intra-stage load without a central coordinator.
+
+Across a 16-GPU deployment with production workloads, L4 reduces median latency by up to 67%, tail latency by up to 69%, and increases throughput by up to 2.89
+\times
+over SOTA inter-instance schedulers.
+
+In summary, our contributions are as follows:
+
+(1) We identify a fundamental mismatch between existing scheduling abstractions and the attention backend’s sensitivity to length heterogeneity in long-context MILS workloads.
+
+(2) We propose a shift from local-only to global-cooperative scheduling. By enforcing global length-homogeneity, L4 allows unmodified local schedulers to operate near hardware limits.
+
+(3) We implement L4 on vLLM and demonstrate substantial latency and throughput improvements over SOTA serving systems.
+
+2
+Background and Motivation
+
+Modern LLM serving clusters execute requests in a multi-instance setting,
+where each instance performs iterative token-by-token decoding using continuous
+batching
+[
+32
+,
+10
+,
+35
+]
+.
+While this abstraction worked well for short-context workloads, emerging
+long-context applications introduce a fundamental tension between
+
+how requests arrive
+and
+how attention kernels execute
+.
+This section summarizes the serving model, highlights the
+kernel-level characteristics that make sequence-length heterogeneity harmful,
+and explains why existing schedulers cannot address the resulting inefficiency.
+We conclude with the design insight that motivates L4.
+
+2.1
+Workflow of Inference
+
+In LLM inference, user requests are executed under
+continuous batching
+
+[
+10
+]
+. Transformer-based LLMs handle these
+requests in two distinct stages:
+prefill
+and
+decoding
+.
+
+Prefill.
+
+The model ingests the entire input sequence of length
+n
+in parallel to construct the initial
+
+key-value (KV) cache
+. Prefill involves a full self-attention over the prefix and therefore exhibits
+
+quadratic
+time complexity,
+O(n^{2})
+
+[
+27
+]
+. In practice, serving systems isolate prefill into dedicated iterations to fully utilize compute-bound kernels
+[
+37
+]
+.
+
+Decoding.
+
+After prefill, the model generates output tokens autoregressively. Modern serving systems batch
+multiple active requests into each decoding iteration. Each step reads all previously cached
+keys and values, performing an attention operation with
+linear
+time complexity,
+O(n)
+,
+per request. Critically, for long-context models (e.g., 128K tokens), this attention operation
+is
+memory-bound
+and can dominate iteration latency (up to 81%). Moreover, attention
+kernels are highly sensitive to sequence-length heterogeneity within a batch, suffering from
+severe load imbalance and inefficient tiling when processing mixed-length sequences.
+
+Whereas prefill consists of uniform, fully parallel computation, decoding performs iterative
+batching over requests with diverse sequence lengths. This heterogeneity disrupts the hardware
+efficiency of attention backends, creating a fundamental mismatch between traditional
+scheduling policies and the execution characteristics of long-context LLMs.
+
+2.2
+LLM Serving Model in MILS Clusters
+
+A MILS deployment consists of
+M
+identical
+inference instances operating independently. Each instance repeatedly performs
+
+iteration-level decoding
+: at each decoding step, it forms a batch from
+all active requests, executes a forward pass to produce the next tokens, and
+updates KV caches. Continuous batching
+[
+10
+]
+merges
+newly arrived requests into ongoing iterations to maximize GPU utilization.
+
+Figure 1
+:
+Request-length distribution in batches under various scheduling policies and request rates. Batches were sampled at 20%, 40%, 60%, and 80% of the inference process. The inputs come from an LLM dialogue dataset
+[
+22
+]
+, and requests longer than 128K are discarded.
+
+Two properties of this workflow are central to our study:
+
+(1) Iteration-level latency is dominated by attention.
+
+As sequence length and batch size grow, the KV cache becomes comparable to—or even larger than—the model’s weight size. Because decoding is memory-bound, attention overhead then gradually comes to dominate
+[
+33
+,
+3
+]
+.
+
+Empirically, our experiments using Llama-3.2-3B on an H100 GPU demonstrate that attention computation dominates latency at large batch sizes, even for short requests. Specifically, for 1000-token sequences, the attention phase accounts for up to 81% of total latency at a batch size of 250, a sharp increase from 14% for a single request. Similarly, for 200-token sequences at a batch size of 500, this proportion reaches 62% (vs. 14% baseline).
+
+(2) Engines observe highly heterogeneous sequence lengths.
+
+Real workloads exhibit skewed length distributions, with many short
+requests mixed with few but increasingly common long requests
+(Figure
+1
+). These heterogeneous requests
+inevitably co-exist in the same decoding iteration.
+
+These properties imply that the batch formed in each iteration—and its
+sequence-length composition—directly determines GPU efficiency.
+
+(a)
+
+Request length 1000 vs 50000.
+
+(b)
+
+Request length 200 vs 10000.
+
+Figure 2
+:
+Effect of sequence length heterogeneity on
+decoding forward
+pass performance. Measured on a single H100 GPU using vLLM and SGLang with FlashAttention, FlashInfer, and Triton (model: Llama-3.2-3B, batch size: 512).
+
+2.3
+Kernel Characteristics: Sensitivity to Length Heterogeneity
+
+Modern attention backends (e.g., FlashAttention, FlashDecoding, Triton-based
+implementations) rely on tiling and parallelizing each sequence into
+
+blocks
+to saturate GPU SMs. The performance of these kernels depends
+crucially on the number and shapes of blocks derived from each request’s
+sequence length. For a request with length
+L
+, the kernel generates roughly
+
+L/B
+blocks (for block size
+B
+) or uses variable block sizes to fit a
+fixed number of blocks
+[
+3
+,
+4
+]
+.
+
+When a batch mixes short and long sequences, the GPU encounters two sources
+of inefficiency:
+
+(1) Inter-SM imbalance.
+Long sequences produce dramatically more blocks than short ones. Even with optimized block partitioning, aggregation and synchronization remain serialized on the critical path of the longest request, leaving SMs waiting after short requests finish.
+
+(2) Partitioning inefficiency.
+
+Block-size vs. block-count trade-offs
+[
+4
+]
+cause either (i) excessive aggregation overhead for long sequences (fixed block size), or (ii) poor SM occupancy (oversized blocks under fixed block count). Heterogeneous batches induce both problems simultaneously.
+
+Empirically, batch-level heterogeneity can increase kernel latency to
+1.1–2.1
+\times
+even when the total number of input tokens remains constant
+(Figure
+2
+). Crucially, this inefficiency represents
+a
+hardware-execution property
+, not a limitation of a particular serving
+implementation. Attention kernels—and thus the GPU—strongly prefer
+
+length-homogeneous
+batches. However, MILS workloads naturally produce a heterogeneous mixture, revealing a fundamental mismatch.
+
+2.4
+Why Existing Schedulers Cannot Fix Heterogeneity
+
+Existing schedulers attempt to increase utilization through
+request reordering or routing, yet none can eliminate heterogeneity at the
+iteration level.
+
+Intra-instance scheduling.
+
+Techniques within a single instance
+[
+10
+,
+35
+,
+7
+,
+2
+]
+attempt to buffer requests and reorder them for better
+batch shape. However, an instance cannot accumulate enough requests to form
+length-homogeneous batches without violating latency targets and exhausting memory. This limitation follows directly from Little’s Law:
+
+P=\lambda W
+. Reducing heterogeneity requires a large queueing population
+(
+P
+), which implies higher memory consumption and longer waiting time
+(
+W
+); both are unacceptable.
+
+Inter-instance scheduling.
+
+Load balancers such as Llumnix
+[
+24
+]
+route requests across
+instances based on memory availability or load. These policies are
+length-agnostic: heterogeneity in the global arrival stream is simply
+replicated within every instance. As a result, all instances still process
+mixed-length batches and suffer the same kernel-level inefficiency.
+
+Conclusion.
+
+The root cause is that current abstractions treat instances as independent
+schedulers. But heterogeneity is a
+cluster-level phenomenon
+whose
+performance implications arise at the
+kernel execution level
+. Local
+scheduling cannot fundamentally reshape the global flow of requests to match
+the hardware’s preference.
+
+2.5
+Insight and Challenges
+
+Our key insight is that MILS clusters should be structured into a
+
+length-aware pipeline
+: partitioning instances into stages that each
+process a contiguous segment of the sequence-length space. Requests naturally
+grow over time and can be migrated between stages, allowing each instance to
+observe mostly length-homogeneous batches without changing its internal
+scheduler.
+As this approach remains agnostic to intra-instance scheduling strategies, it ensures long-term compatibility with the instance internals.
+
+Designing such a system, however, presents three challenges:
+
+Challenge 1: The search space for optimal stage partitioning is explosive.
+
+Range boundaries determine both performance and balance. The search space is large, which includes the number of stages, the number of instances in each stage, and the sequence length range for each stage; it also depends on workload distributions and kernel behavior. Exhausting all possible combinations cannot find the optimal stage partition within an acceptable time. We define a quality model to quantify the effectiveness of running a batch across multiple instances, and devise a dynamic programming algorithm to search for the partition (batch-to-instances assignment) with the optimal quality in polynomial time (§
+4.2
+).
+
+Challenge 2: The sequence length distribution can drift at runtime and become misaligned with the stage partition, leading to suboptimal performance.
+
+Stage partitioning is performed based on long-term workload statistics. But workloads and sequence-length distributions evolve over time. The misalignment between the partition and the distribution leads to performance degradation, but frequently (re)performing stage partitioning incurs significant overhead.
+Stage ranges must adapt to the distribution without disrupting ongoing decoding.
+L4 collects runtime length distribution and refines stage ranges to optimize the service quality (§
+4.3
+).
+
+Challenge 3: Loads of instances in the same stage could evolve to be imbalanced, and the system needs a scalable way to rebalance them.
+
+Intra-stage load imbalance stems from inherent request diversity, compounded by stale state information and the irregularity of inter-stage request migrations. Naïvely applying a central scheduler to balance and migrate requests introduces latency and scalability issues, canceling out its performance gains.
+L4 devises a decentralized bid-ask protocol: instances negotiate request migrations via sender-receiver bids, enabling efficient, scalable workload rebalancing (§
+4.4
+).
+
+3
+L4 Overview
+
+3.1
+Architecture
+
+When serving an LLM, L4 organizes inference instances into multiple
+length-specialized groups
+, each dedicated to sequences within a specific length range. During autoregressive decoding, sequence lengths increase monotonically. L4 leverages this property to form a logical
+pipeline
+, with each group as a pipeline stage; as decoding progresses, sequences naturally flow from shorter to longer stages. As shown in
+Figure
+
+3
+, this pipeline comprises
+N
+stages, each with a variable number of instances. Within each instance, L4 retains standard components: a
+scheduler
+for sequence batching and a
+GPU executor
+for batch processing on the attention backend. To support adaptive, decentralized rescheduling, L4 introduces two lightweight runtime components—
+LoadTracker
+and
+Coordinator
+—in each instance.
+
+The LoadTracker monitors the instance’s token-level workload (e.g., the number of input and output tokens per request) and exchanges these statistics with other instances—both peers in the same stage and instances in adjacent stages. This real-time monitoring allows L4 to capture transient workload fluctuations and trigger responsive adjustments.
+The Coordinator manages dynamic sequence migration by transferring metadata and KV cache across instances, either within a stage or to the next stage. By operating in a decentralized manner, the Coordinator eliminates the bottleneck of a central scheduler, thereby ensuring cluster scalability and minimizing the risk of scheduling decisions based on stale state information.
+
+3.2
+Workflow
+
+System bootup.
+
+L4 constructs the instance pipeline at startup.
+It applies a length-aware stage partition algorithm (§
+4.2
+) to partition instances into length-specialized stages. Each instance initializes its runtime components and establishes connections to peer instances within the same stage and to instances in adjacent stages. These connections enable both intra-stage and cross-stage coordination.
+
+Runtime request processing.
+L4 performs progressive decoding with stage transitions as described in
+Section
+
+2.2
+.
+As shown in
+Figure
+
+3
+, when a request arrives, it is routed to the earliest stage whose serving range covers its initial length. The assigned instance adds this request to its batch when memory is available, then performs prefill and decoding locally using its scheduler and GPU executor. As the sequence grows, if its length exceeds the instance’s range, it is migrated to the next stage for further decoding. This process repeats until the sequence completes.
+
+Figure 3
+:
+Architecture and workflow of L4. Engine instances are grouped by length into stages forming a logical pipeline; sequences may exit early without traversing all stages.
+
+Runtime load (re)balancing.
+Each LoadTracker monitors token-level GPU usage (❶) and propagates this information to peer instances in the same stage and to the upstream stage (❷). The LoadTracker triggers periodic range refinement and instantaneous request migration.
+
+With the load record over a period, an instance’s LoadTracker initiates stage range refinement. It collects the requests of itself and its successor instances. By running the range-refinement algorithm in
+Section
+
+4.3
+, it obtains a new boundary suitable for the current length distribution.
+
+With instantaneous instance loads (of peers and successors), when an instance hands requests to its successors, or when it finds itself overloaded within the same stage, the instance’s LoadTracker triggers the Coordinator (❸) to (re)balance load by migrating active requests within or across stages. The Coordinator runs a bid-ask protocol to determine the target instance for each request.
+For each migration, the Coordinator consults the scheduler to extract sequence metadata (e.g., token count, KV cache location and size, ❻), allocates memory on the target instance, and transfers the KV cache and control state asynchronously (❹❺) via
+live migration
+
+[
+24
+,
+6
+]
+(
+Section
+
+4.4
+).
+
+4
+L4 Mechanisms
+
+We first introduce a service quality model to represent the performance of an engine instance on a given batch (
+Section
+
+4.1
+), then construct an initial MILS pipeline using historical workload statistics (
+Section
+
+4.2
+). We devise a runtime pipeline stage boundary adjustment to balance inter-stage load (
+Section
+
+4.3
+) and decentralized request (re)scheduling to balance intra-stage load (
+Section
+
+4.4
+).
+
+4.1
+QoE Model for Requests and Instances
+
+QoE model for a request.
+After submitting a request, the user endures a prefill delay for the first token, then receives one token per iteration. We define the user’s quality of experience (QoE) as a combination of these two times:
+
+Q=\alpha T^{\text{Prefill}}+\beta T^{\text{Iteration}},
+
+where
+T^{\text{Prefill}}
+and
+T^{\text{Iteration}}
+are the two core serving-quality metrics—Time to First Token (TTFT) and Time per Output Token (TPOT), respectively.
+Since the prefill phase costs
+O(I^{2})
+time for an input request of length
+I
+, and each decoding iteration costs
+O(L)
+time for a request of length
+L
+,
+we can express
+Q
+as:
+
+Q=\left(C_{0}+C_{1}I+C_{2}I^{2}\right)+\left(C_{3}+C_{4}L\right),
+
+where the first term denotes the quadratic time complexity of prefill and the second term denotes the linear time complexity of one iteration.
+C_{i}
+are coefficients fitted by experiments.
+
+QoE model for a batch.
+When an instance processes a batch
+B
+(with
+n
+requests), each request’s processing time is stretched to the same value, namely for any
+j\in\{1,\dots,n\}
+:
+
+Q_{j}=\left(C^{\prime}_{0}+C^{\prime\prime}_{0}n+C_{1}\sum_{i=1}^{n}I_{i}+C_{2}\sum_{i=1}^{n}I_{i}^{2}\right)+\left(C^{\prime}_{3}+C^{\prime\prime}_{3}n+C_{4}\sum_{i=1}^{n}L_{i}\right),
+
+(C^{\prime}_{0}+C^{\prime\prime}_{0}=C_{0},C^{\prime}_{3}+C^{\prime\prime}_{3}=C_{3}),
+
+where variables with subscript
+i
+denote the attributes for request
+i
+. The overall batch QoE is defined as
+
+Q^{B}=\sum_{j=1}^{n}Q_{j}=nQ_{1}=n\sum_{k=0}^{4}D_{k}F_{k},
+
+(1)
+
+where
+D_{k}
+are coefficients,
+F_{0}=1
+,
+F_{1}=n
+,
+F_{2}=\sum_{i=1}^{n}I_{i}
+,
+F_{3}=\sum_{i=1}^{n}I_{i}^{2}
+, and
+F_{4}=\sum_{i=1}^{n}L_{i}
+.
+
+Fitting the parameters
+D_{k}
+.
+We run experiments with various batch settings. For each run, we obtain
+F_{k}
+from the request input and output lengths; we obtain
+Q
+as the
+normalized latency
+—the end-to-end sequence latency divided by its output length, following prior work
+[
+10
+,
+32
+,
+9
+]
+.
+
+We fit the QoE-model parameters
+D_{k}
+by profiling. We begin by partitioning requests in the dataset into exponentially growing length buckets (e.g.
+[100,200)
+,
+[200,400)
+,
+[400,800)
+,
+\dots
+), discarding those that are too short. For each bucket, we measure online inference latency under batch sizes
+1,2,4,\dots
+up to the maximum supported by memory, thereby controlling the request rate within a fixed memory budget. To profile a batch size
+B
+, we continuously inject requests to maintain
+B
+in-flight; whenever one request completes, another is enqueued. Each
+(\text{length},B)
+configuration runs for a fixed duration. From the resulting trace, we extract each request’s normalized latency
+Q
+and its average batch loads
+F_{k}
+over its lifetime, then perform a least-squares regression of
+Q
+against
+F_{k}
+to estimate
+D_{k}
+. Denoting by
+N
+the total number of requests, by
+Q^{(j)}
+the normalized latency of the
+j
+th request, and by
+F_{k}^{(j)}
+its
+k
+th batch-load feature, we compute
+
+\bigl(\hat{D}_{0},\dots,\hat{D}_{4}\bigr)=\arg\min_{D_{0},\dots,D_{4}}\sum_{j=1}^{N}\Bigl(Q^{(j)}-\sum_{k=0}^{4}D_{k}\,F_{k}^{(j)}\Bigr)^{2}.
+
+For validation, we split the dataset into a fitting set and a validation set, and apply the same benchmarking procedure to the validation set as used during profiling. We compute the relative prediction error and show the results in
+Section
+
+6.5
+.
+
+4.2
+Length-Aware Stage Partition
+
+Problem formulation.
+
+Finer-grained pipelines with more stages reduce length heterogeneity within each stage but incur higher inter-stage communication overhead. Conversely, allocating too many instances to a stage may reduce the number of stages and increase intra-instance sequence-length heterogeneity. A well-designed pipeline must balance these factors.
+
+Pipeline planning runs at initialization and periodically thereafter. L4 collects request statistics over the period (input and output lengths) and generates pipeline settings for the next period.
+
+The pipeline planning problem is to find optimal pipeline settings (number of stages
+s
+, number of instances per stage, and range of each stage) given
+E
+instances and a set of requests. Let
+n_{l^{\prime},l}
+denote the subset of requests whose sequence lengths lie in
+[l^{\prime},l)
+. The pipeline’s “goodness” is quantified as the total QoE of all instances processing all requests, called pipeline quality.
+
+Algorithm.
+Let
+f_{s,e,l}
+denote the optimal pipeline quality of serving all sequences with length
+\leq l
+using
+s
+stages and
+e
+instances.
+f_{s,e,l}
+can be recursively represented as the sum of the optimal quality of the previous
+s-1
+stages and the QoE of the
+s
+-th stage; enumerating all possible numbers of instances and requests in the
+s
+-th stage gives the optimal
+f_{s,e,l}
+:
+
+f_{s,e,l}=\min_{e^{\prime}\in[s-1,e],\;l^{\prime}\in[0,l-1]}f_{s-1,e^{\prime},l^{\prime}}+(e-e^{\prime})Q^{n_{l^{\prime},l}/(e-e^{\prime})}+c_{l^{\prime}}.
+
+c_{l^{\prime}}
+captures the delay of transferring all sequence fragments straddling the cut at length
+l^{\prime}
+, computed based on the volume of transferred tokens and system bandwidth.
+
+n_{l^{\prime},l}/(e-e^{\prime})
+means dividing the request set
+n_{l^{\prime},l}
+evenly among
+e-e^{\prime}
+subsets
+1
+1
+
+1
+
+We approximate a subset of the set division
+S/n
+by sorting elements in the set, starting from the
+n/2
+-th one, and picking every
+n
+-th element to comprise the subset.
+.
+
+Q^{n_{l^{\prime},l}/(e-e^{\prime})}
+is the QoE of one instance in its request processing, computed by
+Equation
+
+1
+.
+
+The recursion can be solved by dynamic programming. Finding the smallest value among all
+f_{*,E,*}
+(all possible numbers of stages
+s
+and sufficiently large sequence length
+L
+) gives the optimal pipeline settings.
+
+Figure 4
+:
+Pipeline planning based on the request length distribution.
+
+For example,
+Figure
+
+4
+illustrates the composition of
+f_{3,8,6k}
+for a three-stage pipeline with
+E=8
+instances. The DP algorithm selects cut points at lengths 2k and 4k, allocating 3, 3, and 2 instances to stages covering lengths
+[0,2k)
+,
+[2k,4k)
+, and
+[4k,6k)
+, respectively. The QoE of each stage is
+3Q^{n_{0,2k}/3}
+,
+3Q^{n_{2k,4k}/3}
+, and
+2Q^{n_{4k,6k}/2}
+, and the inter-stage migration overheads at the cut points are
+c_{2k}
+and
+c_{4k}
+. Summing these three QoEs and the two overheads yields the final estimate.
+
+Optimizing efficiency.
+
+Naively evaluating all
+(s,e,l)
+triples incurs a time complexity of
+O(E^{3}L^{2})
+, even with
+O(1)
+prefix-sum access to
+n
+and
+T
+. To make this dynamic program tractable, we introduce two key optimizations.
+First, we bucket sequence lengths into exponentially increasing tiers (e.g.,
+[1,2)
+,
+[2,4)
+,
+[4,8)
+,
+\ldots
+), reducing the number of candidate cut points from
+L
+to
+O(\log L)
+. This is motivated by the observation that real-world inference workloads are highly skewed: most sequences are short or moderate in length, while very long sequences are rare and sparsely distributed. Coarse-grained binning in the long-tail region prevents a few outliers from dominating the DP state space, reducing complexity from
+O(E^{3}L^{2})
+to
+O(E^{3}\log^{2}L)
+while retaining modeling fidelity.
+
+Second, we apply a two-phase heuristic. We first run a simplified DP that assigns exactly one instance per stage, yielding an initial
+E
+-stage pipeline in
+O(E\log^{2}L)
+time. We then iteratively merge adjacent stages to reduce total latency. For each pair, we define a
+merge gain
+—the reduction in latency from unifying their instance and sequence range—and greedily merge the pair with the highest positive gain. Gains are tracked in a max-heap for
+O(E\log E)
+updates, or computed via a naive
+O(E^{2})
+scan. This process continues until no further improvement is possible.
+
+These optimizations reduce the end-to-end complexity to
+O(E(\log^{2}L+\log E))
+, enabling efficient pipeline planning at cluster scale. While the number of instances
+E
+per model is typically small (e.g., a few dozen), the supported context length
+L
+can reach 128K tokens or more, making algorithmic efficiency crucial.
+
+4.3
+Adaptive Range Refinement
+
+Each instance periodically refines its range boundary based on LoadTracker. At each refinement interval, the instance collects the sequence lengths from both itself and its successors. L4 first computes the average workload of the next stage: it merges the successor sequence lengths as a union set, and divides the set evenly by the number of successors (using the same set division method in
+Section
+
+4.2
+).
+
+L4 merges the instance’s local sequence lengths and the average successor lengths into a single set. It sorts the requests in the set as a list
+R
+with requests indexed from
+0
+to
+N-1
+. L4 enumerates all possible splitting points in
+R
+, computes the overall quality of both parts by
+Equation
+
+1
+, and finds the optimal one with the best overall quality:
+
+b=\arg\min_{0\leq i<N}\;\left(Q^{R[:i]}+Q^{R[i:]}\right).
+
+Thus, the boundary is identified as the length at the optimal splitting point
+R[b]
+.
+
+To ensure boundary stability and prevent performance degradation caused by oscillating partitions, we apply three optimizations. First, the boundary is initialized using the offline pipeline planning result, providing a high-quality starting point that accelerates convergence. Second, we smooth the boundary updates using exponential moving averaging. This acts as a low-pass filter to dampen sensitivity to short-term workload fluctuations, thereby avoiding spurious transfers and unnecessary adjustments driven by transient spikes. Third, we suppress refinements during periods of low traffic (e.g., when there are fewer than five requests). In such sparse regimes, the arrival or completion of a single request can disproportionately skew the length distribution; freezing the boundary prevents these discrete events from causing huge shifts in partition logic, ensuring reliable decisions.
+
+4.4
+Decentralized Load (Re)Balancing
+
+Figure 5
+:
+Illustration of intra
+-
+stage load balancing using dynamic decentralized bid-ask scheduling.
+
+Two classes of intra-stage load (re)balancing.
+When an upstream instance hands over requests to its downstream successors, the request distribution should be balanced. This inter-stage request handover triggers bid-ask scheduling.
+
+When instances within one stage execute for a while, their loads may diverge due to diverse requests, requiring rebalancing. With instance LoadTracker exchanging their workloads (sequence lengths), once an instance finds itself an overloaded outlier (e.g., its request-memory demand is 25% above the stage average), it triggers intra-stage bid-ask scheduling. Both classes share the same protocol and migration subsystem below.
+
+Bid-ask protocol.
+For scalability, L4 employs a decentralized bid-ask scheduling protocol: each sender distributes its requests to receivers independently, and all senders’ requests are balanced across all receivers.
+
+Senders and receivers negotiate pairwise for request handover, akin to transaction matching in financial markets. This analogy inspires a lightweight
+bid-ask protocol
+
+[
+8
+]
+to match senders and receivers without global coordination.
+
+The protocol works as follows. In the “asking” phase, the sender notifies all candidate receivers of one request migration. In the “bidding” phase, each receiver replies with its current load and the earliest time it can start the request migration (defined below). The sender filters out half the receivers with higher load, then keeps the three receivers with the earliest transmission start times, and selects the one that replies first. The sender notifies the chosen receiver to confirm the ownership handover, including request metadata such as request ID, sequence length, and source instance. The sender continues to hand over other requests.
+
+Request migration.
+
+Figure
+
+5
+illustrates the transmission subsystem.
+The sender buffers all requests to migrate.
+The receiver buffers the requests it wins in a
+priority queue
+.
+
+In the bid-ask protocol, the sender’s asking message piggybacks its load (the total length of all buffered requests), and the receiver’s bidding message piggybacks its earliest transmission start time (the total length of its buffered requests divided by its measured throughput).
+A request’s priority is defined as the sender’s load, which is used to order the requests in the priority queue.
+
+The receiver repeatedly dequeues the highest-priority request from the priority queue and initiates migration. If the sender is transmitting another request, the receiver skips this request and attempts the next; otherwise, it starts transmission immediately.
+
+A receiver’s first request in the priority queue could starve if the sender repeatedly transmits other requests. To avoid this, the receiver records the number of failed attempts for each request; once a request fails more times than a threshold, the receiver notifies the sender about the starvation, prompting the sender to send the request immediately after completing the current transmission. The receiver then waits to receive the request instead of attempting the next one.
+
+For request transmission, we adopt a
+live-migration
+mechanism proposed by Llumnix
+[
+24
+]
+, which pipelines KV-cache transfer with ongoing decoding in multiple rounds, minimizing disruption to the source instance. When a transmission completes, the sender removes the request from its buffer and deletes the sequence, and the receiver removes the request from its priority queue and hands the sequence to the local scheduler for further processing.
+
+Figure 6
+:
+Mean and 95th-percentile TTFT measured across different LLM models under varying request arrival rates.
+
+5
+Implementation
+
+L4 is implemented with 3,000 lines of Python for the control plane and 700 lines of C++ for the high-performance communication backend, built atop vLLM (v0.9.1) without modifying its core attention kernels. We integrate L4 modularly into vLLM via Scheduler-Aware Hooks: the LoadTracker monitors token-level workloads, while the Coordinator manages metadata and orchestrates KV cache migrations.
+
+Efficient migration infrastructure.
+To minimize the overhead of frequent, fine-grained KV transfers, we implement a custom C++ communication backend that bypasses Python’s GIL and avoids the latency of NCCL’s collective operations, which are ill-suited for numerous small messages. Instead, the backend leverages low-level APIs—specifically
+cudaMemcpyPeerAsync
+for intra-node and RDMA verbs for inter-node transfers—to achieve zero-copy GPU-to-GPU transmission. Furthermore, L4 optimizes physical topology by placing instances of adjacent pipeline stages on the same node whenever possible, thereby significantly reducing expensive inter-node communication.
+
+Migration flow control and optimization.
+L4 optimizes runtime execution by eliminating intermediate buffers; KV caches are transferred directly into idle slots on the target instance, and migration is skipped if no idle cache is available. To prevent bandwidth contention, L4 enforces a strict concurrency limit (capped at three parallel transfers in our implementation); requests exceeding this threshold continue running on the source to avoid performance regression. Finally, we employ asynchronous multi-round live migration (adapting Llumnix
+[
+24
+]
+) combined with bidirectional transfer support and a starvation-aware backpressure mechanism. This design effectively overlaps communication with computation, preventing head-of-line blocking while maximizing GPU and NIC utilization.
+
+6
+Evaluation
+
+This section addresses four key questions:
+
+(1) How does L4 affect request latency across diverse configurations? (
+Section
+
+6.2
+)
+
+(2) How does L4 influence system throughput across diverse configurations? (
+Section
+
+6.3
+)
+
+(3) How does L4 impact SLO attainment? (
+Section
+
+6.4
+)
+
+(4) What is the effect of each L4 mechanism? (
+Section
+
+6.5
+)
+
+6.1
+Experimental Setup
+
+Testbed.
+We evaluate L4 on two testbeds, each comprising two nodes with 16 NVIDIA GPUs. The first testbed uses NVLink-connected H20 GPUs, each with 141 GB of memory, while the second employs PCIe-connected L40 GPUs, each with 48 GB. Every node in both setups is equipped with 2 TB of host memory, an Intel® Xeon® Platinum 8468 CPU (192 logical cores), and a 400 Gbps ConnectX-7 NIC.
+
+Baselines.
+We compare L4 against three popular open-source inference frameworks: vLLM 0.9.1
+[
+10
+]
+, SGLang 0.4.9
+[
+35
+]
+, and Llumnix
+[
+24
+]
+. vLLM and SGLang operate as standalone inference service instances without inter-instance scheduling; we therefore deploy a simple round-robin load balancer across their instances. In contrast, Llumnix extends vLLM with an integrated inter-instance scheduler, which we run using its default configuration. Unless stated otherwise, all backends use an FCFS policy. We cap the batch size at 1024—the vLLM official default—with actual batch sizes further constrained by memory and token budgets at runtime. Following the official default settings, we use FlashAttention
+[
+3
+]
+
+backend for vLLM, Llumnix, and L4, and use FlashInfer
+[
+31
+]
+backend for SGLang
+[
+35
+]
+.
+
+Models.
+We evaluate eight LLMs in FP16 precision across a range of commonly used sizes, grouped into four categories: (1)
+Tiny
+— Llama-3.2-3B
+[
+14
+]
+and Phi-3-3B
+[
+1
+]
+; (2)
+Small
+— Llama-3.1-8B
+[
+13
+]
+and GLM-4-9B
+[
+34
+]
+; (3)
+Moderate
+— Phi-3-14B
+[
+1
+]
+and Qwen-2.5-14B
+[
+30
+]
+; and (4)
+Large
+— QwQ-32B
+[
+25
+]
+and Qwen-2.5-32B
+[
+30
+]
+. Each instance runs on a single GPU, except for Llama-3.1-70B
+[
+13
+]
+, which we evaluate in 2- and 4-way tensor-parallel configurations.
+2
+2
+
+2
+
+We make homogeneous instance setups and leave the discussion of heterogeneous configuration in
+Section
+
+8
+.
+
+We exclude larger models because their high per-instance GPU requirements would leave too few instances on our testbeds, misrepresenting typical multi-instance deployments. L4 constructs pipelines of 4 to 6 stages for the selected model, with each stage comprising 1 to 4 instances. All selected models support context lengths of at least 128K tokens.
+
+Workload.
+Following the standard practice in prior work
+[
+10
+,
+28
+,
+24
+]
+, we construct workloads using the ShareGPT
+[
+22
+]
+datasets of ChatGPT conversation histories and model request arrivals as a Poisson process with configurable rates. Each test point runs for the same duration.
+
+Figure 7
+:
+Mean and 95th-percentile TPOT measured across different LLM models and varying request arrival rates.
+
+Metrics.
+We evaluate inference performance using four key metrics:
+Time to First Token (TTFT)
+— the time from request submission to the generation of the first output token;
+Time per Output Token (TPOT)
+— the average latency to generate each subsequent token in a request;
+Throughput
+— system-wide token generation rate; and
+SLO Attainment
+— the percentage of requests meeting the defined SLO.
+
+Experiment parameters.
+We vary request arrival rates to cover both light and heavy loads. Light load verifies that L4 does not introduce a negative impact, while heavy load, our target scenario, evaluates its performance gains.
+
+6.2
+Reduced End-to-End Latency
+
+Latency reduction across models.
+We compare L4 with other systems across eight LLMs on the H20 testbed. The results are shown in Figures
+6
+and
+7
+.
+
+Figure 8
+:
+TPOT of a
+single
+instance across varying request arrival rates. L4’s single-instance performance matches vLLM’s but falls behind Llumnix’s. By comparing this to other results in §
+6
+, we find that L4’s multi-instance scheduling delivers higher gains than Llumnix’s.
+
+TTFT.
+
+As shown in
+Figure
+
+6
+, L4 consistently achieves a lower mean TTFT than vLLM, SGLang, and Llumnix. Under heavy load, it reduces mean TTFT by 67%–78% compared to vLLM, by 70%–84% compared to SGLang, and by 36%–66% compared to Llumnix, the state-of-the-art in multi-instance scheduling system.
+Tail TTFT exhibits similar trends, with average reductions of 56%, 62%, and 19%, respectively.
+Under light load, model access overhead (unrelated to requests) dominates latency, so the system reverts to standard multi-instance scheduling with performance comparable to Llumnix.
+
+TPOT.
+
+As shown in
+Figure
+
+7
+, L4 achieves a lower mean TPOT than vLLM, SGLang, and Llumnix in most settings. Under heavy load, it reduces mean TPOT by 30%–64% vs. vLLM, 25%–77% vs. SGLang, and 3.4%–56% vs. Llumnix.
+L4 also reduces tail TPOT by 25% vs. vLLM, 61% vs. SGLang, and 20% vs. Llumnix under heavy load.
+
+Under light load, Llumnix performs better because it runs on a newer engine with lower latency. Since L4 focuses on scheduling requests across engine instances rather than optimizing a single engine instance, its benefits here are actually underestimated—on that same newer engine, L4 would achieve even lower TPOT. We confirmed this by experiments below. The results show that L4’s single-instance performance is on par with vLLM’s but falls short of Llumnix’s.
+
+(a)
+
+L40 testbed
+
+(b)
+
+Tensor parallelism
+
+Figure 9
+:
+Normalized latency measured on an additional testbed and tensor-parallelism configurations.
+
+Figure 10
+:
+System throughput measured across different LLM models under varying request arrival rates.
+
+Comparison of single-instance performance.
+
+L4 focuses on improving cluster-level performance by using length-aware request scheduling across instances. When processing requests from the same batch, L4 delivers single-instance performance on par with vLLM, demonstrating full compatibility with both existing and future intra-instance optimizations. In a side-by-side comparison of single-instance performance among L4, vLLM, and Llumnix (
+Figure
+
+8
+), L4 matches vLLM but is still outperformed by Llumnix’s latest engine by 22%–81% since Llumnix’s engine has a lower runtime scheduling and executing overhead than vLLM. This gap indicates that the cluster-level gains reported in the evaluation actually underestimate L4’s potential—when paired with the newest engine, L4 can achieve even higher overall performance.
+
+Latency reduction across testbeds.
+To demonstrate that L4’s performance gains are platform-independent, we evaluate it on the L40 testbed, which has 48 GB of memory and thus only supports small models. We measure normalized latency, defined as the end-to-end delay per output token, including both TTFT and TPOT. As shown in
+Figure
+
+9(a)
+, L4 outperforms all baselines and reduces latency by 45%–67%.
+
+Latency reduction under tensor parallelism.
+To evaluate L4 on large models spanning multiple GPUs, we run Llama-3.1-70B with tensor parallelism (TP) of 2 and 4 on the H20 testbed. At TP=2, model parameters occupy nearly half of each GPU’s memory, causing higher parameter access latency and reducing L4’s effectiveness compared to TP=4. As shown in
+Figure
+
+9(b)
+, L4 reduces latency by 27%–65% with 2 GPUs and 49%–64% with 4 GPUs, outperforming all baselines.
+
+(a)
+
+L40 testbed
+
+(b)
+
+Tensor parallelism
+
+Figure 11
+:
+System throughput measured on an additional testbed and tensor-parallelism configurations.
+
+6.3
+System Throughput Improvement
+
+Throughput improvement across models.
+
+Figure
+
+10
+shows the throughput of each system across eight models on the H20 testbed. Throughput declines once the request rate exceeds a threshold, as all systems prioritize prefilling over decoding. L4 sustains a higher threshold than all baselines. Under heavy load, its average throughput reaches 1.99
+\times
+and 2.18
+\times
+those of vLLM and SGLang, respectively, and is 1.71
+\times
+that of Llumnix. These gains stem from L4’s improved attention backend efficiency by reducing length heterogeneity.
+
+Throughput improvement across testbeds.
+
+Figure
+
+11(a)
+shows system throughput on the L40 GPU. Under heavy load, L4 achieves average throughputs of 1.37
+\times
+, 1.21
+\times
+, and 1.34
+\times
+those of vLLM, SGLang, and Llumnix, respectively. These gains are smaller than on H20, as the L40’s lower memory caps batch sizes and narrows the length-heterogeneity gap.
+
+Throughput improvement under tensor parallelism.
+As shown in
+Figure
+
+11(b)
+, L4 achieves 1.31–2.53
+\times
+throughput with 2 GPUs and 2.89–4.16
+\times
+throughput with 4 GPUs compared to the baselines. The benefit increases with TP size, since tensor parallelism reduces each GPU’s model-access overhead.
+
+(a)
+
+5
+\times
+SLO
+
+(b)
+
+10
+\times
+SLO
+
+(c)
+
+20
+\times
+SLO
+
+Figure 12
+:
+SLO attainment measured across SLO levels and varying request arrival rates. The SLO is defined by the mean TTFT and TPOT at minimum system load, and the N
+\times
+SLO scales both constraints N times.
+
+6.4
+Improved Service Level Objective Attainment
+
+Service Level Objectives (SLOs) define worst-case bounds on key inference-service metrics (e.g., TTFT, TPOT) to ensure a consistent user experience. We quantify SLO attainment as the fraction of those bounds actually met—higher attainment indicates better service quality. We define the baseline SLO as the TTFT and TPOT under minimum load (one request), then evaluate attainment when both bounds are scaled by a factor of N.
+Figure
+
+12
+shows the results of Llama-3.2-3B on the H20 testbed; results for other models, omitted for brevity, exhibit similar trends. Compared with the baselines, L4 achieves 3.8–7.6
+\times
+attainment under 5
+\times
+SLO and 2.0–2.8
+\times
+attainment under 20
+\times
+, driven by its lower TTFT and TPOT.
+
+Figure 13
+:
+Prediction error of our cost model. Errors closer to zero are better.
+
+6.5
+Design Choice Validation and Ablation Study
+
+Our ablation study yielded consistent observations and conclusions across all models and testbeds; for simplicity, we present results for Llama-3.2-3B on the H20 testbed.
+
+Accuracy of the QoE model for latency estimation.
+As the basis for pipeline planning and boundary adjustment, we first validate the accuracy of our QoE model’s latency estimates. We perform profiling experiments across various request lengths and rates to calibrate the model parameters, and then conduct a validation study using these parameters. As a baseline, we use a static predictor that always returns the global mean latency.
+Figure
+
+13
+shows the probability density of per-request relative prediction errors. Our model’s error distribution peaks sharply at zero, with an average error of 8.9%, versus 64% for the static baseline.
+
+Length-aware vs. naïve stage partitioning.
+
+We compare L4 with two naïve layouts: a
+chain
+layout, which assigns one instance per pipeline stage, and a
+no-pipeline
+layout, which coalesces all instances into a single stage. As shown in
+Figure
+
+14
+, the absence of length-based partitioning causes the no-pipeline design to perform the worst, while the chain layout underperforms L4 due to its overly long pipeline, which incurs higher migration overhead and complicates load balancing across stages. Consequently, L4 achieves 30% lower latency and 7.1% higher throughput compared to the chain layout.
+
+(a)
+
+Normalized latency
+
+(b)
+
+System throughput
+
+Figure 14
+:
+Performance across layouts and varying request arrival rates.
+
+Adaptive vs. naïve range-refinement policies.
+
+We compare L4 against two naïve range-refinement policies: a quantity-based refinement that balances the number of requests per stage, and a memory-based refinement that equalizes per-stage memory usage. Both policies enforce increasing request lengths across stages, as in L4. However, the quantity-based approach yields severe workload imbalance and thus the poorest performance, while the memory-based scheme fails to account for request heterogeneity as in
+Section
+
+4.3
+. As
+Figure
+
+15
+illustrates, L4 outperforms the memory-based policy by 21% lower latency and 12% higher throughput.
+
+Complexity reduction for stage partitioning.
+With 16 instances and a 128K sequence length, our optimized algorithm (
+Section
+
+4.2
+) completes stage partitioning in 0.06s, versus an estimated 51 hours without optimization, yielding a speedup of roughly
+3\times 10^{6}
+.
+
+(a)
+
+Normalized latency
+
+(b)
+
+System throughput
+
+Figure 15
+:
+Performance across boundary-adjustment policies and varying request arrival rates.
+
+Figure 16
+:
+Imbalance in output token counts across instances at each stage. Lower values are better.
+
+The load-balancing effect of bid-ask protocol.
+We construct a four-stage pipeline with four instances per stage and compare three load-balancing policies. For each stage, we record the number of output tokens per instance and compute the coefficient of variation (CV), with lower values indicating a more balanced load. As shown in
+Figure
+
+16
+, the round-robin policy exhibits the highest imbalance, since it dispatches requests regardless of instance load. Inter-stage-only bid-ask scheduling reduces this imbalance, while full bid-ask scheduling further mitigates the variability from unpredictable output lengths, yielding an average CV reduction of 40% over inter-stage-only bid-ask and 47% over round-robin.
+
+7
+Related Work
+
+Attention backends.
+Modern self-attention kernels such as FlashAttention
+[
+3
+]
+and FlashInfer
+[
+31
+]
+improve memory efficiency via I/O-aware designs and paged KV caches
+[
+10
+]
+. Transformer libraries
+[
+17
+,
+11
+]
+and low-level frameworks like Triton
+[
+26
+]
+, CUTLASS
+[
+16
+]
+, and CUDA
+[
+15
+]
+provide flexible platforms for scalable attention. L4 complements these by reducing request-level length heterogeneity to unlock the efficiency of the attention backend.
+
+Intra-instance scheduling.
+vLLM
+[
+10
+]
+and SGLang
+[
+35
+]
+dynamically form iteration batches using FCFS or length-aware policies. Prior work
+[
+36
+]
+reduced output-length heterogeneity in traditional one-shot batching through output-length prediction, thereby reducing hardware idle time. However, this batching paradigm has been superseded by the more efficient continuous batching
+[
+32
+]
+that underpins L4. FastServe
+[
+28
+]
+, SSJF
+[
+20
+]
+, and similar works
+[
+7
+]
+prioritize short-output requests to improve latency. Yet, this comes at the cost of throughput: effective prioritization often relies on small batch sizes (e.g.,
+\leq 10
+in SSJF) and aggressive preemption, leading to high swapping overhead
+[
+28
+]
+that hinders system efficiency.
+L4 avoids this trade-off by distributing length-homogeneous batches across its instances.
+
+Inter-instance scheduling and distributed inference.
+Multi-instance systems
+[
+24
+,
+18
+,
+21
+]
+like Llumnix
+[
+24
+]
+employ load- and cache-aware heuristics to balance traffic among instances. Others
+[
+37
+,
+38
+,
+23
+]
+decouple inference into phases (e.g., prefill vs. decode) and assign these phases to specialized instance pools or heterogeneous hardware. L4 is compatible with these approaches and enhances them via length-based instance partitioning.
+
+Request migration in LLM serving.
+ServerlessLLM
+[
+6
+]
+and Llumnix
+[
+24
+]
+enable live request migration for stall-free handoff. L4 builds on this by integrating migration into the decentralized bid-ask mechanism for balancing length-specialized instances.
+
+8
+Discussion
+
+This work exposes a fundamental limitation of current LLM serving: intra-instance schedulers operate under the constraints of Little’s Law and cannot accumulate enough requests to mitigate sequence-length heterogeneity, while the attention backend is highly sensitive to such heterogeneity. This mismatch leads to persistent GPU underutilization even with optimized single-instance engines.
+
+Scope and limitations.
+L4 is most effective when ample GPU memory enables large-batch processing, shifting the primary latency bottleneck from parameter access to attention computation and KV cache intensity. Gains scale with available memory and parallelism. When the parameter size is large relative to the total GPU memory (e.g., occupying 80% of the available capacity) and the remaining KV cache memory cannot support large batches, the realized benefits are naturally constrained, yet the method remains effective. Workloads with highly uniform lengths inherently present less heterogeneity, where L4 still maintains correct scheduling and avoids overhead.
+
+Orthogonality.
+L4 is independent of any particular inference engine. While our prototype inherits vLLM’s single-instance performance characteristics, the scheduling layer itself is complementary to kernel-level and intra-instance optimizations; faster execution engines would only amplify the benefits of global coordination.
+
+Scalability.
+L4 combines offline bucket planning with lightweight online bid-ask rescheduling, keeping planning overhead low and KV migration infrequent. KV migration is efficient (
+Section
+
+5
+) and rarely impacts performance under realistic bandwidth; even under stress, L4 degrades gracefully.
+
+Heterogeneous instances.
+While our evaluation employs homogeneous instance setups to align with standard production practices for simplified management, L4’s mechanisms—including pipeline planning, boundary adjustment, and bid-ask scheduling—natively support heterogeneous configurations. However, fully exploiting this flexibility presents a significant challenge: modern inference engines (e.g., vLLM and SGLang) expose hundreds of configurable parameters (e.g., tensor, pipeline, and expert parallelism degrees). Identifying the optimal configuration for each pipeline stage involves a high-dimensional search with prohibitive profiling costs, which we leave for future exploration.
+
+9
+Conclusion
+
+By elevating length heterogeneity from a local batching issue to a cluster-level scheduling problem, L4 enables effective request regrouping across identical replicas, overcoming fundamental limits of per-instance schedulers. Through dynamic boundaries and decentralized rescheduling, L4 achieves substantial utilization and throughput gains, advancing scalable and efficient LLM serving.
+

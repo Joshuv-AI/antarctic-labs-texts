@@ -1,0 +1,2108 @@
+io _ uring for High-Performance DBMSs: When and How to Use It
+Matthias Jasny, Muhammad El-Hindi, Tobias Ziegler, Viktor Leis, Carsten Binnig
+
+Abstract
+. We study how modern database systems can leverage the Linux io _ uring interface for efficient, low-overhead I/O. io _ uring is an asynchronous system call batching interface that unifies storage and network operations, addressing limitations of existing Linux I/O interfaces. However, naively replacing traditional I/O interfaces with io _ uring does not necessarily yield performance benefits. To demonstrate when io _ uring delivers the greatest benefits and how to use it effectively in modern database systems, we evaluate it in two use cases: Integrating io _ uring into a storage-bound buffer manager and using it for high-throughput data shuffling in network-bound analytical workloads. We further analyze how advanced io _ uring features, such as registered buffers and passthrough I/O, affect end-to-end performance. Our study shows when low-level optimizations translate into tangible system-wide gains and how architectural choices influence these benefits. Building on these insights, we derive practical guidelines for designing I/O-intensive systems using io _ uring and validate their effectiveness in a case study of PostgreSQL’s recent io _ uring integration, where applying our guidelines yields a performance improvement of 14%.
+
+
+
+[Experiment, Analysis & Benchmark]
+
+†
+†
+authors:
+.
+
+PVLDB Reference Format:
+
+PVLDB, 19(1): XXX-XXX, 2026.
+
+doi:XX.XX/XXX.XX
+
+†
+†
+
+This work is licensed under the Creative Commons BY-NC-ND 4.0 International License. Visit
+https://creativecommons.org/licenses/by-nc-nd/4.0/
+to view a copy of this license. For any use beyond those covered by this license, obtain permission by emailing
+info@vldb.org
+. Copyright is held by the owner/author(s). Publication rights licensed to the VLDB Endowment.
+
+Proceedings of the VLDB Endowment, Vol. 19, No. 1 ISSN 2150-8097.
+
+doi:XX.XX/XXX.XX
+
+PVLDB Artifact Availability:
+
+The source code, data, and/or other artifacts have been made available at
+https://github.com/mjasny/vldb26-iouring
+.
+
+1.
+Introduction
+
+Figure 1
+.
+Performance comparison between traditional I/O interfaces and io
+_
+uring in a buffer manager and network shuffle. Naive use only yields modest gains, whereas designs that fully exploit io
+_
+uring more than double the performance.
+
+Modern hardware and the I/O bottleneck.
+
+Modern PCIe 5.0 hardware, including NVMe SSDs such as the Kioxia CM7-R (2.45M IOPS) and NICs such as the ConnectX-7 (400 Gbit/s), sustains millions of IOPS and hundreds of gigabits per second of throughput, yet conventional I/O interfaces struggle to saturate them
+(
+38
+;
+42
+;
+23
+;
+22
+;
+33
+)
+.
+In particular, kernel-based I/O interfaces, as still used by production-grade database systems, incur system-call and context-switch overhead, consuming a significant fraction of CPU cycles without saturating these devices
+(
+43
+)
+.
+These inefficiencies widen the hardware–software gap and make low-overhead I/O mechanisms central to modern database systems.
+
+Challenges of user-space I/O.
+
+User-space I/O frameworks such as DPDK, SPDK, and RDMA bypass the kernel and can deliver high performance on dedicated hardware
+(
+34
+;
+43
+;
+26
+)
+.
+However, operating entirely in user space removes OS abstractions such as file systems and TCP networking, making integration difficult for production databases that rely on them.
+These stacks also require exclusive control of SSDs or NICs
+(
+10
+;
+17
+;
+29
+)
+, which may conflict with deployments where devices must be shared.
+Consequently, user-space I/O, despite its advantages, has not seen wide adoption and is used mainly in specialized, tightly controlled environments rather than general-purpose systems
+(
+10
+;
+21
+)
+.
+
+io
+_
+uring features for efficient I/O.
+
+The Linux io
+_
+uring interface
+(
+2
+)
+is a promising candidate for bridging the gap between efficient I/O and the preservation of common kernel abstractions.
+It combines three key features, distinguishing it from earlier kernel I/O interfaces.
+First,
+a unified interface
+integrates storage, network, and other system calls into one framework.
+Second,
+fully asynchronous execution
+overcomes limitations of existing asynchronous interfaces, allowing applications to perform useful work while I/O operations complete in the background.
+Third,
+batched submission and completion
+process multiple operations with a single system call, amortizing system call overhead and context switches.
+These features make io
+_
+uring attractive for database systems that issue large numbers of storage and network I/O operations.
+
+Low-overhead I/O with io
+_
+uring?
+
+However, io
+_
+uring is not a panacea.
+Simply replacing traditional I/O interfaces with io
+_
+uring does not necessarily yield substantial performance benefits.
+As
+Figure
+
+1
+shows, using io
+_
+uring off the shelf instead of
+libaio
+for storage I/O in a buffer manager, or instead of
+epoll
+for a network shuffle, only modestly improves performance (by 1.06
+\times
+and 1.10
+\times
+, respectively).
+In contrast, when the system is explicitly designed around io
+_
+uring’s capabilities (e.g., batching) and uses appropriate optimizations (e.g., registered buffers), the end-to-end performance improvements become much more pronounced: 2.05
+\times
+for the buffer manager and 2.31
+\times
+for the network shuffle.
+
+These observations motivate our three research questions to guide DBMS system builders in using io
+_
+uring:
+
+(1)
+
+When to use io
+_
+uring?
+Under which system conditions – especially high I/O-intensive scenarios – does io
+_
+uring provide the greatest benefit?
+
+(2)
+
+How to integrate io
+_
+uring?
+How should a DBMS architecture incorporate io
+_
+uring to exploit its capabilities effectively?
+
+(3)
+
+How to tune io
+_
+uring?
+Which io
+_
+uring features most strongly influence DBMS performance?
+
+Contributions and outline.
+
+To answer these questions, we present the first analysis of io
+_
+uring across both storage- and network-bound workloads in database systems.
+We evaluate io
+_
+uring using two complementary use cases supplemented with microbenchmarks.
+First, we integrate io
+_
+uring into a transactional storage engine on NVMe SSDs to examine storage-bound workloads (
+Section
+
+3
+).
+Second, we employ io
+_
+uring for data shuffling in a distributed analytics engine on 400 Gbit/s networks, representing network-bound workloads (
+Section
+
+4
+).
+From these case studies, we derive general principles for effective io
+_
+uring use and validate them by improving PostgreSQL’s io
+_
+uring backend to achieve more than 10% of additional speedup (
+Section
+
+5
+).
+
+2.
+Background: Understanding io
+_
+uring
+
+Figure 2
+.
+io
+_
+uring architecture. The database system in user space communicates with the kernel via two shared ring buffers: the Submission Queue (SQ) for enqueuing I/O requests and the Completion Queue (CQ) for receiving results.
+
+io
+_
+uring was introduced into the Linux kernel in 2019 and has since been actively developed and optimized.
+Despite this progress, there has been little work on understanding how to adapt it to the requirements of database systems.
+This section therefore provides the background needed to understand how io
+_
+uring can be used in DBMSs and how its design influences performance.
+We highlight two aspects that distinguish io
+_
+uring from existing I/O backends: its application interface and its internal execution model, both of which enable high performance for data-intensive systems.
+
+2.1.
+Interface of io
+_
+uring
+
+Through its three key capabilities (unified I/O, asynchronous execution, and batching), io
+_
+uring provides an interface that aligns well with the demands of high-speed DBMSs.
+Below, we describe these capabilities in more detail and their implications for DBMSs.
+
+Unification of I/O with io
+_
+uring.
+
+Traditional DBMSs rely on synchronous system calls such as
+read()
+and
+write()
+, which provide a simple, uniform abstraction but scale poorly due to their blocking behavior.
+To enable non-blocking network I/O, Linux introduced
+epoll
+, which allows applications to monitor multiple sockets for readiness.
+For storage,
+libaio
+provided a separate API that in practice was mostly restricted to direct block I/O and often lacked true asynchronous execution.
+This fragmentation of asynchronous I/O interfaces forced developers to combine
+epoll
+and
+libaio
+, leading to duplicated code paths and limited concurrency between storage and network operations.
+io
+_
+uring eliminates the need for such hybrid designs by unifying storage and network (as well as other system calls) under a single fully asynchronous API.
+Its capabilities continue to expand beyond I/O-related system calls (e.g.,
+madvise
+), moving toward a general-purpose asynchronous execution model for Linux.
+The unified interface enables DBMSs to overlap network and disk I/O more efficiently within a single path, simplifying system design and reducing context switching.
+
+Figure 3
+.
+io
+_
+uring provides three execution paths: inline completion (2a), asynchronous execution via the poll set (2b), and a fallback to worker threads for blocking operations (2c).
+An optional SQPoll thread can submit requests without syscalls.
+
+Asynchronous architecture.
+
+At a high level, io
+_
+uring serves as a unified asynchronous layer atop existing kernel I/O subsystems, such as the block layer for storage devices and the TCP/IP stack for networking.
+It is implemented in the Linux kernel (
+Figure
+
+2
+, right) and typically accessed through the
+liburing
+user-space library
+(
+7
+)
+.
+In contrast to
+epoll
+’s readiness-based polling approach, io
+_
+uring employs a
+completion-based
+model, notifying applications after operations complete rather than when they become possible.
+It implements this model using two memory-mapped ring buffers with configurable capacity: the
+Submission Queue (SQ)
+and the
+Completion Queue (CQ)
+.
+These queues are shared between user space and the kernel, avoiding additional data copies when submitting and completing requests.
+Applications enqueue I/O requests in the SQ, and their corresponding completions later appear in the CQ.
+Because completions may arrive out of order, each request carries a user-defined identifier to match submissions and completions.
+io
+_
+uring further supports
+request linking
+to enforce operation ordering for multiple elements in the SQ.
+
+Batch processing.
+
+While
+epoll
+can report multiple readiness events, each I/O operation, such as
+read()
+, still requires its own syscall.
+In contrast, io
+_
+uring enables applications to enqueue multiple I/O requests in the SQ before triggering their submission with a single
+io_uring_enter
+syscall.
+Similarly, multiple completions can be retrieved from the CQ in one step.
+This batching capability amortizes syscall overhead and reduces context switches, allowing the kernel to process operations in bulk.
+Even modest batch sizes (e.g., 16 operations) reduce the CPU cycles per operation by roughly 5–6
+\times
+compared to single-operation submission as shown below:
+
+As we will show in our use case discussions, DBMSs often have opportunities to issue I/O requests in batches, for example, during buffer-pool eviction or group commits
+(
+31
+;
+36
+;
+37
+)
+.
+However, excessive batching can also introduce drawbacks; therefore, it must be tuned carefully to yield clear benefits.
+
+2.2.
+Inner Workings of io
+_
+uring
+
+To effectively tailor DBMSs to io
+_
+uring, it is important to understand how I/O requests are executed.
+In the following, we examine the internals of io
+_
+uring and discuss other important aspects.
+
+Issuing I/O requests.
+
+io
+_
+uring supports two ways to issue I/O in the kernel (step (1) in
+Figure
+
+3
+).
+In the default mode, the application thread (top left) calls
+io_uring_enter
+and transitions into kernel mode, where it processes submissions and completions.
+The syscall can either block until a specified number of completions are available or return immediately.
+In contrast, when applications set up io
+_
+uring with the
+SQPoll
+mode, they avoid user–kernel transitions (syscalls) on the submission path by decoupling submission from execution.
+A dedicated kernel thread (cf.
+Figure
+
+3
+, bottom left) continuously polls the SQ, issues I/O on behalf of the application, and posts results to the CQ.
+When no new requests are submitted, the SQPoll thread enters a sleep state after a configurable timeout.
+In a dedicated microbenchmark, we measured that waking this thread introduces a non-trivial latency of roughly 30 microseconds.
+As our study later demonstrates, choosing the most beneficial execution strategy requires a thorough understanding of the application architecture and workload characteristics.
+
+Execution paths in io
+_
+uring.
+
+I/O in io
+_
+uring can follow three main paths as shown in
+Figure
+
+3
+(steps 2a-c):
+
+(2a) Inline execution.
+
+When processing submissions, io
+_
+uring first attempts to complete requests inline,
+for example, when reading from a socket that has data already available.
+Such operations execute immediately and their completion is posted to the CQ.
+
+(2b) Non-blocking execution.
+
+If an operation cannot be completed inline, its handling depends on its type.
+For pollable operations, such as non-blocking socket reads, io
+_
+uring installs an internal event handler (
+io_async_wake()
+) that is executed when the socket becomes readable (
+Figure
+
+3
+, 2b).
+By default, io
+_
+uring waits indefinitely for the operation unless a timeout via
+OP_LINK_TIMEOUT
+is set.
+
+(2c) Blocking execution.
+
+Certain operations cannot be executed asynchronously; for instance, blocking filesystem calls, such as
+fsync
+, or large storage reads.
+In such cases, io
+_
+uring delegates execution to worker threads (
+io_worker
+).
+This fallback is slower and incurs higher overhead than the native asynchronous paths.
+Applications can explicitly request this behavior using the
+IOSQE_ASYNC
+flag, which forces execution in a worker thread.
+In a dedicated microbenchmark, issuing NOPs that were handled by
+io_worker
+threads added an average overhead of 7.3 microseconds compared to inline execution.
+This additional cost results from offloading to a separate thread and synchronization between the worker and submission context.
+Frequent fallback or a large number of active
+io_worker
+threads typically indicates suboptimal I/O patterns and may warrant application-level redesign
+(
+5
+;
+3
+;
+4
+)
+.
+
+Avoiding preemptions for completion-handling.
+
+When an asynchronous operation finishes, io
+_
+uring must run
+task_work
+in the kernel to place the completion entry into the CQ (step 3 in
+Figure
+
+3
+).
+By default, this
+task_work
+runs whenever the application transitions from user to kernel space.
+If the thread is busy (for example, during a join or scan), the kernel may issue an inter-processor interrupt (IPI) to process pending completions.
+This effectively preempts the application, disrupts cache locality, increases jitter, and reduces batching efficiency.
+To mitigate these effects, io
+_
+uring offers the
+COOP_TASKRUN
+flag (CoopTR), which reduces IPIs and allows applications to delay
+task_work
+.
+However, completions are still processed on any kernel-user transition, including unrelated syscalls such as
+malloc()
+.
+Because preemptions have side effects, both the default and cooperative modes are ill-suited for modern high-performance DBMSs. The
+DEFER_TASKRUN
+flag (DeferTR) only runs
+task_work
+on
+io_uring_enter
+calls, making it the recommended mode since it gives applications more control and eliminates unwanted preemptions.
+We therefore use it for the remainder of the paper unless stated otherwise.
+
+Other features for modern hardware.
+
+io
+_
+uring is designed to fully exploit modern hardware capabilities, supporting a variety of additional features.
+These span both high-level application optimizations and low-level runtime tuning for efficient asynchronous I/O.
+Key features include buffer registration and pinning to reduce memory management overhead, multishot operations, polling modes, and advanced request scheduling.
+In the remainder of this paper, we examine how database engines leverage these mechanisms to implement efficient I/O.
+
+3.
+Efficient Storage I/O with io
+_
+uring
+
+Modern NVMe devices can sustain millions of IOPS, yet conventional I/O stacks rarely reach this potential
+(
+26
+;
+22
+)
+.
+To explore if and how io
+_
+uring can close this gap, we discuss our three research questions (when to use, how to integrate, and how to tune io
+_
+uring) in the context of a buffer-managed storage engine.
+
+We follow a stepwise approach during its design to highlight how io
+_
+uring’s key capabilities impact system performance. After our use case discussion, we use targeted microbenchmarks to isolate specific io
+_
+uring behaviors in the storage context and provide insights for estimating achievable I/O gains.
+
+3.1.
+Use Case: Buffer-Managed Storage Engine
+
+We use a buffer-managed storage engine as our primary use case because the buffer manager is a critical component in out-of-memory database workloads, sitting directly on the I/O path of every transaction.
+It continuously orchestrates data movement between memory and high-performance SSDs, making it a crucial component for DBMSs as the main interface to the storage.
+Before diving into the details, we first outline the buffer manager’s core responsibilities and architecture (see
+Figure
+
+4
+).
+A solid understanding of the application characteristics is essential for exploiting io
+_
+uring effectively.
+
+Buffer manager overview.
+
+A buffer manager caches frequently accessed pages and loads or evicts them as needed.
+When a requested page is not present in the buffer pool, a
+page fault
+triggers a read I/O to retrieve it from storage.
+If the buffer pool is full, the buffer manager must select a page for eviction; if it is dirty, it is written back before its buffer frame is reused.
+Because these operations lie on the critical transaction path, their efficiency is crucial for sustaining high throughput.
+Although background tasks, such as checkpointing, also interact with the buffer manager and issue additional I/O, we ignore them for simplicity.
+
+Figure 4
+.
+Overview of the buffer-managed storage engine design. Cold pages are evicted and written to disk freeing space that is used to cache frequently accessed pages.
+
+Buffer manager architecture.
+
+The buffer manager maintains a preallocated pool of buffer frames and a page table mapping logical page identifiers to frames, along with metadata such as reference bits and dirty flags.
+It exposes two primitives
+(
+15
+)
+:
+
+fix(page_id)
+(1) checks whether the requested page resides in the buffer pool and loads it from storage (3) if not, evicting (2) another page if necessary, while
+unfix(page_id)
+(4) releases the page and marks it dirty if modified.
+When the pool is full, a replacement policy selects victims. In this paper, we use clock-sweep
+(
+19
+)
+, a common algorithm in DBMS:
+pages are marked during the first pass and, if still unreferenced on the second pass, dirty pages are written back before the frame is reused.
+The storage engine includes a B-tree index for tuple access and updates.
+When the working set fits in memory, these operations complete without I/O; otherwise, page faults and evictions place I/O on the critical path, coupling buffer management with application logic.
+
+3.2.
+Workload & System Conditions
+
+As mentioned in
+Section
+
+1
+, the question
+when to use io
+_
+uring
+– when io
+_
+uring provides measurable performance gains – depends on the given workload and system conditions.
+In this section, we present a simple back-of-the-envelope model to estimate the expected performance impact of various design choices, based on I/O cost and CPU utilization.
+These models show how engineers can predict expected gains from io
+_
+uring optimizations and validate their system implementation.
+
+Workload conditions.
+
+To capture the impact of different workload characteristics, we use two standard DBMS benchmarks: single-statement, I/O-intensive YCSB-like transactions and the more complex, compute-bound TPC-C workload.
+The experiments use a small 1 GB buffer pool.
+For YCSB, we load 10 million tuples (8-byte key, 128-byte value), which with index structures and metadata results in a roughly 70% page fault probability under uniform updates with 4 KiB pages, producing an I/O-bound workload well suited for storage analysis.
+For TPC-C, we use 1 and 100 warehouses to study the effects of a mostly in-memory vs. a mostly out-of-memory setting.
+
+System conditions.
+
+We evaluate several buffer manager configurations on our 3.7 GHz AMD server (Kernel 6.15) with an array of eight modern PCIe 5.0 NVMe SSDs (Kioxia CM7-R). The configurations range from fully synchronous to batched and asynchronous variants to study how the workloads interact with system conditions.
+All configurations utilize a single-threaded setup, in which one core handles transaction processing and I/O requests.
+This setup isolates I/O behavior from concurrency effects, allowing more precise analysis of performance improvements.
+Later, in
+Sections
+
+4
+and
+5.2
+, we extend the analysis to multithreaded configurations.
+
+Figure 5
+.
+
+YCSB throughput (100% uniform updates, one update per transaction) under different buffer manager designs and I/O execution modes.
+io
+_
+uring features and design optimizations are enabled incrementally from left to right, increasing transaction throughput from 16.5 k to 546.5 k TPS.
+
+3.3.
+Using io
+_
+uring in the Storage Engine
+
+Traditional buffer managers perform I/O through blocking system calls such as
+pread()
+and
+pwrite()
+, where each I/O request must complete before the thread can proceed.
+As a performance baseline, we implement a synchronous buffer manager on top of io
+_
+uring by submitting one request at a time and waiting for its completion, ensuring that the DBMS thread has at most one outstanding I/O.
+Although this baseline uses io
+_
+uring’s submission and completion queues for consistency with later variants, it does not exploit its asynchronous or batching features.
+
+When io
+_
+uring does not help.
+
+This setup is the simplest form of I/O execution, where the transaction thread blocks on every page fault or for eviction.
+Consequently, throughput is directly tied to device latency, and using io
+_
+uring does not result in performance gains.
+For the update-heavy YCSB workload mentioned earlier, our posix-based and io
+_
+uring-based implementation reaches a single-threaded throughput of 16.5 k tx/s (
+Figure
+
+5
+,
+Posix
+and
+io_uring
+).
+Because in-memory updates are negligible compared to storage latency, both implementations are
+I/O-latency bound
+.
+
+Modeling the bottleneck.
+
+To validate the performance results, we use a simple latency-based model derived from the operation costs in Table
+1
+.
+Assuming a 70% page fault rate and an average read-plus-write latency of
+70+12=82
+
+\mu
+s for our SSD device, the expected throughput is
+
+\frac{1}{0.7\times 82\times 10^{-6}}\approx 17.4\,\text{k\,tx/s}
+.
+The estimate aligns with the measured 16.5 k tx/s, confirming that I/O latency rather than CPU or software overhead limits synchronous performance.
+As a consequence, higher throughput can be achieved by reducing effective I/O latency or amortizing the latency of one request through batching.
+
+Table 1
+.
+I/O numbers used for performance modeling.
+
+Single
+
+[-1.5pt]
+Read
+
+Single
+
+[-1.5pt]
+Write
+
+70
+\mu
+s
+
+12
+\mu
+s
+
+I/O Latency
+
+Transaction
+
+Execution
+
+Single
+
+[-1.5pt]
+Read
+
+Batch
+
+Read
+
+Batch
+
+Write
+
+8264 clk
+
+10200 clk
+
+5400 clk
+
+5700 clk
+
+CPU Cycles
+
+3.3.1.
+Using io
+_
+uring to Batch Writes
+
+With synchronous I/O, performance is bound by I/O latency, since each page fault triggers a blocking writeback of a dirty page before the next read can proceed.
+Although io
+_
+uring cannot magically reduce device latency, its
+batching feature
+can enable us to reduce the impact on the critical path.
+
+Amortizing eviction cost.
+
+We leverage io
+_
+uring to introduce
+batched write submission
+for the buffer manager’s eviction path.
+Instead of evicting and writing one page at a time, the buffer manager collects multiple victims and issues their writes together with a single
+io_uring_enter()
+call.
+While execution remains synchronous and reads and writes do not yet overlap, batching lowers submission overhead and exploits device-level parallelism, demonstrating how a minor architectural change can benefit from io
+_
+uring’s strengths.
+
+Performance implications.
+
+Batching write operations improves performance by about 14%, reaching 19 k tx/s (compare
+Figure
+
+5
+,
++BatchEvict
+) because submission overhead for eviction is amortized.
+Eviction writes are issued in batches, so their latency is incurred once per batch rather than per eviction.
+This amortizes the cost across
+N
+evictions and leaves the 70
+\mu
+s read latency as the dominant term in the latency model from the previous section.
+The expected throughput is
+
+\frac{1}{0.7\times 70\times 10^{-6}}\approx 20.4\,\text{k\,tx/s}
+.
+The measured and predicted results align closely, confirming that batching removes the write latency from the latency-bound path and effectively mitigates latency through amortization rather than elimination.
+
+3.3.2.
+Using io
+_
+uring for Asynchronous I/O
+
+While batched writes amortize write latency, the buffer manager still operates synchronously, blocking on page faults and leaving the CPU idle during I/O.
+Multiple threads, as studied in
+Section
+
+3.6
+, hide this latency but introduce synchronization and scheduling overhead.
+To hide latency in our single-threaded design, we therefore adopt
+asynchronous transaction execution
+to overlap I/O and computation.
+
+Overlapping compute & I/O.
+
+io
+_
+uring’s completion-based model integrates naturally with asynchronous runtimes such as coroutines or fibers.
+We extend the buffer manager with
+Boost.fibers
+
+(
+9
+)
+for cooperative scheduling, where each transaction runs as a fiber that issues asynchronous I/O requests and yields on page faults.
+During this time, the io
+_
+uring-based runtime schedules other ready fibers, keeping the CPU active.
+
+Cooperative transaction execution.
+
+Fiber context switches cost only tens of CPU cycles since they save and restore only register state, providing efficient user-level concurrency suited for I/O-intensive workloads.
+When a suspended fiber’s I/O completes, it is marked ready and resumed by the scheduler.
+Since all concurrency is cooperative, the B-tree implementation requires no locks or atomic operations between fibers.
+If a fiber resumes after an I/O delay and the data structure has changed, it restarts the B-tree traversal to ensure correctness and preserve isolation without explicit synchronization. Considering such details is important for accurate performance modeling, as shown later.
+
+CPU, the new bottleneck.
+
+With up to 128 fibers, throughput rises by nearly an order of magnitude to 183 k tx/s (
+Figure
+
+5
+,
++Fibers
+).
+Under the same asynchronous execution scheme,
+libaio
+reaches 173 k tx/s, so we continue the analysis on io
+_
+uring, which provides higher throughput and exposes additional optimization opportunities.
+At this concurrency level, the system becomes CPU- rather than latency-bound: concurrent fiber execution hides I/O latency and the CPU is fully utilized.
+We therefore switch from a latency- to a cycle-based model that accounts for per-transaction CPU cost.
+
+Using hardware cycle counters (
+rdtsc
+), we measure transaction logic (B-tree traversal and update) as
+c_{\mathrm{tx}}=8{,}264
+cycles in an in-memory run, and I/O processing (submission and completion) as
+c_{\mathrm{io}}=c_{\text{read-single}}+c_{\text{write-batch}}=15{,}900
+cycles (
+Table
+
+1
+).
+For a 3.7 GHz core and a page fault rate of
+r_{pf}=70\%
+, the expected throughput is
+
+\frac{\text{clock frequency}}{c_{tx}+r_{pf}\times c_{io}}=\frac{3.7\times 10^{9}}{8264+0.7\times 15900}\approx 190.8\,\text{k\,tx/s},
+
+which matches the measured 183 k tx/s.
+This confirms that CPU overhead, rather than I/O latency, now dominates performance, as intended with asynchronous execution.
+
+3.3.3.
+Using io
+_
+uring to Batch Reads
+
+In the initial asynchronous design, each fiber submits its I/O request right before blocking and is woken up once the I/O completes.
+This hides I/O latency by overlapping reads and writes but incurs syscall overhead for each I/O.
+We therefore introduce
+batched read submission
+, which groups read requests from multiple fibers before entering the kernel via
+io_uring_enter()
+.
+The batched submission amortizes syscall overhead and exploits device-level parallelism, reducing per-I/O cycle cost (
+Table
+
+1
+) and improving CPU efficiency beyond latency hiding.
+
+Adaptive batching.
+
+Read batching improves throughput by lowering per-I/O cost but may introduce queuing delays if the runtime waits too long to collect requests, while very small batches negate the amortization benefit.
+Our runtime therefore uses
+adaptive batching
+, adjusting the batch size based on the ratio of outstanding I/Os to waiting fibers.
+When many I/Os are in flight, additional submissions are deferred to increase amortization; when few are pending, batches are flushed earlier to keep the CPU busy.
+This feedback mechanism maintains high device utilization while avoiding stalls from an empty ready queue.
+
+Impact of adaptive batching.
+
+Performance increases by about 18%, from 183 k to 216 k tx/s (
+Figure
+
+5
+,
++BatchSubmit
+).
+Adding I/O cost for batched reads to the cycle model,
+
+c_{\mathrm{io}}=c_{\text{read-batch}}+c_{\text{write-batch}}=11{,}100
+cycles (
+Table
+
+1
+),
+yields
+\frac{3.7\times 10^{9}}{8264+0.7\times 11100}\approx 230\,\text{k\,tx/s}
+as expected throughput.
+The estimate aligns with the measured 216 k tx/s, confirming that adaptive read batching reduces CPU overhead in the submission path and improves single-core efficiency.
+
+3.4.
+Tuning io
+_
+uring for the Storage Engine
+
+Utilizing io
+_
+uring’s key capabilities enabled us to implement an asynchronous architecture whose performance is determined by CPU cycles spent on I/O processing.
+This forms the basis for applying io
+_
+uring’s low-level features to reduce I/O overheads.
+However, the effectiveness of io
+_
+uring’s features also depends strongly on workload characteristics, as discussed next.
+
+3.4.1.
+Performance Evaluation with YCSB
+
+We cut per-I/O CPU cost by reducing three overheads: data movement (using registered buffers), storage stack (NVMe passthrough), and submission/completion handling (SQPoll & IOPoll).
+
+Registered buffers reduce copies.
+
+io
+_
+uring allows user-space buffers to be
+registered
+once during initialization, avoiding per-request page pinning and kernel-user copies.
+The kernel then performs DMA directly into user memory, eliminating these overheads.
+For our YCSB workload, this zero-copy optimization improves throughput by about 11%, reaching 238 k tx/s (
+Figure
+
+5
+,
++RegBufs
+).
+
+NVMe passthrough skips abstractions.
+
+To access NVMe devices directly, io
+_
+uring provides the
+OP_URING_CMD
+opcode, which issues native NVMe commands via the kernel to device queues. By bypassing the generic storage stack, passthrough reduces software-layer overhead and per-I/O CPU cost.
+This yields an additional 20% gain, increasing throughput to 300 k tx/s (
+Figure
+
+5
+,
++Passthru
+).
+
+IOPoll avoids interrupts.
+
+With
+IOPOLL
+, completion events are polled directly from the NVMe device queue, either by the application or by the kernel
+SQPOLL
+thread (cf.
+Section
+
+2
+), replacing interrupt-based signaling.
+This removes interrupt setup and handling overhead but disables non-polled I/O, such as sockets, within the same ring.
+When using filesystems,
+IOPOLL
+requires explicit support and is typically available only for direct block-device access via
+O_DIRECT
+.
+As shown in
+Figure
+
+5
+(
++IOPoll
+, right), completion polling provides an additional 21% throughput gain, reaching 376 k tx/s - single-threaded.
+As we will show later, it also reduces latency for I/O-intensive workloads (cf.
+Figure
+
+9
+).
+
+SQPoll eliminates syscalls.
+
+In
+SQPOLL
+mode, a dedicated kernel thread continuously polls the submission queue, allowing applications to enqueue I/O requests without calling
+io_uring_enter()
+for each submission.
+This dedicates one CPU core to polling but eliminates most syscall and submission overheads. The kernel thread handles I/O completions and places them into the completion queue for later consumption by the application.
+For our buffer manager (
+Figure
+
+5
+,
++SQPoll
+), throughput increases by about 32% to 546k tx/s, corresponding to the cost previously spent in syscall and kernel-side processing.
+
+Figure 6
+.
+TPC-C with 1 warehouse (left) and 100 warehouses (right) with the default transaction mix. io
+_
+uring outperforms libaio, vmcache uses blocking I/O that performs worst if out-of-memory with 100 warehouses (storage-intensive).
+
+3.4.2.
+Performance Evaluation with TPC-C
+
+Unlike YCSB, which issues short, independent transactions dominated by random I/O, TPC-C models an OLTP system with interacting transactions and a larger share of in-memory computation.
+This workload thus evaluates how io
+_
+uring optimizations perform in a less I/O-bound, more CPU-intensive setting.
+As a baseline, we use
+vmcache
+
+(
+31
+)
+, a state-of-the-art buffer manager.
+We reuse the asynchronous, batched-read configuration from the YCSB experiments for a fair comparison.
+
+Workload-dependent benefits.
+
+Figure
+
+6
+shows the results for TPC-C in a mostly in-memory and a mostly out-of-memory configuration.
+The io
+_
+uring-based buffer manager consistently outperforms
+vmcache
+, achieving up to 12.5
+\times
+higher throughput in the naive configuration.
+The primary reason is architectural:
+vmcache
+relies on blocking reads.
+Enabling advanced io
+_
+uring features further improves throughput, although the relative gains depend on the workload configuration.
+The memory-intensive TPC-C workload is largely compute-bound and many reads can be answered from memory which limits the effect of I/O-path optimizations.
+In this case,
++IOPoll
+performs slightly worse than the interrupt-driven baseline because polling wastes CPU cycles when I/O operations are sporadic.
+
++SQPoll
+provides no benefit for the same reason.
+In the out-of-memory setting, I/O activity rises significantly due to the increased cost of page loads and evictions, making optimizations more impactful.
+
+3.5.
+Take-aways and Summary
+
+When to use io
+_
+uring.
+
+Our buffer manager study shows that io
+_
+uring yields meaningful gains for I/O-intensive workloads with many page faults, such as YCSB and TPC-C configurations where a substantial fraction of reads miss the buffer pool and involve SSD page loads and evictions.
+In compute-heavy (i.e., mostly in-memory) settings, the I/O path contributes little to overall cost, and io
+_
+uring optimizations have correspondingly smaller impact.
+
+How to integrate it.
+
+A key insight of our study is that io
+_
+uring must be integrated as part of an end-to-end architectural design rather than as a drop-in replacement.
+Using io
+_
+uring key features (batching, asynchronous execution) enabled us to shift the bottleneck from device latency to CPU cycles and make the cost of I/O processing explicit, as verified by our model-based analysis.
+
+How to tune it.
+
+Once the architecture exposes enough asynchronous I/O, low-level io
+_
+uring features can reduce per-operation CPU overhead.
+However, our study revealed that the tuning benefits depend strongly on the workload: substantial improvements arise when I/O dominates execution time, while CPU-bound or cache-resident workloads gain little.
+
+3.6.
+Detailed Analysis of io
+_
+uring
+
+The results in the previous section showed that realizing performance gains depends on both the system architecture and workload characteristics. In this section, we conduct targeted microbenchmarks to isolate and quantify the effects of individual mechanisms for system builders in depth and also study effects of multi-threading.
+
+Batching effects on SSD latency.
+
+In the buffer manager design, we used io
+_
+uring’s batching to hide I/O latency for writes and amortize syscall overhead for reads.
+However, batching can also increase latency variance, which is problematic for workloads requiring predictable response times.
+To quantify this effect, we vary batch sizes for write requests to a single SSD via io
+_
+uring, fixing throughput at 1.5 MIOPS to stay below the device limit and isolate batching behavior.
+As shown in
+Table
+
+2
+, small batches (e.g., size 8) keep latencies mostly below 25 µs, at the cost of slightly higher syscall frequency.
+Larger batches reduce submission overhead but cause higher variance; with batch size 128, latency spikes up to 200 µs occur as bursts from multiple workers can temporarily overload the SSD queue with many outstanding I/Os.
+Thus, even below I/O saturation, batch size strongly influences latency distribution.
+For latency-sensitive DBMSs, overly aggressive batching is counterproductive.
+
+Table 2
+.
+Impact of batch size on SSD write latency (8 workers).
+
+Batch size:
+
+1
+
+8
+
+32
+
+64
+
+128
+
+256
+
+Latency
+\oslash
+[µs]
+
+11.51
+
+24.22
+
+60.62
+
+116.40
+
+200.85
+
+317.51
+
+Latency
+\sigma
+[µs]
+
+±0.95
+
+±1.71
+
+±3.91
+
+±12.17
+
+±7.47
+
+±33.88
+
+Figure 7
+.
+Scale-out performance for random 4 KiB reads & writes between
+libaio
+and io
+_
+uring with incremental optimizations. io
+_
+uring consistently outperforms
+libaio
+. Further io
+_
+uring optimizations increase throughput by 3.4–3.5
+\times
+.
+
+Multi-threaded Performance.
+
+The buffer manager in the previous section used a single-threaded setup.
+We now increase the number of threads to analyze how io
+_
+uring behaves under parallelism.
+We use one ring-per-thread for io
+_
+uring and also include
+libaio
+for comparison.
+As shown in
+Figure
+
+7
+, io
+_
+uring consistently outperforms
+libaio
+for both random reads and writes and exhibits near-linear scalability with the number of threads.
+At higher core counts, the operating system’s storage stack becomes the dominant bottleneck.
+The benefit of io
+_
+uring optimizations increases with scale: registered buffers (+RegBufs) reduce CPU overhead, while NVMe passthrough (+Passthru) and IOPoll in particular deliver substantial throughput improvements of 3.4–3.5
+\times
+saturating the SSD array with 18 and 6 cores, respectively.
+
+Increasing block sizes.
+
+Larger block sizes for I/O can further amortize CPU costs when the workload allows coarser-grained access.
+We therefore evaluate how block size affects SSD performance by measuring CPU cycles per byte for reads and writes while varying the I/O block size in a single-threaded setup.
+
+Figure
+
+8
+shows that larger blocks substantially reduce CPU cost per byte, as syscall and I/O stack overheads are amortized.
+With sufficiently large requests, a single core saturates the PCIe 5 SSD array, reaching up to 90 GiB/s for reads and 50 GiB/s for writes, close to hardware limits.
+This point is reached for writes at 128 KiB and reads at 256 KiB with +Passthru and +IOPoll enabled.
+
+Large blocks can backfire.
+
+However, exceeding certain thresholds triggers asynchronous worker threads, signaling fallback to slower I/O paths as discussed in
+Section
+
+2.2
+.
+First, if the block size exceeds
+max_hw_sectors_kb
+(which can be 128 KiB if the IOMMU were enabled), workers are spawned even at low I/O depth, as a single request surpasses the maximum DMA size.
+Second, with
+O_DIRECT
+, workers appear once the number of batched requests exceeds
+nr_requests
+(1023 on bare metal, 127 in our cloud VM), and on some consumer SSDs even without
+O_DIRECT
+.
+Third, when block sizes exceed 512 KiB (
+max_segments
+) asynchronous workers are again used internally for I/O.
+While large blocks improve efficiency and fully utilize PCIe 5 bandwidth, surpassing these software or hardware limits causes worker fallback, reintroducing latency and CPU overhead in io
+_
+uring.
+
+Figure 8
+.
+Single thread SSD performance with increasing block sizes. Performance degrades with I/O workers, NVMe-passthrough is only supported until 512KiB.
+
+The durable write problem.
+
+Durable writes are essential for database systems, particularly for write-ahead logging and checkpointing, yet remain costly.
+The standard approach,
+fsync
+, is blocking in io
+_
+uring and thus executed by fallback worker threads.
+Moreover,
+fsync
+cannot be issued by rings configured for IOPoll and must be used from a separate ring or as a traditional syscall.
+These constraints motivate alternatives such as opening files with
+O_SYNC
+, which delegates durability to the kernel, or using NVMe flushes via passthrough commands.
+
+Figure
+
+9
+compares these methods on consumer and enterprise SSDs.
+Enterprise SSDs with DRAM caches and Power Loss Protection (PLP) achieve microsecond-level latencies, whereas consumer SSDs remain dominated by intrinsic millisecond-scale
+fsync
+cost, masking worker-thread latencies.
+Not pinning the
+fsync
+I/O worker to the local chiplet (+Chiplet) increases latency by about 5%.
+
+O_SYNC
+-based writes perform poorly, more than twice as slow as explicit writes followed by
+fsync
+.
+NVMe passthrough with explicit flush commands offers a truly asynchronous durability path but requires raw device access.
+Linking a write and
+fsync
+in io
+_
+uring offers no improvement over issuing them sequentially in the application.
+For enterprise SSDs, durability is managed by the device itself, eliminating the need for
+fsync
+.
+Passthrough writes with IOPoll reduce latency by about one microsecond, showing the benefit of bypassing the storage stack in latency-sensitive workloads.
+While passthrough with flush is the most efficient asynchronous option, its lack of filesystem support restricts it to flash-optimized database systems.
+Implementing durable writes in io
+_
+uring therefore requires careful configuration to avoid performance pitfalls.
+
+4.
+Efficient Network I/O with io
+_
+uring
+
+Figure 9
+.
+Durable writes with io
+_
+uring. Left: Writes and fsync are issued via io
+_
+uring or manually linked in the application. Right: Enterprise SSDs do not require fsync after writes.
+
+After analyzing storage, we now focus on the networking aspects of io
+_
+uring.
+High-speed interconnects with link rates in the range of 400 Gbit/s are now a commodity in modern data centers and cloud deployments
+(
+1
+;
+42
+)
+.
+We investigate how distributed DBMSs can saturate these high-throughput rates with io
+_
+uring by addressing our three research questions.
+We again conclude with a set of microbenchmarks that provide an isolated analysis of important io
+_
+uring features.
+
+4.1.
+Use Case: Distributed Data Shuffle
+
+Shuffle operations are a key building block in any distributed DBMS.
+We now study a bi-directional, all-to-all data shuffle representative of distributed analytical query execution, as used in parallel joins.
+
+Distributed shuffle overview.
+
+In a distributed shuffle, each node scans local data tables and repartitions tuples to other nodes based on a partitioning function.
+For a distributed hash join of two tables, tuples of the smaller table are shuffled by their join key, and local tuples are inserted into a node’s local probe table.
+Meanwhile, remote tuples are sent over the network and then inserted into the remote probe table.
+For the larger table, tuples are also shuffled based on their join key and then probed into these hash tables.
+
+Shuffle engine architecture.
+
+We implement a distributed hash join using morsel-based processing
+(
+32
+)
+.
+Each worker thread repeatedly fetches morsels from a shared iterator, partitions tuples by their hash, and issues send and receive operations for shuffling.
+In addition to network shuffling, we also execute the hash table build phase of the join, allowing us to study scenarios where computation and I/O compete for CPU cycles.
+Hash table inserts update pointers rather than copying payloads to reduce memory bandwidth.
+
+4.2.
+Workload & System Conditions
+
+The previous discussion reveals similarities between the buffer manager in the previous section and the distributed shuffle, as both involve computation (B-tree traversal/probe table build) and I/O operations that compete for precious CPU cycles.
+However, there are important differences in workload and system conditions, motivating a different stepwise approach.
+
+Workload conditions.
+
+To study
+when
+io
+_
+uring yields measurable benefits, we vary the tuple size while shuffling the same total amount of data to obtain different workload characteristics:
+Smaller tuples result in more probe table inserts per transferred byte, leading to a large number of random memory accesses.
+Although not compute-bound like TPC-C, many hash-table inserts for small tuples can stall the CPU due to random memory accesses and therefore represent a challenging workload.
+In contrast, larger tuples lead to fewer insertions and fewer random memory accesses.
+
+Figure 10
+.
+Overview of the shuffle architecture with scan & probe table. Workers use morsel-driven parallelism and handle scanning, probe table building and network I/O.
+
+System conditions.
+
+We evaluate the shuffle workloads on a six-node cluster with ConnectX-7 NICs, which provide 400Gbit/s bidirectional bandwidth, resulting in 4.8 Tbit/s of bisection bandwidth (6
+\times
+2
+\times
+400 Gbit/s).
+Since network round-trip latencies are orders of magnitude higher than SSD access latencies, even in traditional engines, it is common to adopt asynchronous strategies such as using dedicated I/O threads
+(
+13
+;
+28
+;
+35
+)
+.
+Batching tuples into larger chunks, e.g., 1 MiB, is also an often adopted approach to amortize network overhead and increase throughput
+(
+27
+)
+.
+Hence, we adopt an asynchronous design as a baseline from the beginning without discussing synchronous I/O in the context of the shuffle use case.
+
+4.3.
+Using io
+_
+uring in the Shuffle Engine
+
+Building on these insights and the results of the buffer manager use case in
+Section
+
+3
+, we directly utilize io
+_
+uring’s asynchronous I/O and batching capabilities for a first shuffle baseline.
+
+Integrating io
+_
+uring into a shuffle.
+
+The asynchrony of io
+_
+uring enables us to avoid the approach of using dedicated I/O threads that use blocking I/O. As recommended with io
+_
+uring
+(
+6
+)
+, we adopt a ring-per-thread architecture in which each worker thread possesses a thread-local io
+_
+uring ring.
+This architecture enables scanning data, while sending and receiving tuples asynchronously via io
+_
+uring within a single thread.
+While both approaches overlap computation and communication, increasing CPU utilization, co-locating computation and I/O within the same thread avoids synchronization overhead with I/O workers and improves cache locality.
+Unlike in our buffer manager, we directly employ multithreading with the goal to saturate the 400 Gbit/s NICs.
+
+Details of shuffle implementation.
+
+To avoid other system bottlenecks and isolate io
+_
+uring performance impacts, we adopt several state-of-the-art system optimizations in our shuffle implementation.
+For example, we use batched inserts into the probe table to improve access predictability and allow the prefetcher to issue concurrent loads
+(
+8
+)
+.
+We pin workers with their TCP/IP flows in a round-robin manner to CPU
+chiplets
+
+(
+16
+)
+to reduce overheads in io
+_
+uring for networking.
+Finally, we tune our network stack following industry best practices
+(
+30
+)
+and use Linux 6.17 for zero-copy recv support.
+
+Basic io
+_
+uring configuration.
+
+io
+_
+uring comes with multiple network-specific features, such as multi-shot receive (cf.
+Section
+
+4.6
+), that can be used for data shuffling.
+As a baseline, we adopt the same DeferTR and single-issuer setup flags as used in the buffer manager use case to avoid preemptions and internal synchronization (cf.
+Section
+
+2
+).
+For transfers, we use large buffer sizes of 1 MiB, which are more suitable than multi-shot receive or other mechanisms, as we show later in
+Section
+
+4.6
+.
+
+Figure 11
+.
+Per-node egress bandwidth for a six node shuffle with different tuple sizes using up to 32 worker threads.
+
+Initial performance.
+
+Figure
+
+11
+shows the per-node egress bandwidth for small and large tuple sizes as the number of worker threads increases.
+The total bidirectional bandwidth is therefore twice these values.
+The baseline io
+_
+uring configuration (red) scales with more workers, mainly due to the morsel-based design, where workers can send and receive data independently.
+For small tuple sizes (e.g., 64 B), more frequent probe table inserts cause additional random memory accesses, which introduce stalls and limit network throughput.
+With larger tuples, the insertion rate decreases, reducing memory pressure and allowing the system to achieve higher bandwidths.
+However, even for larger tuples, the system reaches at most 30 GiB/s per node (
+Figure
+
+11
+, red), well below the 400 Gbit/s link rate, indicating that the workload is not I/O-bound.
+
+4.4.
+Tuning io
+_
+uring for Network I/O
+
+As with storage, io
+_
+uring also provides multiple network optimizations to reduce per-I/O overhead.
+In the following, we discuss our findings on how to best use them for efficient network shuffling.
+
+Reducing memory pressure.
+
+In the Linux networking stack, send and receive operations typically copy data between user-space and kernel buffers.
+While these copies are negligible at moderate speeds, they become costly at high network speeds, as even a single extra copy can consume precious memory bandwidth.
+To address this, io
+_
+uring supports zero-copy operations, eliminating redundant data copies between kernel and user space.
+Zero-copy send transmits data directly from pinned user-space buffers, avoiding intermediate copies.
+Zero-copy receive, a more recent io
+_
+uring addition, writes received data directly into registered user-space memory.
+It requires NIC support to separate the TCP header (still handled by the kernel) from the payload, so it may not be available on all network devices.
+
+Zero-copy I/O reduces memory load.
+
+As shown in
+Figure
+
+11
+, enabling zero-copy send (green) and zero-copy receive (blue) yields visible throughput improvements across different tuple sizes compared to the default setting.
+For 4 KiB tuples, link bandwidth is saturated with only 16 workers per node when both zero-copy paths are active, achieving full bidirectional 400 Gbit/s utilization with modest CPU usage.
+However, for 64B tuples, zero-copy receive does not provide additional benefits beyond zero-copy send.
+We suspect that contention between NIC traffic and CPU-driven random memory accesses, along with resulting stalls, diminishes the potential gains.
+Since zero-copy receive is a recent kernel addition, a deeper investigation is left for future work.
+
+Analyzing memory bandwidth.
+
+To understand why shuffle performance is limited without zero-copy operations, we analyze system memory bandwidth during the scale-out experiment described above.
+
+Figure
+
+12
+shows measurements for both the default and zero-copy configurations.
+On the left, we present the system memory bandwidth, calculated as the sum of read and write traffic from hardware performance counters.
+For both workloads, peak system bandwidth approaches 400 GiB/s.
+Zero-copy configurations typically show equal or higher absolute memory bandwidth, primarily due to their higher network throughput, which increases overall memory traffic.
+To account for this effect, we normalize the measured bandwidth by the achieved network throughput.
+The normalized plot (cf.
+Figure
+
+12
+, right) shows that using zero-copy for send and receive reduces effective memory bandwidth by about half, as expected, since data copies are eliminated in both directions.
+
+Figure 12
+.
+Memory bandwidth for the data shuffle in Fig.
+11
+(32 Workers).
+Left: absolute bandwidth; right: Bandwidth reduction normalized by achieved network throughput.
+
+Figure 13
+.
+Speedup of io
+_
+uring and zero-copy send epoll vs. plain epoll for data shuffling across six nodes and different tuple sizes. Zero-copy receive is only available with io
+_
+uring.
+
+End-to-end comparison with epoll.
+
+Similar to the buffer manager, we compare our optimized io
+_
+uring-enabled implementation to state-of-the-art approaches.
+For the shuffle, we use epoll as a baseline, a readiness-based I/O interface commonly used in existing systems.
+
+Figure
+
+13
+shows the speedup of different io
+_
+uring variants and an epoll-based zero-copy send implementation against a naive epoll baseline without optimizations.
+We vary tuple sizes (smaller tuples result in more random inserts into the probe table per byte transferred) and scale up to sixteen workers to avoid link saturation and ensure a fair comparison.
+Without zero-copy, epoll is only marginally slower than io
+_
+uring despite issuing more system calls.
+This behavior stems from both implementations transferring tuples in large 1 MiB chunks, which amortizes syscall and I/O-path overhead.
+With zero-copy send, io
+_
+uring achieves substantially better performance, with the gap widening as the number of workers increases.
+Unlike epoll, io
+_
+uring also supports zero-copy receive, further improving performance and providing up to a 2.5
+\times
+speedup.
+Overall, io
+_
+uring offers a more efficient and unified interface for network I/O, supporting batching, and zero-copy send and receive.
+
+4.5.
+Take-aways and Summary
+
+Figure 14
+.
+Careful tuning of the networking setup is required to achieve equal bandwidth sharing. Workload: 100 GiB table shuffle between 2 nodes using eight workers (no probe table).
+
+When to use io
+_
+uring.
+
+Our shuffle use case shows that io
+_
+uring provides benefits in high-throughput settings where memory bandwidth becomes a bottleneck.
+In the setup with large tuples, where probe table inserts are rare, and workers mainly stream tuples and perform simple partitioning, zero-copy networking enables us to saturate 400 Gbit/s links with relatively few cores.
+For smaller tuple sizes, random memory accesses during hash-table inserts dominate and limit the achievable throughput; network-path optimizations have a relatively less significant impact but are still important for achieving optimal bandwidth.
+
+How to integrate it.
+
+Treating io
+_
+uring as a drop-in replacement in a traditional I/O-worker design is inadequate.
+Instead, io
+_
+uring requires a ring-per-thread design that overlaps computation and I/O within the same thread.
+Together with careful placement of workers across CPU chiplets and an optimized networking stack, this architecture keeps cores busy and exposes sufficient concurrent I/O for io
+_
+uring to be effective.
+
+How to tune it.
+
+Once the engine operates asynchronously with large batched transfers, tuning io
+_
+uring can reduce data movement and CPU overhead per I/O.
+Registered buffers and zero-copy send/receive eliminate kernel-user copies, reducing memory bandwidth consumption per unit of network throughput by
+\approx 2\times
+.
+
+4.6.
+Detailed Analysis of io
+_
+uring
+
+In this section, we focus on important aspects of io
+_
+uring for tuning network interfaces of database systems, which we could not cover before through targeted microbenchmarks.
+
+Impact of network-stack configuration.
+
+To quantify the effect of suboptimal network settings on io
+_
+uring performance, we conduct a microbenchmark using the shuffle workload.
+The experiment transfers 100 GiB bidirectionally between two machines, each running eight worker threads, and measures end-to-end throughput over time.
+In the default configuration, we disable Nagle’s algorithm (
+TCP_NODELAY
+) and pin NIC queues to CPU cores.
+Despite these settings, persistent flow imbalance occurs, with one peer dominating the bandwidth and starving the other (
+Figure
+
+14
+), resulting in a total runtime of 6.3 s.
+Such behavior masks potential io
+_
+uring gains at the system level.
+For the shuffle evaluation above we therefore used a tuned network stack.
+Specifically, using fairer queue discipline (qdisc) and configuring socket buffers for 400 Gbit/s according to
+(
+30
+)
+balance bandwidth utilization.
+As shown in
+Figure
+
+14
+, the total runtime is reduced by over 25%, from 6.3s to 4.6s.
+
+Reducing latency with io
+_
+uring.
+
+Network latency is crucial for distributed latency-sensitive database protocols, such as transaction coordination or replication, where microsecond-level delays accumulate at scale.
+We measure one-way and round-trip latencies for TCP and UDP using 8-byte messages to capture the minimum cost of message delivery.
+Both modes - deferred taskrun (DeferTR) and SQPoll - are evaluated, along with optimizations such as registered file descriptors, registered buffers, and NAPI (the networking counterpart of IOPoll).
+As shown in
+Figure
+
+15
+, SQPoll achieves lower latency than DeferTR, but the advantage disappears once NAPI is enabled.
+DeferTR with NAPI yields the best overall latency, outperforming SQPoll, while registered buffers have a negligible impact for small messages and increase latency slightly.
+When the NIC queue is pinned to a remote chiplet, cross-chiplet interrupt handling increases latency by 14 % for UDP and 21 % for TCP.
+With NAPI enabled, however, remote queues cause only a negligible increase of less than 1 %.
+For reference, a DPDK-based implementation reaches 7 µs, providing a lower bound for userspace networking.
+
+Figure 15
+.
+UDP and TCP latency ping-pong with 8 -byte messages and incrementally enabled optimizations. NAPI polling reduces latency for DeferTR, but increases it with SQPoll.
+
+Figure 16
+.
+Impact of incremental io
+_
+uring optimizations on the cycle cost for a single TCP connection. The best-performing configuration depends on the shown thresholds. Registered file descriptors offer minimal benefit and are therefore omitted.
+
+Send path optimizations.
+
+As shown in
+Figure
+
+15
+, registered buffers have little effect for very small messages, in contrast to their positive impact in the storage setting (
+Section
+
+3.4.1
+).
+To better understand which optimizations are most effective for different database workloads, we vary the transfer size and report the effective cycle cost per transmitted byte.
+
+Figure
+
+16
+(left) shows a clear threshold around 1 KiB: below this size, zero-copy send performs worse than plain io
+_
+uring due to buffer-management overheads, whereas for larger messages registered buffers amortize this cost and consistently reduce per-byte CPU time.
+Registering rings and file descriptors yields only marginal improvements but introduces no observable drawbacks.
+Overall, zero-copy with registered buffers is the most efficient configuration for large messages, achieving up to 3.5
+\times
+fewer cycles per transmitted byte than default io
+_
+uring.
+
+Receive path optimizations.
+
+We observe analogous thresholds for the receive path (
+Figure
+
+16
+, right).
+Multishot receive operations repeatedly generate completions from a single submission and are most efficient for workloads with small messages.
+Once message sizes exceed roughly 1 KiB, zero-copy receive becomes more efficient, and for very large messages (e.g., 13 KiB and above) even the normal single-shot receive path outperforms multishot due to reduced per-message overheads.
+io
+_
+uring can also draw receive buffers from a kernel-managed pool (RingBufs), but these perform worse than user-supplied buffers and are only useful in multishot scenarios.
+Exact thresholds vary with capabilities and available offloads of the NIC, but the overall pattern remains consistent.
+
+Optimizing kernel execution for sockets.
+
+Recall how io
+_
+uring executes
+task_work
+inside the kernel.
+By default, it first attempts to complete an I/O operation inline in non-blocking mode and falls back to internal polling only if the call returns
+-EAGAIN
+(see
+Figure
+
+3
+).
+For socket operations, this speculative attempt can be wasteful when the application already knows the socket is empty (for receive) or full (for send), causing unnecessary kernel work.
+Such cases commonly occur in RPC-style communication, where the response is expected only after the request.
+To handle this efficiently, io
+_
+uring provides the
+RECVSEND_POLL_FIRST
+flag, which skips the speculative attempt and directly uses the poll set.
+Using PollFirst reduces the number of instructions executed and kernel work, resulting in up to 1.5
+\times
+reduction in CPU cycles spent.
+
+5.
+Insights for System Builders
+
+In our study, we focused on three research questions:
+when to use io
+_
+uring
+,
+how to integrate it
+, and
+how to tune it
+.
+Exploring these questions provided key insights for effectively using io
+_
+uring in database systems.
+We summarize these insights as actionable guidelines for engineers, and then validate their practicality by applying them to enhance PostgreSQL’s I/O performance.
+
+5.1.
+Guidelines
+
+Based on our system case studies, we draw four practical guidelines for using io
+_
+uring effectively in database systems:
+
+(1)
+Determine if I/O is a system bottleneck.
+
+When I/O accounts for only a small fraction of execution time, as in CPU-bound or cache-resident workloads, potential io
+_
+uring gains are limited.
+Our use cases in
+Section
+
+3
+and
+Section
+
+4
+show that io
+_
+uring is most effective when it reduces or amortizes the CPU cost of I/O operations, or when it lowers the memory bandwidth consumption.
+As demonstrated in the buffer manager case study, simple latency or cycle models help to model such bottlenecks.
+
+(2)
+Align the architecture with io
+_
+uring capabilities.
+
+io
+_
+uring enables asynchronous execution, system call batching, and a unified interface for storage and network I/O.
+Our buffer manager (
+Section
+
+3.1
+) shows that architectural changes, such as overlapping I/O and computation via asynchronous execution or amortizing per-I/O cost through batching, can yield large improvements.
+The network shuffle (
+Section
+
+4.1
+) shows how applications can use the
+ring-per-thread
+architecture to scale beyond a single core and enable internal io
+_
+uring optimizations.
+
+(3)
+Choose and tune the execution mode deliberately.
+
+The recommended io
+_
+uring configuration uses DeferTR with
+single-issuer
+for predictable task execution and controlled completion reaping (
+Section
+
+2
+).
+SQPoll can improve performance when dedicating a polling core is amortized, and latency or IOPS targets justify the additional CPU cost.
+Falling back to
+io_workers
+should be avoided by ensuring that all operations, including
+fsync
+and large I/Os, can execute fully asynchronously (cf.
+Figure
+
+8
+).
+Tuning the execution mode to the underlying hardware helps avoid costly effects, such as cross-chiplet traffic or non-local interrupt handling (
+Section
+
+4.3
+).
+
+(4)
+Use io
+_
+uring optimizations.
+
+io
+_
+uring offers a range of general, storage-specific, and networking-specific optimizations for I/O-intensive systems.
+Carefully selecting these optimizations can reduce the per-I/O cycle cost.
+Some optimizations, such as registered FDs or fixed buffers for 4 KiB page-aligned storage I/O, do not negatively impact performance (see
+Section
+
+3.4.1
+).
+However, mechanisms like zero-copy or multishot receive are only effective when payloads exceed device-specific thresholds (cf.
+Figure
+
+16
+).
+Other optimizations, such as NVMe passthrough or IOPoll, apply only when no filesystem or a compatible filesystem is used.
+
+5.2.
+Optimizing PostgreSQL using Guidelines
+
+PostgreSQL recently added support for io
+_
+uring in version 18, enabling asynchronous I/O for data and WAL access
+(
+18
+)
+.
+We use this integration to illustrate how our guidelines can be used in a production-grade engine and where PostgreSQL’s architecture imposes constraints.
+
+GL (1): Determine if I/O is a system bottleneck.
+
+Even without tuning io
+_
+uring parameters or enabling additional features, PostgreSQL’s new io
+_
+uring backend achieves up to 3
+\times
+higher performance in I/O-intensive workloads than the previous synchronous design based on blocking calls and OS readahead
+(
+18
+)
+.
+This shows that I/O has been a dominant bottleneck and validates guideline (1) in a real system: once I/O is identified as limiting, adopting io
+_
+uring yields measurable gains.
+This baseline forms the starting point for the guideline-driven improvements in
+Figure
+
+17
+.
+We use 1–8 backend workers scanning a 32 GiB cold table via direct I/O to show how PostgreSQL’s I/O bottleneck improves.
+
+GL (2): Align the architecture with io
+_
+uring capabilities.
+
+PostgreSQL already partially aligns with guideline (2).
+Backend processes overlap computation and I/O by issuing multiple asynchronous reads and writes, aligning with io
+_
+uring’s batching capability.
+However, PostgreSQL uses a multi-process model in which a backend may wait on I/O submitted through rings owned by other processes.
+Rings are therefore not exclusively used by a single issuer, which prevents using
+DeferTR
+, as it requires per-thread ring ownership.
+A more io
+_
+uring-friendly design would use one ring per thread with exclusive ownership and no cross-process sharing.
+PostgreSQL also relies on filesystems for data storage, which prevents low-level optimizations for guideline (4), such as NVMe passthrough and
+IOPoll
+.
+Filesystem traversal adds CPU overhead and constrains effective utilization of modern storage hardware.
+
+GL (3): Choose and tune the execution mode deliberately.
+
+Given PostgreSQL’s architecture,
+DeferTR
+cannot be used without substantial refactoring.
+We therefore configure io
+_
+uring with
+CoopTR
+as the next-best alternative.
+
+CoopTR
+disables kernel-driven
+task_work
+preemptions but still processes completions on each kernel-user transition, providing more predictable execution while remaining compatible with PostgreSQL’s process model.
+Still following guideline (3), we extend the backend to support
+SQPoll
+by enabling the respective setup flag during ring creation and allowing multiple backend processes to share a single
+SQPoll
+kernel thread.
+For WAL durability, PostgreSQL invokes
+fsync()
+directly (or via
+O_DATASYNC
+) rather than through io
+_
+uring, consistent with guideline (3).
+This avoids spawning
+io_workers
+for blocking
+fsync()
+calls and keeps the critical path fully asynchronous.
+
+GL (4): Use io
+_
+uring optimizations.
+
+We apply guideline (4) by enabling io
+_
+uring optimizations that fit PostgreSQL’s access patterns and architectural constraints.
+We register the entire buffer pool as fixed buffers, eliminating PostgreSQL’s heuristic of enabling
+IO_ASYNC
+after four outstanding I/Os.
+Given PostgreSQL’s 8 KiB page size, this optimization aligns with the findings from
+Figure
+
+8
+.
+In
+Figure
+
+17
+, fixed buffers alone provide a 4–6% improvement.
+Because we use ext4, we additionally enable
+IOPoll
+, improving performance up to 7.5% over the baseline.
+Combined with
+SQPoll
+, total throughput improves by 11–15% over upstream PostgreSQL, despite the architectural constraints discussed above.
+
+Summary.
+
+Applying the guidelines yields consistent improvements even in a mature DBMS.
+Although PostgreSQL already incorporates optimizations such as coalescing small reads and using OS readahead, and although its process model and filesystem dependence limit the applicability of several io
+_
+uring features, the remaining optimizations still yield measurable gains.
+Despite these factors, we observe speedups of 11–15% for the scan workload.
+
+6.
+Related Work
+
+Although io
+_
+uring is a relatively recent addition to the Linux kernel, it has already been studied in various contexts, primarily focusing on storage I/O and its impact on data-intensive systems
+(
+40
+;
+39
+)
+.
+
+Figure 17
+.
+PostgreSQL speedup from io
+_
+uring optimizations. Sharing the SQPoll kernel thread between rings has negligible performance impact. Improvements remain limited by the filesystem and PostgreSQL’s multi-process architecture.
+
+Storage interfaces and NVMe systems.
+
+Initial systematic comparisons of io
+_
+uring with established interfaces such as
+libaio
+and SPDK were conducted using the
+fio
+benchmark to evaluate typical storage workloads
+(
+12
+)
+.
+Ren and Trivedi extended this analysis for Intel Optane SSDs, characterizing microarchitectural behavior, instruction-level overheads, and Linux block I/O scheduler performance
+(
+41
+)
+.
+In the context of database systems, Haas et al. explored io
+_
+uring and other asynchronous I/O mechanisms for NVMe SSD arrays.
+They identified improvements in throughput and latency associated with various io
+_
+uring features
+(
+21
+;
+22
+;
+20
+)
+.
+
+Application-level and system integrations.
+
+Several works integrated io
+_
+uring into production systems to evaluate application-specific benefits.
+Chen et al. applied io
+_
+uring to Redis, reporting significant reductions in overhead for medium and large payloads
+(
+11
+)
+. Durner et al. used io
+_
+uring to accelerate cloud object storage access, achieving lower latency and higher throughput
+(
+14
+)
+.
+However, systematic analyses of network-specific aspects and end-to-end effects on distributed systems remain absent.
+
+Security and advanced feature analyses.
+
+From a security perspective, He et al. proposed RingGuard, an eBPF-based framework that monitors and restricts io
+_
+uring operations to prevent kernel-level vulnerabilities.
+It extends eBPF with new io
+_
+uring-specific hooks and verifier logic, enforcing safety policies at runtime while maintaining low overhead
+(
+24
+)
+.
+The most comprehensive exploration of io
+_
+uring features to date is the work by Ingimarsson, who integrated basic functionality into RocksDB
+(
+25
+)
+.
+However, detailed evaluations of advanced io
+_
+uring features, such as registered buffers for zero-copy operations and linked requests to minimize system calls, are still lacking.
+
+Our research addresses these gaps, offering detailed empirical evaluations in the context of data-intensive workloads and providing practical guidelines to use io
+_
+uring’s capabilities effectively.
+
+7.
+Conclusion and Outlook
+
+The modern Linux io
+_
+uring interface provides powerful mechanisms for efficient asynchronous I/O, but achieving measurable gains requires more than simply enabling its features.
+Our case studies show that performance depends on understanding system bottlenecks and integrating io
+_
+uring into the overall design, including leveraging asynchronous execution to hide latency, batching to amortize kernel interactions, and applying targeted optimizations to reduce CPU cost per byte.
+We further used focused microbenchmarks to highlight trade-offs and subtleties of specific optimizations, such as the effects of buffer size on zero-copy and the importance of aligning polling strategies with hardware and workload characteristics.
+From this analysis, we distilled practical guidelines for I/O-intensive systems and validated them through an integration into PostgreSQL, improving table-scan throughput by 11-15% over its baseline io
+_
+uring implementation.
+As io
+_
+uring continues to evolve, it offers a path towards scalable I/O in Linux.
+Adopting it today also makes systems future-ready, allowing applications to benefit from new capabilities, such as recently added zero-copy receive and upcoming features, without requiring architectural changes.
+

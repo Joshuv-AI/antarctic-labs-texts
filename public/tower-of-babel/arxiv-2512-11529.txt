@@ -1,0 +1,947 @@
+xGR: Efficient Generative Recommendation Serving at Scale
+Qingxiao Sun, Tongxuan Liu, Shen Zhang, Siyu Wu, Peijun Yang, Haotian Liang, Menxin Li, Xiaolong Ma, Zhiwei Liang, Ziyi Ren, Minchao Zhang, Xinyu Liu, Ke Zhang, Depei Qian, Hailong Yang, [1ex] Beihang University
+
+Abstract
+Recommendation system delivers substantial economic benefits by providing personalized predictions. Generative recommendation (GR) integrates LLMs to enhance the understanding of long user-item sequences. Despite employing attention-based architectures, GR’s workload differs markedly from that of LLM serving. GR typically processes long prompt while producing short, fixed-length outputs, yet the computational cost of each decode phase is especially high due to the large beam width. In addition, since the beam search involves a vast item space, the sorting overhead becomes particularly time-consuming. We propose xGR, a GR-oriented serving system that meets strict low-latency requirements under high-concurrency scenarios. First, xGR unifies the processing of prefill and decode phases through staged computation and separated KV cache. Second, xGR enables early sorting termination and mask-based item filtering with data structure reuse. Third, xGR reconstructs the overall pipeline to exploit multi-level overlap and multi-stream parallelism. Our experiments with real-world recommendation service datasets demonstrate that xGR achieves at least 3.49 × \times throughput compared to the state-of-the-art baseline under strict latency constraints.
+
+
+
+1
+Introduction
+
+Recommendation systems play a central role in modern digital platforms, such as social media
+[
+16
+]
+, video
+[
+4
+]
+, music
+[
+10
+]
+, and e-commerce
+[
+11
+]
+applications. By providing personalized and accurate predictions, recommendation systems can enhance user engagement and substantially improve economic benefits. For example, YouTube’s recommendation system has helped over 1 billion
+users discover personalized videos, resulting in a 60% increase in clicks
+[
+4
+]
+. As users generate increasingly rich behavioral data across various application scenarios, the demand for intelligent recommendation systems among enterprises continues to rise
+[
+20
+]
+.
+
+The success of industrial applications has promoted the development of recommendation systems
+[
+46
+]
+. During the past decade, deep learning-based recommendation (DLR)
+[
+13
+,
+3
+]
+has gained widespread attention. DLR typically employs a cascade architecture
+[
+17
+]
+, which includes sequential stages such as recall, pre-ranking, and fine-ranking. Among these, fine-ranking is the most computation-intensive stage, which utilizes
+deep learning recommendation models (DLRMs)
+
+[
+28
+,
+30
+]
+to predict the click-through rate (CTR) and conversion rate (CVR) scores. However, such a cascade architecture leads to system fragmentation, with a significant amount of time consumed in inter-stage communication, making it difficult to meet the ever-increasing service level objective (SLO) requirements
+[
+43
+,
+37
+]
+. Furthermore, DLRM generally adopts simple MLP networks, heavily relying on feature engineering and offering limited understanding of user behavior
+[
+28
+]
+.
+
+In recent years,
+generative recommendation (GR)
+systems have experienced explosive growth
+[
+24
+]
+. Unlike traditional DLR, GR incorporates a large language model (LLM), leveraging its rich pre-trained corpus to mitigate the cold-start problem for new items
+[
+6
+]
+. Furthermore, the inherent autoregressive nature of LLMs enables GR to follow a robust scaling law
+[
+14
+,
+36
+]
+, and the strong long-sequence embedding capability makes it particularly well-suited for extended user context in recommendation scenarios. In early development, LLMs are exploited to collaborate or replace certain stages of DLR cascade architecture, such as recall strategy enhancement
+[
+32
+]
+and fine-ranking model upgrades
+[
+47
+]
+. Subsequently, LLMs serve as the core of recommendation systems
+[
+7
+]
+, which enables end-to-end list recommendation through generative paradigms. This not only avoids error propagation among stages but also creates opportunities for deploying recommendation functionality directly via LLM inference.
+
+Although GR employs an attention-based architecture similar to general LLMs
+[
+35
+,
+26
+,
+1
+]
+, its inference workload characteristics differ significantly from LLM serving due to the unique nature of recommendation scenarios.
+At first, GR involves a fixed number of decode phases
+[
+9
+]
+, but each decode incurs substantial computation, requiring the avoidance of redundant KV cache loading and additional block copying.
+In addition, GR needs to perform efficient beam search
+[
+39
+]
+within a vast item space and coordinate resources for item filtering throughout the overall generation process.
+However, the core bottleneck lies in the extremely low latency requirement of the entire online inference pipeline (within tens to 200 milliseconds), while peak user traffic reaches thousands of queries per second (QPS)
+[
+41
+]
+.
+These characteristics suggest that naively adopting an LLM inference system is inadequate for GR, and a comprehensive reconstruction of the underlying pipeline is required. Specifically, the GR system exhibits three unique challenges that motivate this paper.
+
+Challenge 1: how to minimize the computation and memory cost induced by GR’s long prompt, short fixed-length output nature?
+Unlike conversational LLM applications that generate long responses to short prompts
+[
+50
+]
+, the GR task is characterized by long prompt inputs and fixed-length, short outputs. For example, a user’s lifetime behavior sequence may contain hundreds or thousands of tokens, but the output requires only a few tokens.
+This offers the potential for aggressive prefill-only optimizations
+[
+9
+]
+. But in GR, the computational volume of each decode phase becomes especially large due to the incorporation of beam search. Also, existing methods generally treat each beam sequence as independent
+[
+22
+,
+27
+]
+, ignoring the fact that they actually share an identical prompt context. The redundant loading of the shared KV cache exacerbates the memory bandwidth bottleneck. On the other hand, when the input length does not align with the KV block size, the last block must be explicitly copied to ensure the continuity of beam sequences. The costly massive block copies introduce severe latency and fragmented memory allocations.
+
+Challenge 2: how to maintain beam search efficiency while minimizing both sorting and filtering overhead in high-concurrency recommendation scenarios?
+The core operation of beam search is to select beam width (
+BW
+) sequences from a large pool of candidate sequences
+[
+29
+]
+.
+For each identified token, only the Top-
+K
+likely candidate tokens for the next step are retained
+[
+23
+]
+. Accurate recommendations require larger
+BW
+and
+K
+values, but the sorting and filtering operations become particularly time-consuming. As the decode phase progresses, beam search continuously generates new candidate sequences and discards old sequences. Frequent creation and destruction of related data structures incurs significant overhead.
+Moreover, due to the numerous possibilities of token ID combinations, not all of them correspond to actual products, leading to candidate sequence invalidation
+[
+21
+]
+.
+
+Challenge 3: how to schedule multi-level GR pipeline to maximize pipeline parallelism while reducing accelerator idle time?
+In GR, the scheduler first prepares the information needed on the host side. After preparation, the relevant tasks are handed over to the engine. The engine is responsible for executing one prefill as well as three beam search and decode combinations
+[
+7
+]
+. The workers are responsible for executing specific phases. In such a multi-level pipeline, the host and device handle distinct tasks, leading to opportunities for overlapping. In addition, request sizes typically follow a power-law distribution that potentially contains tens to thousands of tokens. Moreover, current GR models contain far fewer parameters than that of LLMs, causing host-side scheduling to account for a substantial portion of the latency.
+
+To address the above challenges, we propose xGR, a serving system that meets the low-latency constraints under high-concurrency scenarios.
+For Challenge 1,
+xAttention achieves efficient memory management and load balancing through KV cache separation and staged attention computation.
+For Challenge 2,
+xBeam minimizes search overhead with early sorting termination and mask-based item filtering.
+
+For Challenge 3
+, xSchedule leverages host-device overlap and multi-stream parallelism in the system pipeline.
+To the best of our knowledge, this is the first work to comprehensively reconstruct the GR serving paradigm, encompassing optimizations from operator and algorithm to system. xGR has been deployed in production scenarios for 3 months, serving over hundreds of millions users. Even under peak RPS of tens of thousands, it maintains a P99 latency within 200 milliseconds. Specifically, this paper makes the following contributions:
+
+•
+
+We comprehensively analyze the workload characteristics of the GR paradigm and expose potential optimization opportunities to facilitate deployment.
+
+•
+
+We optimize the overall process spanning prefill, decode, and beam search phases. At the operator level, xAttention accelerates self-attention through KV cache separation and staged computation allocation. At the algorithm level, xBeam reduces search overhead with valid path constraint and early search termination.
+
+•
+
+We deconstruct the GR pipeline to facilitate system-level optimizations. xSchedule employs a three-tier hierarchy to enable pipeline overlap and task parallelism.
+
+•
+
+We develop a GR serving system xGR that enables low-latency recommendation under high-concurrency scenarios. The experimental results show that xGR achieves at least 3.49
+\times
+throughput compared to the state-of-the-art baseline under strict latency constraints.
+
+2
+Background
+
+2.1
+Recommendation Paradigms
+
+2.1.1
+Discriminative Recommendation
+
+To handle massive item pools, traditional industrial recommendation systems universally adopt a discriminative cascade architecture
+[
+17
+]
+. This pipeline typically consists of three sequential filtering stages:
+Recall
+, which selects thousands of candidates from hundreds of millions of items using two-tower models or inverted indices, focusing on coverage;
+Pre-ranking
+, which uses lightweight models to narrow down the scope; and
+Fine-ranking
+, the most computationally intensive stage, which typically employs DLRM
+[
+28
+,
+30
+]
+to predict precise CTR/CVR scores for hundreds of candidates. However, this architecture faces fundamental limitations from both system and hardware perspectives. First, the I/O overhead and network transmission accumulated across multiple model instances introduce significant system latency. Second, sparse embedding lookups (
+gather
+operations) dominate execution time, resulting in low arithmetic intensity.
+
+2.1.2
+Generative Recommendation
+
+To address these limitations, both academia and industry are pivoting towards GR. As shown in Figure
+1
+, departing from the multi-stage discriminative architecture, GR adopts a Transformer-based unified architecture (e.g., TIGER
+[
+32
+]
+, OneRec
+[
+7
+]
+). GR redefines the recommendation task as a
+Sequence-to-Item
+generation problem: given a user’s historical behavior sequence
+H=\{x_{1},x_{2},...,x_{t}\}
+, the model directly predicts the next most probable item
+x_{t+1}
+.
+
+The core driver behind this shift is the scaling law
+[
+18
+,
+14
+,
+36
+]
+. Recent studies indicate that the accuracy of traditional DLRM tends to saturate at a certain scale, whereas Transformer-based GR exhibits strong scalability—recommendation quality improves predictably as model parameters, data volume, and FLOPs increase. This drives service providers to deploy deeper and wider models, shifting the system workload toward a compute-intensive profile.
+
+Figure 1
+:
+Architecture comparison between discriminative recommendation and generative recommendation.
+
+2.2
+System Analysis of GR
+
+2.2.1
+GR Inference Workflow
+
+The inference workflow of GR follows the standard “Prefill-and-Decode” paradigm but exhibits unique characteristics.
+
+Prefill.
+In contrast to LLMs that typically process concise prompts, GR encodes a significantly longer sequence of user interaction history (e.g., extensive lists of clicked item IDs), resulting in a long prompt input workload.
+
+Decode.
+While LLMs typically employ stochastic sampling to foster diversity and creativity, GR prioritizes retrieval accuracy to recommend the most relevant items. Consequently, GR relies heavily on beam search with large width (>=128) instead of greedy or random sampling. This requirement compels the system to maintain and update large amount of active beams simultaneously at each step, rendering the GR decode phase significantly different from the single-stream decoding commonly found in LLM applications.
+
+2.2.2
+Beam Search Algorithm
+
+Beam search is a heuristic search algorithm widely adopted in GR to balance the trade-off between retrieval quality and computational cost. It maintains a set of
+BW
+most promising partial sequences, where
+BW
+is the beam width.
+
+As shown in Figure
+2
+, at each time step
+t
+, the algorithm expands all
+BW
+active beams by computing the probability distribution over the item vocabulary. To manage the search space, the system first selects the Top-
+K
+most likely next-token candidates for each beam. From this aggregated pool of
+BW\times K
+candidates, it then identifies the global Top-
+BW
+sequences with the highest cumulative log-probabilities to form the new set of active beams for step
+t+1
+. This procedure repeats until the generated item identifiers are complete. Unlike typical LLM tasks where
+BW
+is small, generative recommendation demands high diversity, often requiring large values for both
+BW
+and
+K
+(e.g.,
+128\times 128
+or even
+512\times 512
+). This results in a massive candidate pool (up to
+2.6\times 10^{5}
+candidates per time step), transforming the lightweight sorting operation into a computationally heavy bottleneck.
+
+Figure 2
+:
+An example of beam search process.
+
+2.2.3
+Key Workload Characteristics
+
+Based on observations from production environments, GR inference workloads exhibit three unique characteristics that constitute the primary bottlenecks in current systems.
+
+1) Redundant memory access in long-context beam search.
+The primary bottleneck lies not just in the computation of the long prompt, but in the redundant memory access during the decode phase. In GR, a single long user history sequence (prompt) is shared across a wide beam width (e.g.,
+BW=128
+) to generate diverse item candidates. Existing attention mechanisms often treat these beams as independent sequences during calculation, failing to efficiently reuse the loaded KV cache data in compute units of the shared prefix. This necessitates repetitively loading the massive prompt KV cache from global memory to compute units for each beam.
+
+2) Memory inefficiency from beam forking.
+The dynamic nature of beam search, where sequences continuously fork and retire, introduces severe inefficiencies in block-based memory management (e.g., PagedAttention
+[
+22
+]
+). If the sequence length does not align with the KV block size, the system is forced to perform physical block copies to ensure context independence for the new branches.
+Furthermore, these massive copied blocks may contain redundant leading tokens and unused token space, resulting in inefficient memory usage.
+
+3) Latency sensitivity due to strict SLO and small model scale.
+GR services operate under extremely strict SLO, typically requiring P99 latency to be within 200 milliseconds to ensure user experience. Unlike general LLMs with hundreds of billions of parameters, GR models are often relatively smaller (e.g., 100M to 10B parameters). This shift in model scale makes the system highly sensitive to runtime overheads. Non-compute costs—such as kernel launching, host-side scheduling, and synchronization—constitute a substantial proportion of the end-to-end latency.
+
+2.3
+Accelerator Abstraction
+
+Modern accelerators typically comprise dozens of core groups (CGs) that share an L2 cache through the interconnect network. The L2 cache is connected to high-bandwidth global memory. Each CG consists of different functional units, including matrix compute units (MCUs), vector compute units (VCUs), and scalar compute units (SCUs).
+The register file serves as the storage closest to these compute units, followed by L1 cache and scratchpad memory. The scratchpad memory is explicitly managed, thus offering high flexibility.
+
+Abstraction
+
+Ascend GPU
+
+NVIDIA GPU
+
+Core Group
+
+AI Core
+
+Streaming Multiprocessor
+
+Matrix Compute Unit
+
+Cube
+
+Tensor Core
+
+Vector Compute Unit
+
+Vector Unit
+
+CUDA Core
+
+Scalar Compute Unit
+
+Scalar Unit
+
+—
+
+Scratchpad Memory
+
+Unified Buffer
+
+Shared Memory
+
+Table 1
+:
+Correspondence in Ascend NPU and NVIDIA GPU.
+
+Table
+1
+presents the correspondence between the unified abstraction and the architectures of Ascend NPU and NVIDIA GPU. For such a unified abstraction, performance optimizations must pay particular attention to the following principles: 1) the complex storage hierarchy necessitates careful data placement; 2) the diversity of compute units necessitates fine-grained task partitioning; 3) task dependencies necessitate efficient execution pipelines. These principles guide us in designing specialized optimizations for GR workloads.
+
+3
+Motivation
+
+Generative recommendation systems rely heavily on beam search to generate diverse lists of recommended items. However, state-of-the-art inference frameworks (such as vLLM based on PagedAttention
+[
+22
+]
+) are not optimized for this scenario characterized by high-concurrency branching. We identify three critical bottlenecks that hinder performance.
+
+3.1
+Attention Performance
+
+As discussed in Section
+2.2.3
+, existing attention kernels lack awareness of the shared prefix inherent in beam search, resulting in significant memory access overhead. As shown in Figure
+3
+, the latency of existing operators like PagedAttention exhibits a significant upward trend as the beam width increases. In contrast, the Ideal that represents theoretical performance with perfect reuse of the shared prefix remains relatively flat. The significant performance gap between the actual curve of PagedAttention and Ideal intuitively reveals the substantial potential for optimization by eliminating redundant memory access to enhance operator efficiency. Furthermore, we experiment with TreeAttention
+[
+33
+]
+, whose masking-based batching mechanism partially mitigates the overhead of redundant memory loads. However, the substantial beam width introduces a significant mask generation overhead.
+
+Figure 3
+:
+Latency comparison of various attention kernels across different beam widths.
+
+3.2
+Memory Consumption
+
+As discussed in Section
+2.2.3
+, the paged memory management mechanism of PagedAttention introduces significant copy overhead and memory redundancy when handling beam bifurcation. As shown in Figure
+4
+, with the increase in beam width, the memory consumption of PagedAttention increases sharply due to frequent block copies and resulting fragmentation. In contrast, the Ideal represents the memory required to store only one copy of the shared prefix in an ideal state. The large gap between PagedAttention and the Ideal confirms that its memory management suffers from severe resource redundancy. For TreeAttention, although successfully avoids the partial block copy triggered by newly generated tokens, it cannot efficiently release the KV cache belonging to previously eliminated beam search paths.
+
+Figure 4
+:
+Memory consumption comparison of various attention kernels across different beam widths.
+
+3.3
+Invalid Item Generation
+
+The fundamental difference between GR and general text generation lies in the validity constraint of the output. Given the exponentially growing combination space of Token IDs, not all token sequences map to valid, real-world items. To prevent the model from generating non-existent “hallucinated” items, GR systems must enforce strict valid item filtering mechanisms. As shown in Figure
+5
+, the experiments conducted without filtering conditions reveal that the proportion of invalid items approaches 50%. These invalid results not only waste compute resources but also significantly degrade the final recommendation quality, rendering the system unable to meet actual business requirements.
+
+However, existing mechanisms for item filtering face a severe dilemma: calculating the masks dynamically introduces substantial latency, while pre-storing the masks leads to unmanageable memory overhead, also leading to a suboptimal performance.
+
+Figure 5
+:
+Proportion of invalid items under the total generation capacity of 300 items within a 2-minute interval.
+
+4
+Overview
+
+In this section, we present xGR, a GR-oriented serving system designed to meet strict SLO requirements under high request concurrency. As shown in Figure
+6
+, xGR is composed of three tightly coupled components: xAttention for operator-level optimizations (§5), xBeam for algorithm-level optimizations (§6), and xSchedule for system-level optimizations (§7).
+
+Figure 6
+:
+Design overview of xGR.
+
+Figure
+6
+illustrates the interaction of the three components. xAttention and xBeam span the prefill, decode, and beam phases, working cooperatively to achieve efficient token generation and sampling. Specifically, xAttention focuses on self-attention computation, integrating KV cache management and staged computation allocation to improve throughput. xBeam quickly determines the candidate tokens via valid path constraint, early sorting termination, and data structure reuse. xSchedule provides system support for xAttention and xBeam. It employs a three-tier management hierarchy that comprises the scheduler, engine, and worker. This design enables pipeline overlap and task parallelism across batches, across requests within a batch, and within each request. A detailed description is provided in the following sections.
+
+5
+Attention Computation
+
+Attention computation remains the primary performance bottleneck in GR scenarios. Specifically, the process is divided into one prefill phase and three decode phases, with each decode phase generating a token ID (
+TID
+), where the resulting
+TID
+triplet represents an item ID. Unlike prior study that identifies the prefill phase as the dominant cost
+[
+9
+]
+, large
+BW
+and
+K
+settings make the decode stage also particularly time-consuming. In the following, we present the KV cache management and task allocation mechanisms.
+
+5.1
+KV Cache Management
+
+Existing KV cache management strategies are highly inefficient in GR scenarios. For example, PagedAttention
+[
+22
+]
+ignores the fact that sequences within a beam share the same prefix token IDs, and instead redundantly loads identical KV blocks for expansion. Such duplicated memory accesses further exacerbate the memory bandwidth bottleneck. Although recent works
+[
+52
+,
+33
+,
+25
+]
+mitigate repeated accesses to shared KV blocks through system KV cache computation, it still incurs additional block copying or masking overhead to maintain beam-sequence continuity. To address the above issues, xAttention separates the KV cache into shared and unshared parts, each managed with a distinct strategy.
+
+Figure 7
+:
+KV cache management in xAttention.
+
+Figure
+7
+illustrates the KV cache management throughout the whole inference process. The
+shared cache
+stores the token-level outputs of the prompt produced during the prefill phase, whereas the
+unshared cache
+holds the
+BW
+token IDs generated at each decode phase. Specifically, since the number of decode phases (
+ND
+) is known in advance, xAttention initializes the unshared cache size to exactly the product of
+BW
+and
+ND
+, thereby avoiding redundant block loading. In addition, the unshared cache is also managed at the token granularity without extra alignment, avoiding the overhead of block copying. After each decode phase, the beam prefixes are updated and extended with new token IDs.
+
+Figure 8
+:
+In-place block updates in the unshared cache.
+
+In managing the unshared cache, achieving in-place block updates without introducing additional copies remains challenging. In-place updates require only a single memory buffer to modify the blocks, while preserving the continuity of KV loading during attention computation. As shown in Figure
+8
+, xAttention updates block contents based on beam indices. However, if the block is naively updated in a strictly downward or upward order, some entries would be overwritten before they are read, resulting in incorrect outputs. To this end, xAttention introduces
+direct indices
+that indicate the direction: “1” for upward writes and “-1” for downward writes. Based on these indices, xAttention first performs all upward writes in downward order, and then completes the remaining writes in upward order. This approach eliminates write-before-read hazards and thus ensures correctness.
+
+5.2
+Staged Computation Allocation
+
+Since the shared and unshared caches do not interfere with each other, xAttention divides the attention computation with common prefixes into a shared stage and an unshared stage. To maximize parallelism, xAttention computes the local attention scores and statistics (i.e., local maxima and sums) for the shared and unshared stages independently. It then applies
+OnlineSoftmax
+to produce the final logits, followed by post-processing to generate the outputs. Inspired by FlashAttention
+[
+5
+]
+, we further decompose the computation into tiles and distribute them across hardware units.
+
+Figure 9
+:
+Pipeline parallelism across hardware units.
+
+Figure
+9
+illustrates the pipeline parallelism of attention computation across hardware hierarchies. To improve data locality and avoid frequent cross-CG synchronization, each of the three stages exclusively occupies a CG during execution. In both the shared and unshared stages, computations from different tiles are fused using
+batchmatmul
+, with the
+batchmatmul
+and
+Softmax
+operations assigned to the MCU and VCU, respectively. Because the
+Softmax
+depends on the results of the
+batchmatmul
+, the MCU and VCU within each CG operate in a pipelined parallel manner. However, different CGs do not have interdependencies and can therefore execute in an embarrassingly parallel fashion. Regarding the merging stage,
+OnlineSoftmax
+and
+Post-processing
+are deployed on the MCU and VCU, respectively. Since the merging stage depends on the partial logit results, it forms a pipelined execution across CGs with the preceding stages. The merging stage employs a soft-synchronization mechanism, setting flags in the workspace so that the CG assigned to this stage spin-waits until the required data becomes available.
+
+Given that accelerators typically contain dozens of CGs, effectively partitioning CGs across stages to achieve load balance is critical. On the one hand, the computational volume of the shared stage is generally greater than that of the unshared stage, potentially requiring more CGs. On the other hand, the shared cache only needs to be loaded once, whereas the unshared cache must be updated at each decode step. The limited CGs allocated to the unshared stage exacerbate intra-CG cache conflicts and complicate the scratchpad memory management. As for the merging stage, the optimal CG allocation is strongly correlated with the preceding stages and cannot be predetermined. To this end, xAttention employs a lightweight decision tree regressor
+[
+2
+]
+to predict the performance of each CG partition setting represented as triplets. In addition to the partition setting, the input parameters also include the lengths of unshared and shared caches, i.e., the number of tokens. Note that in mature deployments, GR parameters such as
+BW
+and
+K
+, as well as attention parameters like head size, are fixed. Therefore, there is no need to include them as inputs to the regressor. Consequently, the overall cost of collecting the training set and model training is feasible.
+
+6
+Beam Search
+
+In GR scenarios, beam search is essential for personalized recommendations to users from a vast item space. In each decode phase, each beam selects token IDs with Top-
+K
+probabilities from the vocabulary to expand its sequence. Then, all beam sequences are traversed to obtain the tokens with Top-
+BW
+probabilities to enter the next decode phase. However, naive beam search implementation is highly time-consuming and easily violates SLO requirements. To address this issue, we introduce the following optimization techniques.
+
+6.1
+Valid Path Constraint
+
+Given the vast combinatorial space of token IDs, not all token-ID triplets correspond to actual items. To guarantee that the model produces only valid item identifiers, we impose valid path constraint during token generation. Specifically, we borrow the idea of constraint decoding
+[
+8
+]
+in LLMs and leverage item masks to filter out invalid token IDs. As illustrated in Figure
+10
+, xBeam generates an item mask based on the pre-built valid item vocabulary and incorporates the mask into the model’s output logits through element-wise addition. Once the masked logits are processed by the
+Softmax
+function, the probabilities of invalid token IDs become vanishingly small, effectively preventing them from being selected.
+
+Figure 10
+:
+Valid path constraint during token generation.
+
+On the other hand, xBeam employs a combination of sparse and dense storage to improve mask generation efficiency. For example, during the first decode step, each beam typically contains thousands of candidate tokens. To mitigate latency, the mask is stored in a dense format and pre-generated during model loading, eliminating the need for on-demand generation at runtime. In contrast, during the final decode step, each beam only contains few candidate tokens, resulting in additional memory overhead when generating a new mask. In this case, xBeam stores the relevant positions in a sparse format and performs in-place updates to the existing mask. Owing to the small extent of these modifications, the incurred runtime latency remains within an acceptable range.
+
+6.2
+Early Sorting Termination
+
+During token generation, beam search accumulates log-probabilities (
+log_prob
+) rather than multiplying raw probabilities to ensure numerical stability. After that, beam search selects the Top-
+BW
+token sequences from the filtered candidate sequences. This procedure can be viewed as a partial sorting problem, which obviates the need for fully sorting and thereby provides an opportunity to reduce computational complexity. Another feature is that the
+log_prob
+results for each beam are inherently in descending order. Based on the above considerations, xBeam adopts an early termination mechanism to improve sorting efficiency.
+
+Figure 11
+:
+The sorting process with early termination.
+
+Figure
+11
+shows the sorting process with early termination. xBeam maintains a global min heap of size
+BW
+to store the top-ranking token sequences along with their associated
+log_prob
+values. During sorting, xBeam visits the leaves of each sub-beam tree sequentially. During the traversal of each beam, if the leaf’s
+log_prob
+exceeds that of the heap’s top element, it is inserted into the heap, and the heap structure is adjusted to maintain order. Otherwise, the sorting operation of that beam is terminated immediately. After traversing all beams, xBeam retrieves the top-
+BW
+token sequences. In this way, xBeam significantly reduces sorting overhead while ensuring high-quality sequence selection.
+
+6.3
+Data Structure Reuse
+
+Beam search typically requires a larger
+BW
+(e.g., 512) to ensure accurate recommendations. However, continuously generating new candidate sequences while discarding old ones leads to substantial waste of computational and memory resources. This is because the frequent creation and destruction of sequence-related data structures, as well as the associated data movement operations, incur significant overhead. Fortunately, since the
+BW
+is predetermined and fixed throughout the beam search process, this provides an opportunity for resource reuse. Specifically, during the generation of new candidate sequences, xBeam does not allocate entirely new data structure; instead, it reuses the data structure previously occupied by old sequences. Moreover, once beam search completes, xBeam updates the memory regions corresponding to the old sequences with the content of the newly generated ones. This strategy not only reduces memory consumption but also lowers the resource management overhead.
+
+7
+System Scheduling
+
+Figure
+12
+shows the overall pipeline of xSchedule. First, the scheduler pre-allocates resources and prepares the necessary embedding information on the host side. Once prepared, the scheduler initiates the corresponding phases and hands them over to the engine for processing. Then, the engine manages the continuous execution of one prefill followed by three beam search and decode combinations. Note that beam search and decode are tightly coupled, leaving no room for pipelining across phases. The worker is responsible for executing all tasks associated with a specific phase (e.g., prefill).
+
+Figure 12
+:
+The overall pipeline of xSchedule.
+
+Such a multi-level pipeline offers numerous opportunities for system-level optimization to improve overall execution efficiency. For example, the host-side scheduler concurrently processes requests by overlapping control and computation flows. Specifically, the
+Schedule
+involves device-side control (e.g., kernel dispatch), which can overlap with the
+Beam
+and
+Pre-allocate
+computations. Moreover, xSchedule captures a series of device-side operations (e.g., kernels and memory copies) in the form of a graph and submits them all at once. This approach significantly reduces kernel launch overhead and enables execution without intervention, effectively lowering host-side scheduling time. On the other hand, xSchedule strives to overlap host and device operations as much as possible. The filter mask generation is performed on the host side, overlapping with the device-side model forward pass that produces logits. In addition, the H2D transfer of the mask is performed concurrently with the
+self-attention
+, achieving overlap between computation and communication.
+
+In addition to pipeline optimizations, fully exploiting the accelerator capabilities is also crucial for improving request throughput. xSchedule employs a dynamic batching strategy similar to that used in LLMs, aggregating incoming requests into larger batches. However, in recommendation scenarios, the request concurrency scale can vary drastically, and individual requests may contain tens to thousands of tokens. To handle such variability, xSchedule automatically adjusts the batch size based on the token capacity. Meanwhile, the batching interval is constrained by the SLO: if the waiting delay reaches the allocated quota, the batch is dispatched for computation immediately. Furthermore, given that GR models contain far fewer parameters than LLMs and therefore have lower computational load, sequentially executing batches may still leave certain units underutilized in the spatial dimension. To this end, xSchedule employs a multi-stream strategy to process batches concurrently, where each stream independently handling requests within a single batch. This strategy amortizes host-side scheduling overhead and fully exploits the many-core parallelism. More importantly, the batches can be dynamically assigned to idle streams based on real-time load conditions to guarantee service quality.
+
+8
+Implementation
+
+We implement xGR on top of xLLM
+[
+27
+]
+, comprising 17k lines of Ascend C/CUDA/C++ code and 4k lines of Python code. Notably, the system and operator designs are portable across Ascend NPU and NVIDIA GPU, as modern accelerators generally feature multi-level memory hierarchies and heterogeneous compute units. These can be uniformly abstracted to efficiently support matrix- and vector-related operations. However, the specialized components lead to differences in fine-grained optimizations. For example, On NVIDIA GPU, xGR leverages the tensor memory accelerator (TMA) of the Hopper architecture to load tiles from global memory into shared memory. This is made possible by our novel KV cache management that ensures contiguous memory layout. In this case, TMA can perform asynchronous DMA transfers in a single operation, maximizing throughput while reducing the overhead of address calculations and load/store instructions.
+
+9
+Evaluation
+
+9.1
+Experimental Setup
+
+Hardware.
+We evaluate our system on an Ascend cluster and a GPU cluster. The Ascend cluster comprises 64 nodes, each with 16 Ascend NPUs (64GB) interconnected via HCCS. The GPU cluster comprises 8 nodes, each with 8 NVIDIA H800 GPUs (80GB) interconnected via NVLink.
+
+Models.
+We select Qwen3
+[
+40
+]
+and OneRec
+[
+21
+]
+, widely adopted as representative models for GR tasks.
+
+Baselines.
+We compare our system with two baselines including vLLM
+[
+22
+]
+and xLLM
+[
+27
+]
+. vLLM is a high-throughput serving engine using PagedAttention. We use the vllm-ascend porting for the Ascend cluster. xLLM is an industrial inference framework optimized for throughput. It leverages PagedAttention’s mechanism for memory management, providing efficient support for Ascend NPU platforms.
+
+Datasets.
+We use two datasets including Amazon Review
+[
+15
+]
+and JD Trace. Amazon Review is a public dataset for benchmarking recommendation tasks. JD trace is taken from production scenarios, featuring dynamic traffic patterns.
+
+Metrics.
+We focus on two critical metrics for user experience: average latency and P99 latency under varying RPS.
+
+9.2
+End-to-end Performance
+
+We conduct the experiments on the Ascend cluster using Qwen3 model (ranging from 0.6B to 4B parameters) and the OneRec model (ranging 0.1B to 3B parameters).
+Figure
+13
+and Figure
+14
+illustrate the curves for Qwen3 and OneRec, respectively. Note that vLLM does not natively support OneRec and is thus not included in Figure
+14
+. xGR consistently outperforms both baselines across all cases. Specifically, under strict latency constraints (P99
+\leq 200
+ms), xGR sustains a significantly higher throughput. As the RPS increases, the baselines experience a sharp rise in latency and quickly reaches the constraint. In contrast, xGR maintains a relatively smooth latency increase even at high loads, demonstrating the efficacy of staged attention computation and KV cache separation.
+
+GR heavily relies on large beam widths to ensure retrieval diversity. We conduct experiemnts under varying beam widths (
+BW\in\{128,256,512\}
+), observing that the performance gap widens significantly as the beam width increases. For small beam width (
+BW=128
+), the baselines struggle to meet SLO requirements even at moderate request concurrency. At larger beam widths (
+BW=512
+), the baselines fail to scale effectively, with latency increasing non-linearly. Conversely, xGR leverages the high NPU parallelism for both sorting and filtering, coupled with shared prefix management. This design allows xGR to exhibit only a slight increase in latency even when the beam width grows by multiples.
+
+We further verify the scalability of xGR across different model scales. xGR consistently delivers superior performance across the spectrum. Notably, on larger models (e.g., Qwen3-4B), the memory bandwidth savings become even more pronounced. By avoiding the redundant loading of shared prompt contexts for varying beams, xGR supports high concurrency robustly, whereas the baselines frequently trigger preemption or recomputation under similar conditions. Since vLLM-Ascend is not well optimized, its redundant memory accesses under large-width beam search lead to severe underutilization of compute units. We compare xGR only with xLLM for Ascend NPU in the following experiments.
+
+(a)
+
+Amazon Review Dataset
+
+(b)
+
+JD Dataset
+
+Figure 13
+:
+End-to-end comparison of Qwen3 on the Ascend cluster using (a) Amazon Review dataset and (b) JD dataset.
+
+(a)
+
+Amazon Review Dataset
+
+(b)
+
+JD Dataset
+
+Figure 14
+:
+End-to-end comparison of OneRec on the Ascend cluster using (a) Amazon Review dataset and (b) JD dataset.
+
+Figure 15
+:
+Peak memory usage comparison of Qwen3-4B across different beam widths at a fixed RPS of 4.
+
+Figure 16
+:
+Peak memory usage comparison of Qwen3-4B across different input lengths at a fixed beam width of 256.
+
+9.3
+Memory Efficiency
+
+We analyze the memory usage of xGR compared to xLLM using the Qwen3-4B model on a single Ascend NPU, where the RPS is set to 4. Figure
+15
+illustrates the peak memory usage as the beam width increases from 128 to 512 with a fixed input lengh of 1k tokens. While xGR maintains a stable memory footprint (around 10GB), xLLM exhibits super-linear growth. Specifically, xLLM consumes a 46.3GB compared to xGR’s 10.6GB with
+BW=512
+. The excessive memory consumption in xLLM stems from the additional block copying inherent in PagedAttention, leading to severe redundancy and fragmentation. xGR addresses this through separated KV cache management, maintaining a single physical copy of the shared prefix and just enough space to store the decoded tokens.
+
+We further evaluate memory scalability under varying input lengths (Figure
+16
+). With the
+BW
+fixed at 256, xGR maintains a remarkably low footprint—peaking at only 12.0GB even with 3k tokens—significantly outperforming xLLM, which consistently consumes around 30GB. This confirms that xGR decouples memory usage from sequence length, ensuring robustness for long-context recommendation tasks.
+
+(a)
+
+Kernel Latency
+
+(b)
+
+Computational Throughput
+
+(c)
+
+Memory Access Overhead
+
+Figure 17
+:
+Kernel efficiency of PagedAttention and xAttention, where
+BS
+and
+L
+refer to batch size and input length.
+
+9.4
+Kernel Efficiency
+
+We analyze fine-grained kernel efficiency on Ascend NPU across varying input lengths, beam widths and batch sizes. As shown in Figure
+17
+, we focus on three key metrics including kernel latency, computational throughput, and memory access overhead. Regarding latency and throughput, xAttention demonstrates superior performance, particularly at large beam width (
+B=512
+). It reduces kernel latency by approximately 6.6
+\times
+and boosts computational throughput by 7
+\times
+. This indicates that xAttention effectively saturates the compute units, whereas PagedAttention suffers from idle stalls.
+
+We also perform memory profiling via Ascend NPU’s Profiler. As show in Figure
+17
+(3), PagedAttention is heavily memory-bound. The memory access pipeline spends an average of 93.4% of its time in a busy state. This is primarily due to repeated memory load to the same KV cache prefix. In contrast, xAttention maintains a steady busy rate of around 52%, successfully transforming the workload from memory-bound to compute-bound and maximizing hardware utilization.
+
+Figure 18
+:
+Ablation study of scheduling optimizations using OneRec-0.1B on the Amazon Review dataset.
+
+9.5
+Scheduling Analysis
+
+To quantify the individual contributions of xSchedule, we conduct an ablation study using the OneRec 0.1B model on the Amazon Review dataset. We establish the xGR baseline that implements the core xAttention and xBeam components but lacks scheduling optimizations. We enable valid item filtering, kernel graph dispatch, and multi-stream execution separately to evaluate their individual impacts. As observed in Figure
+18
+, the latency for the baseline sharply as RPS increases. Without multi-stream optimization, xGR suffers from serial execution overhead and fails to overlap H2D data transfer with device-side computation. Moreover, for lightweight models like OneRec-0.1B, the kernel launch overhead becomes a dominant factor limiting performance. The kernel graph dispatch optimization allows xGR to capture the sequence of kernels into a static graph structure, drastically reducing the CPU interactions required per decode phase.
+
+Finally, we evaluate the overhead of ensuring recommendation validity via item filtering. Traditional host-side filtering typically introduces a massive latency penalty due to host-device synchronization. In contrast, xGR implements a fully device-resident mechanism, ensuring that validity checks are performed within the beam search kernel. Figure
+18
+demonstrate that the filtering overhead is negligible. The results indicate that xGR successfully reconciles the conflict between recommendation correctness and system performance.
+
+9.6
+Deployment on NVIDIA GPUs
+
+To demonstrate the portability of xGR, we extend the evaluation to the GPU cluster equipped with 64 H800 GPUs.
+While the architectural details of NVIDIA GPU differ from that of Ascend NPU, the fundamental challenges such as “memory wall” and KV cache management induced by large beam widths remain consistent.
+Figure
+19
+presents the P99 and average latency comparison across various model scales (0.6B, 1.7B, 4B) and beam widths (
+B\in\{128,256,512\}
+). Since xLLM lacks GPU support for PagedAttention, we compare xGR only with vLLM. The results on the GPU cluster mirror the trends observed on the Ascend NPU. xGR consistently achieves significantly lower latency and higher sustainable throughput.
+Notably, despite H800 GPU’s high memory bandwidth and H2D bandwidth (employs PCIe Gen5), as well as large computational capacity, it still performs poorly on vLLM. This indicates that hardware enhancement alone is insufficient to effectively address the unique challenges of GR, requiring a comprehensive system redesign.
+
+Figure 19
+:
+End-to-end comparison on the GPU cluster using the Amazon Review dataset at a fixed RPS of 64.
+
+10
+Related Work
+
+10.1
+DLRM Serving System
+
+DLRM serving must meet strict latency requirements on the order of hundreds of milliseconds, placing stringent demands on inference efficiency
+[
+34
+,
+19
+,
+38
+,
+43
+,
+41
+]
+.
+Ekko
+[
+34
+]
+exploits the temporal locality to prioritize the sending of memory updates and enable model rollbacks when detecting SLO-detrimental biased updates. GRACE
+[
+43
+]
+introduces item co-occurrence graph that records co-accessed item combinations and finds item combinations within the capacity-limited cache space. Prism
+[
+41
+]
+divides the computation graph into CPU-intensive and GPU-intensive subgraphs that are scheduled to disaggregated CPU nodes and GPU nodes for fragmentation reduction.
+However, the aforementioned studies remain constrained by the model scaling law and cascade architecture.
+
+10.2
+LLM Inference Engine
+
+The prototype of LLM inference engines can be traced back to Hugging Face’s standardization of Transformer models. Nowadays, the growing demand for LLM serving has driven the development of inference frameworks
+[
+44
+,
+22
+,
+50
+,
+49
+,
+31
+,
+51
+]
+.
+vLLM
+[
+22
+]
+offers LLM execution beyond GPU memory capacity, minimizing GPU memory fragmentation, which leads to larger batch sizes.
+SGLang
+[
+49
+]
+targets structured output generation, which submits primitive operations to the prompt state stream for asynchronous execution. xLLM
+[
+27
+]
+adopts a workload-adaptive dynamic prefill-decode (PD) disaggregation policy for instance scheduling, employing dual-stream parallelism for multi-layer pipelining. However, these inference engines are suboptimal for GR workloads, which typically exhibit long prompt-short output nature and shared prefix across decode phases. A recent work, PrefillOnly
+[
+9
+]
+assumes that the model outputs a single token, which enables predictable job completion time (JCT) and KV-cache storage limited to the last layer. However, such aggressive optimization is misaligned with practical GR scenarios where each decode phase also incurs substantial computation.
+
+There are also lines of work that focus on memory management (e.g., KV cache)
+[
+12
+,
+42
+,
+45
+,
+48
+]
+.
+IC-Cache
+[
+45
+]
+employs a cost-aware example reply mechanism that selectively evicts examples to preserve those that yield the most effective responses.
+DiffKV
+[
+48
+]
+handles the irregular memory usage patterns via parallel KV compaction, which packs fragmented free memory lists into contiguous regions on GPU.
+However, in GR scenarios, the issues of redundant KV cache loading and costly block copying have not been well resolved, requiring customized fine-grained optimization techniques.
+
+11
+Conclusion
+
+In this paper, we propose xGR, an efficient GR serving system that meets low-latency requirements under high request concurrency. First, we implement an attention operator that separates KV cache management and employs staged computation allocation. Second, we introduce a beam search algorithm that filters invalid items and enables early search termination. Third, we design a scheduling mechanism that allows pipeline parallelism throughout the entire system. The experiments with real-world datasets demonstrate that xGR achieves at least 3.49
+\times
+throughput compared to the state-of-the-art baseline under strict latency constraints.
+

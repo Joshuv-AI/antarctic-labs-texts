@@ -1,0 +1,2113 @@
+Vec-LUT: Vector Table Lookup for Parallel Ultra-Low-Bit LLM Inference on Edge Devices 116
+Xiangyu Li 1 Chengyu Yin 2 Weijun Wang 1 Jianyu Wei 3 Ting Cao 1 Yunxin Liu 1 1 Institute for AI Industry Research (AIR), Tsinghua University 2 Beijing Jiaotong University 3 University of Science and Technology of China
+
+Abstract
+. Large language models (LLMs) are increasingly deployed on edge devices. To meet strict resource constraints, real-world deployment has pushed LLM quantization from 8-bit to 4-bit, 2-bit, and now 1.58-bit. Combined with lookup table (LUT)-based inference, CPUs run these ultra-low-bit LLMs even faster than NPUs, opening new opportunities for ubiquitous on-device intelligence. However, this paper identifies that LUT-based inference underutilizes memory bandwidth during parallel inference, which is required for prefilling, test-time scaling, and other multi-token scenarios. The root cause is the scalar LUT paradigm, which performs repetitive and non-contiguous memory accesses for each token. To solve the issue, we propose vector LUT, a new lookup paradigm that constructs a unified LUT across parallel tokens, and performs a single 1 → N 1\rightarrow N lookup per index. To realize it efficiently, we further introduce (1) Vector LUT-Centric Tensor Layout, and (2) Cache-Aware Streamed Lookup techniques. Evaluations on 5 edge devices across 3 LLMs show that Vec-LUT outperforms state-of-the-art baselines by up to 4.2 × 4.2\times . Our implementation is integrated into llama.cpp. The code is available at https://github.com/Cipherxzc/vlut.cpp .
+
+
+
+1.
+Introduction
+
+Figure 1
+.
+Different mpGeMM paradigms for ternary LLM inference. Our vector LUT stores precomputed results from multiple tokens contiguously in the table, and performs efficient
+1\rightarrow N
+lookup, instead of
+N\times
+repetitive
+1\rightarrow 1
+lookup in existing scalar LUT. Fig.
+2
+and §
+2.1.3
+further explain the mechanism of LUT.
+
+Large language models (LLMs) are increasingly deployed on edge devices, such as Apple Intelligence on iPhone and Mac
+(
+2
+)
+, Google Gemma 3 on Android
+(
+17
+)
+, and Microsoft Phi on Copilot PC
+(
+29
+;
+22
+)
+. To fit the limited memory budgets of edge devices, quantization has become a de facto technique for on-device LLMs. Recent advances continuously push bit-width from 8-bit
+(
+10
+;
+43
+)
+to 4-bit
+(
+14
+;
+25
+)
+, 2-bit
+(
+12
+;
+6
+)
+and now 1.58-bit, represented by Microsoft’s ternary model and its successors
+(
+28
+;
+27
+;
+1
+;
+30
+;
+38
+;
+21
+)
+. These low-bit models not only demonstrate superior bit-level accuracy scaling
+(
+16
+;
+26
+)
+, but also achieve linear speedup via
+lookup table (LUT)-based
+inference kernels, enabling CPUs (including Apple M2 and RaspBerry Pi) to outperform NPUs
+(
+41
+;
+40
+)
+. This overturns the need for costly AI accelerators and opens new opportunities for ubiquitous LLM deployment.
+
+LUT-based inference
+(
+34
+;
+41
+)
+was introduced to bridge the gap between low-bit models and hardware without native low-bit support
+(
+3
+;
+19
+;
+32
+;
+35
+)
+(see Fig.
+1
+(b) and Fig.
+2
+).
+The core idea is to partition the weight matrix into small groups, for which all possible bit patterns of a group can be enumerated.
+For each bit pattern, its dot product with the activation is precomputed and stored in a lookup table.
+This turns matrix multiplication into table lookup indexed by the corresponding bit patterns,
+followed by accumulation across groups.
+For example, a group of four elements in a ternary model (each weight element ranges {-1, 0, 1}) has 81
+(3^{4})
+possible bit patterns (e.g., (1, -1, 0, 1) and (-1, 0, 1, 0)), resulting in 81 table entries.
+
+Although LUT-based LLM inference achieves superior performance for single-token generation, we find that it behaves poorly under
+parallel inference
+(i.e., generating multiple tokens simultaneously), required in scenarios such as prefilling, serving, test-time scaling for decoding
+(
+7
+;
+13
+)
+, and speculative decoding
+(
+23
+;
+5
+)
+.
+In these settings, the memory bandwidth remains highly underutilized, reaching only
+\leq
+40% of its capacity.
+This limitation directly harms edge applications that rely on efficient parallel inference, such as multi-app services
+(
+37
+;
+24
+;
+44
+)
+, long-context processing agents
+(
+42
+;
+36
+)
+, and streaming video understanding
+(
+11
+)
+.
+
+By analyzing this behavior, we find that the inefficiency stems from the
+1\rightarrow 1
+table lookup
+paradigm, which we refer to as
+scalar LUT
+(see Fig.
+1
+(b-1)).
+During parallel inference, each token’s activation precomputes its own tables. Hardware LUT instructions (e.g., the ARM TBL instruction) are then called to perform table lookup. An
+N
+-token parallel inference requires loading
+N
+tables and executing lookup for
+N
+times. Since memory access of table lookup is inherently random, and the table size (e.g., hundreds of MiBs) far exceeds cache capacity, this repetitive non-contiguous memory access leads to severe memory-bandwidth underutilization and substantially increased latency.
+
+To address this issue, we propose a novel
+vector LUT paradigm that performs a single
+1\rightarrow N
+lookup for each index, rather than performing
+1\rightarrow 1
+lookup for
+N
+times
+. Instead of constructing a separate table for each token, vector LUT precomputes a unified table, as shown in Fig.
+1
+(b-2), where the results corresponding to the same index are stored contiguously across tokens. It eliminates reliance on hardware scalar LUT instructions, avoids non-contiguous memory access, and potentially improves memory bandwidth utilization.
+
+While this idea is conceptually clean, realizing it effectively requires overcoming two technical challenges.
+
+(i) How to design tensor layouts for memory bandwidth efficiency
+
+Since vector LUT constructs a unified table across all tokens rather than separated ones for each token, all tensors involved in the computation, including weight, activation, and LUT, should be organized to match this paradigm for continuous memory access. In scalar LUT, each token maintains its own table, leading to an activation and weight layout that is feature-first.
+The unified table used by vector LUT requires a token-first layout so that all tokens’ values for the same feature are stored contiguously.
+If tensors are misaligned with this requirement, discountinuous memory accesses can degrade performance as high as
+12\times
+(see §
+5.5
+).
+
+(ii) How to design the LUT access to avoid cache thrashing
+
+As shown in Fig.
+1
+, vector LUT stores the results for
+N
+tokens in each row, which expands the LUT size by a factor of
+N
+, making it infeasible to cache the entire LUT for fast lookup.
+For example, while typical L1 and L2/L3 caches for edge processors are only 10s of KiBs and 10s of MiBs, respectively
+(
+4
+;
+18
+)
+, a 2-bit vector LUT in INT16 can exceed
+200
+MiB
+(e.g.,
+285.5
+MiB for a
+4096\times 14436\times 512
+GeMM from Llama3 8B).
+During lookup, the large LUT combined with the inherently random access pattern can lead to a poor cache hit rate and low inference throughput.
+
+To address the challenges, we present Vec-LUT, an efficient mpGeMM kernel design (mixed-precision GeMM, e.g., w2A16 and w1.6A8), built upon the vector LUT paradigm for parallel inference. Technically, we propose:
+(i)
+Vector LUT-Centric Tensor Layout
+, which reorganizes weight, activation, and LUT tensors into a token-contiguous rather than feature-contiguous layout. The online reorganization is fused into LUT operation, with minimal overhead while compatible with existing inference frameworks.
+Since vector LUT eliminates the need for lookup instructions, we can pack weights as flexible decimal indices.
+(ii)
+Cache-Aware Streamed Lookup
+, which prevents cache thrashing by performing table lookup within cache-friendly tiles. This design streamlines the precompute-lookup process: instead of generating and storing the entire LUT beforehand, each tile is precomputed on-demand and then looked up entirely within cache.
+
+We implement and integrate Vec-LUT into llama.cpp
+(
+15
+)
+, with particular support for SOTA accuracy-bit-efficient ternary models. Our lossless weight packing can achieve b1.60
+1
+1
+
+1
+
+The number indicates the BPW (bits per weight)
+precision (
+I1
+) for ternary models, beyond b2.00 (
+I2
+), providing the most compact ternary packing to date.
+We conduct a comprehensive evaluation on 5 edge devices and 3 LLMs (BitNet
+(
+1
+)
+, Llama 3
+(
+30
+)
+, and Falcon
+(
+38
+)
+).
+Compared to SOTA frameworks (T-MAC
+(
+41
+)
+, bitnet.cpp
+(
+27
+)
+, and llama.cpp
+(
+15
+)
+) requiring only CPUs, Vec-LUT achieves up to
+4.2\times
+(
+I1
+) and
+2.6\times
+(
+I2
+) speedup.
+Besides, Vec-LUT achieves a 273.5 tokens/s throughput on an affordable CPU server ($0.50/h on AWS) in an additional serving test.
+
+We summarize our main contributions as follows:
+
+\bullet
+
+We propose vector LUT, a new paradigm for LUT-based inference. It constructs a unified LUT across all parallel tokens and performs a single
+1\rightarrow N
+lookup per weight index.
+
+\bullet
+
+We present Vec-LUT, an efficient mpGeMM kernel built on vector LUT paradigm, optimized with Vector LUT-Centric Tensor Layout and Cache-Aware Streamed Lookup.
+
+\bullet
+
+We implement Vec-LUT with llama.cpp integration, outperforming SOTA LUT baselines by up to
+4.2\times
+.
+
+2.
+Background and Motivation
+
+2.1.
+Parallel Inference and Ultra-Low-Bit LLMs
+
+2.1.1.
+Edge applications of parallel LLM inference
+
+Parallel inference
+, which processes multiple tokens in parallel, is one of the most critical workloads in today’s LLM-based applications.
+It is predominantly exercised in two scenarios: prefilling and parallel decoding.
+
+(i) Prefilling
+of LLMs ingests multiple tokens (e.g., in a user prompt) simultaneously as input.
+Its latency directly affects the responsiveness of edge applications with long context inputs, such as GUI agents
+(
+42
+)
+and AIoT agents
+(
+36
+)
+.
+
+(ii) Parallel decoding
+of LLMs generates multiple tokens simultaneously.
+Its performance not only determines the overall QoS in multi-app services
+(
+37
+;
+24
+)
+, but also influences the effective decoding latency in parallel test-time scaling
+(
+13
+;
+7
+)
+and speculative decoding
+(
+23
+;
+5
+)
+.
+
+2.1.2.
+Superiority of ternary LLMs in edge scenarios
+
+As the bit-width of LLMs continues to shrink, ternary-valued models, where each weight takes value from {1,-1, 0}, emerge as a Pareto-optimal point in the accuracy-cost tradeoff. Their advantages manifest in two dimensions.
+
+(i) Theoretical superiority.
+Recent research demonstrates the superior
+accuracy per joule
+
+(
+16
+)
+and
+accuracy per bit trade-offs
+
+(
+26
+)
+of ternary quantization. For example, Microsoft’s BitNet 2B costs only 0.4 GB memory
+(
+27
+)
+, but 4-bit models of similar accuracy require
+\geq
+1 GB. Also, TENET
+(
+16
+)
+and LUT Tensor Core
+(
+31
+)
+demonstrate the superior latency/energy efficiency of ternary LLMs with co-designed hardware.
+
+(ii) Practical benefits.
+Past deployment from Microsoft (e.g., BitNet.cpp and T-MAC) have demonstrated ternary models can run smoothly on diverse x86/ARM/iOS edge devices using CPUs alone, including mobile phones, desktops (Microsoft Surface Book, Apple M2) and even Raspberry Pi. The running speed can even surpass NPUs. For example, T-MAC reports that a 4-bit 7B model reaches 18.7 tokens/s on Snapdragon X Elite CPUs, whereas the NPU attains only 10.4 tokens/s
+(
+41
+)
+.
+This effectively removes the dependence on GPUs/NPUs for LLM inference and opens significant potential for deployment across edge and IoT devices.
+
+Figure 2
+.
+A minimal example of using LUT to calculate
+\mathbf{o}=\mathbf{w}\times\mathbf{v}
+with FP16
+\mathbf{v}
+and ternary
+\mathbf{w}
+of size 4.
+
+2.1.3.
+LUT-based Ultra-Low-Bit LLM inference
+
+LUT-based inference replaces runtime dequantization and multiplication with table lookup.
+As shown in Fig.
+2
+, take a ternary model with weight partitioned in groups of 4 as an example, it enumerates all possible bit patterns of weight groups (i.e.,
+\mathbf{w}\in\{-1,0,1\}^{4}
+), and then precompute their dot products with the activation group
+\mathbf{v}
+.
+The precomputed results are stored in the table
+\mathbf{T}=\{\mathbf{w}\times\mathbf{v}\mid\mathbf{w}\in\{-1,0,1\}^{4}\}
+, obtaining
+3^{4}=81
+table entries in total.
+
+Then it traverses the actual weight matrix, and uses the weight groups as indices to directly look up the dot product
+\mathbf{o}=\mathbf{w}\times\mathbf{v}=\mathbf{T}(idx(\mathbf{w}))
+without multiplication.
+LUT is suitable for low-bit, especially ternary models, for which the possible bit patterns in
+\mathbf{w}
+are limited to enumerate (e.g.,
+3^{4}=81
+for groups of 4).
+On top of this basic LUT design, our vector LUT paradigm constructs the table in the granularity of vectors, so each table entry stores precomputed results from multiple tokens contiguously.
+
+Figure 3
+.
+mpGeMM latency vs. BPW on an Intel PC. Vec-LUT utilizes fewer BPWs (i.e.,
+\leq 2
+) for lower latency, while MAD-based llama.cpp cannot achieve speedup with fewer BPWs.
+
+2.2.
+Limitations of Existing Approaches
+
+We conduct in-depth profiling of both MAD-based (Multiply-Add) and scalar LUT-based mpGeMM kernels to diagnose their bottlenecks, and motivate our vector LUT design.
+
+2.2.1.
+Costly Dequantization in MAD-based mpGeMM
+
+Conventional MAD-based mpGeMM must dequantize low-bit weights to hardware-supported precisions and then multiply them with activations in aligned precisions (e.g., INT8/FP16).
+The dequantization and multiplication overheads counteract the benefit of low-bit quantization, and even increase the latency, as demonstrated in Fig.
+3
+2
+2
+
+2
+
+Q# in the figure denotes the quantization formats used in llama.cpp, where # indicates the bits per weight (BPW). TQ# refers to the corresponding ternary quantization formats in llama.cpp.
+.
+Among MAD-based mpGeMM kernels in llama.cpp, the higher-BPW 8-bit kernel (
+Q8_0
+) delivers lower latency than the 4-bit kernel (
+Q4_0
+), and the 2-bit (
+TQ2_0
+) ternary packing outperforms the sub-2-bit (
+TQ1_0
+) one significantly.
+In contrast, our LUT-based approach directly leverages compactly packed weights for table lookup without dequantization or unpacking (more in §
+3.3
+), yielding remarkable acceleration at low BPWs.
+
+Table 1.
+Time breakdown of T-MAC’s mpGeMM kernel. Measured with HF BitNet 3B on an Orange Pi 5 Plus.
+
+M\times K
+
+Precompute
+
+Lookup
+
+Accumulate
+
+Scale
+
+320\times 3200
+
+0.8%
+
+47.6%
+
+25.0%
+
+26.6%
+
+128\times 8640
+
+0.7%
+
+47.3%
+
+25.5%
+
+26.4%
+
+2.2.2.
+Repetitive Lookup in Scalar LUT
+
+Existing LUT-based kernels (e.g., T-MAC) can fully leverage the memory bandwidth for single-token generation. However, we observe a sever bandwidth underutilization (<40%) for parallel inference. We identify the reason is that existing LUT-based kernels adopt the scalar LUT paradigm (
+1\rightarrow 1
+table lookup), which constructs an independent table for each token. Hardware lookup instructions, like SIMD TBL instruction on ARM CPU and PSHUF on x86 CPU is then called to look up the table.
+
+For a parallel inference with
+N
+tokens, the kernel requires loading
+N
+tables and executing lookup for
+N
+times. Since memory access of table lookup is inherently random, and the table size (e.g., hundreds of MiBs) far exceeds cache capacity, this repetitive non-contiguous memory access leads to severe memory-bandwidth underutilization and substantially increased latency. In some cases, scalar-LUT kernels even underperform MAD-based kernels (more in §
+5.2
+).
+
+As shown in Table
+1
+, even optimized with hardware instructions, “Lookup” (including weight loading and table lookup) still takes up nearly half of T-MAC’s mpGeMM latency.
+In contrast, Vec-LUT will reduce the lookup cost to below 1%, as evaluated in §
+5.4
+.
+
+2.3.
+Insight and Opportunities
+
+2.3.1.
+Unified table shared by all tokens
+
+Based on the analysis in §
+2.2.2
+, we propose the vector LUT paradigm.
+Our key insight is that instead of constructing a separate table for each token, we build a unified table shared across all
+N
+parallel tokens,
+replacing
+N
+independent
+1\rightarrow 1
+lookups with a single
+1\rightarrow N
+lookup
+. This transformation eliminates repeated discontinuous memory accesses, converts them into contiguous accesses for each weight index, and removes the dependency on hardware LUT instructions.
+Given the high proportion of “Lookup” cost in T-MAC (Table
+1
+), vector LUT is expected to deliver up to
+2\times
+kernel-level speedup by effectively eliminating lookup overhead. Vec-LUT reduces lookup cost to below 1% in §
+5.4
+.
+
+2.3.2.
+Other opportunities by not relying on hardware lookup instructions
+
+Besides the key opportunity in §
+2.3.1
+, vector LUT brings two more potential gains by not relying on hardware lookup instructions.
+
+(i) Accumulation reduction with larger indexing range.
+
+To satisfy the bit-width requirements of SIMD hardware lookup instructions, existing kernels only allow a
+2^{4}
+indexing range with a 4-bit index.
+In contrast, vector LUT allows up to a
+3^{5}
+indexing range with an 8-bit index (details in Fig.
+5
+).
+It reduces the required lookup and accumulation count by
+\sim 2\times
+(twice lookup and accumulation for 4-bit index compared to 8-bit index), providing up to
+1.25\times
+additional kernel speedup (see Table
+1
+accumulate cost).
+
+(ii) Enhanced versatility and efficiency with flexible sub-2-bit packing.
+
+To utilize SIMD acceleration,
+existing MAD-based kernels impose strict weight shape requirements (e.g., by multiples of 256 in llama.cpp’s
+TQ1_0
+and
+TQ2_0
+
+(
+9
+)
+), which significantly limits their generality.
+In contrast, vector LUT can pack weights of almost
+any shapes
+more compactly for memory saving, without compromising performance or accuracy.
+
+3.
+Design
+
+Based on the insight in §
+2.3
+, we propose the vector LUT paradigm for parallel ultra-low-bit LLM inference, and design the Vec-LUT mpGeMM kernel (§
+3.1
+and §
+3.2
+).
+
+To effectively support this paradigm, we also need to solve the challenges of (i) tensor layout design to align with the vector LUT paradigm, and (ii) the LUT access design to avoid cache thrashing. We propose two optimizations accordingly: (i)
+Vector LUT-Centric Tensor Layout
+that improves memory bandwidth utilization with a contiguous layout (details in §
+3.3
+, and (ii)
+Cache-Aware Streamed Lookup
+that enhances cache hit and register reuse with cache-aware tiling and streamed precomputing-lookup execution (details in §
+3.4
+).
+
+Figure 4
+.
+Overview of the Vec-LUT mpGeMM kernel.
+
+3.1.
+System Overview
+
+Figure
+4
+shows the overview of Vec-LUT’s mpGeMM kernel.
+It involves two stages:
+offline weight transformation
+and
+runtime LUT computation
+.
+
+(i) At the offline stage
+, Vec-LUT flexibly packs floating-point weights to low-bit integers, and then permutes them to a tile-contiguous layout. The transformed weights will be directly used as lookup indices at runtime.
+
+(ii) At the runtime stage
+, Vec-LUT transposes feature-contiguous activations (common in inference frameworks like llama.cpp) to token-contiguous, and then perform LUT precomputing and lookup in tiles.
+Specifically, the vector LUT contains precomputed results from the activation (introduced in §
+2.1.3
+), and each lookup index (transformed from weights) maps to a vector of precomputed results (i.e.,
+1\rightarrow N
+lookup).
+
+Our design includes the core algorithm (§
+3.2
+), layout optimizations (§
+3.3
+), and lookup scheme optimizations (§
+3.4
+).
+The offline stage mainly involves layout optimizations, including flexible sub-2-bit packing and tile-contiguous packed weight layout, which will be introduced in §
+3.3
+.
+The runtime stage combines layout and lookup scheme optimizations.
+Layout optimizations, including token-contiguous LUT layout and the corresponding activation and output transformation, will be introduced in §
+3.3
+.
+Lookup scheme optimizations, including locality-aware LUT tiling, streamed precomputing-lookup execution and INT16-INT32 hierarchical accumulation, will be introduced in §
+3.4
+.
+
+Table 2.
+Notations for mpGeMM:
+\mathbf{W}\times\mathbf{A}=\mathbf{O}
+.
+
+Tensor
+
+Description
+
+\mathbf{W}\in\mathbb{R}^{M\times K}
+
+Weight
+
+\mathbf{A}\in\mathbb{R}^{K\times N}
+
+Activation
+
+\mathbf{O}\in\mathbb{R}^{M\times N}
+
+Output
+
+Dimension
+
+Description
+
+M
+
+Out. Feature
+
+K
+
+In. Feature
+
+N
+
+Token Length
+
+3.2.
+Vector LUT Algorithm
+
+1
+
+2
+
+input :
+Activation
+\mathbf{A}
+of shape
+K\times N
+,
+
+Packed weights
+\mathbf{W}
+of shape
+M\times K/g
+
+where
+g
+is the group size of packed weights.
+
+output :
+Result
+\mathbf{O}
+of shape
+M\times N
+
+3
+
+\mathbf{T}\leftarrow\text{Precompute}(\mathbf{A},K,N)
+;
+
+4
+
+5
+
+for
+
+k\leftarrow 1
+
+to
+
+K/g
+
+do
+
+6
+
+for
+
+m\leftarrow 1
+
+to
+
+M
+
+do
+
+7
+
+idx\leftarrow\mathbf{W}[m,k]
+;
+
+//
+Shared index among
+N
+
+for
+
+n\leftarrow 1
+
+to
+
+N
+
+do
+
+8
+
+\mathbf{O}[m,n]\text{ += }\mathbf{T}[k,idx,n]
+;
+
+//
+Vector add
+
+9
+
+Function
+
+Precompute(
+\mathbf{A},K,N
+)
+:
+
+10
+
+for
+
+k\leftarrow 1
+
+to
+
+K/g
+
+do
+
+11
+
+;
+
+//
+Sub-tables
+
+for
+
+i,j\leftarrow 1
+
+to
+
+3^{g},g
+
+do
+
+12
+
+v\leftarrow\text{GetSign}(i,j)
+;
+
+//
+Enumerated index
+
+if
+
+v=1
+
+then
+
+13
+
+for
+
+n\leftarrow 1
+
+to
+
+N
+
+do
+
+14
+
+\mathbf{T}[k,i,n]\text{ += }\mathbf{A}[kg+j,n]
+;
+
+//
+Add
+
+else if
+
+v=-1
+
+then
+
+15
+
+for
+
+n\leftarrow 1
+
+to
+
+N
+
+do
+
+16
+
+\mathbf{T}[k,i,n]\text{ -= }\mathbf{A}[kg+j,n]
+;
+
+//
+Sub
+
+else
+
+17
+
+Continue;
+
+//
+Nop
+
+return
+
+LUT
+
+18
+
+Function
+
+GetSign(
+i,j
+)
+:
+
+19
+
+trit\leftarrow\lfloor i/3^{j-1}\rfloor\bmod 3
+;
+
+20
+
+return
+
+trit-1
+
+//
+j
+-th trit (in
+\{-1,0,1\}
+) of
+i
+
+Algorithm 1
+
+Vec-LUT’s Core Algorithm
+
+Figure 5
+.
+Mappings among packed weights (bits and decimal), unpacked weights (ternary), and precomputed LUT rows. The LUT row index is equal to the decimal value of packed weights, avoiding extra conversion.
+
+The Vector LUT-based mpGeMM algorithm (described in Alg.
+1
+) is the core of Vec-LUT.
+It includes two steps:
+LUT precompute
+and
+Table lookup & Accumulate
+. We’ll introduce the details below.
+
+LUT precompute
+ingests the activation and builds the vector LUT.
+For an activation
+\mathbf{A}
+, of shape
+K\times N
+, Vec-LUT traverses the dimension
+K
+of
+\mathbf{A}
+in groups of
+g
+(line 8), and precomputes a
+sub-table
+of shape
+3^{g}\times N
+for each group (line 9 to 18).
+This produces a unified table
+\mathbf{T}
+containing
+K/g
+sub-tables.
+In
+\mathbf{T}
+of shape
+K/g\times 3^{g}\times N
+,
+\mathbf{T}[k,i,n]
+is calculated by:
+
+(1)
+
+\mathbf{T}[k,i,n]=\sum_{i=1}^{3^{g}}\sum_{j=1}^{g}\text{GetSign}(i,j)\mathbf{A}[kg+j,n],
+
+where, GetSign
+(i,j)
+extracts the
+j
+-th trit (i.e., ternary value, ranging
+\{-1,0,1\}
+) from an integer
+i
+, which represents the operation (i.e., subtraction (sub), nop, or addition (add)) to the
+j
+-th row in the
+k
+-th group of activation
+\mathbf{A}
+, to calculate the
+i
+-th row of results in the
+k
+-th sub-table of
+\mathbf{T}
+.
+For example, when
+g=4
+,
+i=23=0\times 3^{3}+2\times 3^{2}+1\times 3+2\times 1\rightarrow(0,2,1,2)\rightarrow(-1,1,0,1)\rightarrow(\text{sub, add, nop, add})
+.
+Fig.
+5
+shows a complete view of mappings between indices and corresponding ternary weights, for both
+g=4
+(2-bit packing) and
+g=5
+(1.6-bit packing).
+As a result, each sub-table in
+\mathbf{T}
+contains
+3^{g}
+table entries of length
+N
+, representing the
+3^{g}
+possible combinations (with sub, nop, and add) of the
+g
+rows in the
+k
+-th group of activation
+\mathbf{A}
+.
+
+After precomputing
+\mathbf{T}
+,
+Table lookup & Accumulate
+traverses the transformed weights
+\mathbf{W}
+in tiles, and uses each packed byte as an index for table lookup.
+Fig.
+5
+shows the mappings from indices to results (i.e., corresponding rows in the vector LUT).
+Continuing with the
+i=23
+example, Vec-LUT looks up the table with index 23 and gets
+-\mathbf{A}[0,:]+\mathbf{A}[1,:]+\mathbf{A}[3,:]
+, which is the precomputed result for this specific weight pattern (
+\{-1,1,0,1\}
+).
+The results are then accumulated to obtain the token-contiguous output
+\mathbf{O}
+of shape
+M\times N
+.
+Specifically,
+\mathbf{O}[m,n]
+is calculated by:
+
+(2)
+
+\mathbf{O}[m,n]=\sum_{k=1}^{K/g}\mathbf{T}[k,\mathbf{W}[m,k],n],
+
+in which, each packed index (of
+uint8
+) in
+\mathbf{W}
+ranges from 1 to
+3^{g}
+, where
+g\in\{4,5\}
+
+3
+3
+
+3
+
+To be precise, the
+uint8
+index range is
+[0,3^{g})
+(Dec. in Fig.
+5
+).
+.
+
+The core difference between vector LUT and existing scalar LUT is that Vec-LUT precomputes (line 4 to 6) and looks up (line 10 to 18) the LUT in the granularity of vectors, instead of single elements.
+This significantly reduces random con-contiguous memory access in scalar LUT, with the technical challenges solved by §
+3.3
+and §
+3.4
+.
+
+3.3.
+Vector LUT-Centric Tensor Layout
+
+Vec-LUT adopts the
+Vector LUT-Centric Tensor Layout
+to keep memory access contiguous in vector LUT.
+It includes token-contiguous layout for activations, LUTs, and outputs, and tile-contiguous layout for weights.
+Besides, we propose flexible sub-2-bit packing for a compact weight layout without shape restriction and performance degradation.
+
+Token-contiguous LUT layout
+
+To improve the memory bandwidth utilization during lookup and accumulation, Vec-LUT layouts the LUT
+\mathbf{T}
+of shape
+K/g\times 3^{g}\times N
+in row-major, keeping the token dimension
+N
+contiguous.
+This ensures contiguous memory access during vector addition in the inner loop (e.g., line 6 in Alg.
+1
+),
+and leads to an up to
+12\times
+speedup, when applied with the weight layout below (more in §
+5.5
+).
+The activation
+\mathbf{A}
+and accumulated output
+\mathbf{O}
+also adopt this token-contiguous layout to keep aligned with the LUT.
+
+Tile-contiguous packed weight layout
+
+To further reduce the accumulation count and improve memory bandwidth utilization, Vec-LUT adopts the tile-contiguous packed weight layout.
+It packs the ternary weights into bytes (e.g.,
+uint8
+) for direct LUT indexing (details in Fig.
+5
+).
+This byte-wise packing bypasses the bit-width limitation in existing kernels, leading to a remarkable reduction of the accumulation count, as mentioned in §
+2.3
+.
+Then, each weight tile (details in §
+3.4
+) is flattened and contiguously stored in bytes to ensure tile-wise contiguous access.
+The tiles are then permuted by the input feature (
+K
+) to keep aligned with the
+K\rightarrow M
+loop order in Alg.
+1
+.
+
+Flexible sub-2-bit weight packing
+
+Unlike existing kernels which have strict shape requirements (mentioned in §
+2.3.2
+), Vec-LUT adopts a flexible and lossless sub-2-bit packing method to further reduce the memory footprint without performance degradation.
+Fig.
+5
+shows Vec-LUT’s two basic packing methods, the 1.6-bit (
+g=5
+) and 2-bit (
+g=4
+) packing, which already have much looser shape requirements (i.e.,
+g\mid K
+) compared to existing kernels (e.g., llama.cpp).
+Vec-LUT further combines these two packing methods by applying different packings for different groups of weights.
+This further expands the weight shape support to almost any
+K
+values
+4
+4
+
+4
+
+The condition is
+(4a+5b)\mid K,a,b\in\mathbb{Z},ab>0
+.
+, and always achieves a near-1.6-bit BPW for common weight shapes.
+
+Fused activation and output transformation
+
+In most inference frameworks (e.g., llama.cpp), the activations and outputs are in a feature-first layout, which is different from Vec-LUT’s token-first layout.
+Therefore, to integrate into these frameworks, Vec-LUT needs extra transposition and reverse-transposition for activations and outputs, respectively.
+To minimize the overhead of these extra operation, we fuse them into LUT precomputing and results accumulation, achieving significant end-to-end inference acceleration (up to
+4.2\times
+in prefilling and
+3.2\times
+in parallel decoding in §
+5.3
+).
+
+3.4.
+Cache-Aware Streamed Lookup
+
+Figure 6
+.
+Tiled tensors in Vec-LUT. The LUT is tiled by sub-tables (
+K/g
+) and tokens (
+N
+) for locality.
+
+Vec-LUT adopts the
+Cache-Aware Streamed Lookup
+scheme to address the cache thrashing issue caused by large LUT storage.
+It includes locality-aware LUT tiling and the streamed precomputing-lookup execution that perform LUT-related operations in high-speed caches, and INT16-INT32 hierarchical accumulation that improves the accumulation throughput within limited cache bandwidth.
+
+Locality-aware LUT tiling
+
+To reduce the LUT memory footprint (hundreds of MiBs if not tiled) while reducing random access during lookup, Vec-LUT adopts a locality-aware tiling strategy.
+As shown in Fig.
+6
+,
+it tiles the LUT by sub-tables (
+K/g
+) with a tile size of
+K_{tile}/g
+, and by tokens (
+N
+) with a tile size of
+N_{tile}
+.
+The
+3^{g}
+rows of sub-tables are not tiled as they will be randomly accessed during table lookup.
+This reduces the LUT memory footprint by up to
+(K/K_{tile})(N/N_{tile})\times
+, and the optimal tile size depends on hardware specifications (details in §
+4
+).
+In our implementation, it achieves KiB level LUT size per tile, which is sufficient to fit in typical L1 cache, achieving less than 10% cache-miss overhead in VTune
+(
+20
+)
+profiling.
+
+Streamed precomputing-lookup execution
+
+To reduce memory copy from main memory to cache, we take a further step to streamline LUT precomputing and lookup by tiles.
+Since each tile is sufficiently small to fit in high-speed cache, Vec-LUT can conduct all LUT-related memory access solely in cache.
+Compared to precomputing the entire table in the main memory (existing kernels’ practice), this streamed execution provides up to
+3\times
+inference speedup, combined with the tiling design above (evaluated in §
+5.5
+).
+
+INT16-INT32 hierarchical accumulation
+
+Besides the locality issues, another source of the memory pressure is the precision mismatch during accumulation.
+It requires accumulating low-bit (e.g., INT8) lookup results to high-precision (e.g. INT32) outputs to avoid overflow, which reduces the accumulation throughput by
+4\times
+compared to INT8 accumulation.
+To address this, we adopt a hierarchical accumulation design that uses INT16 to bridge INT8 and INT32:
+(i) LUT precomputing from INT8 (activations) to INT16 (LUT elements).
+(ii) Intra-block accumulation in INT16 (LUT elements and block-wise intermediates).
+It won’t cause overflow as long as the block size
+B\leq\lfloor\frac{max(\text{INT16})}{max(\text{INT8})\times g}\rfloor
+.
+(iii) Inter-block accumulation from INT16 (intermediates) to INT32 (outputs).
+With sufficiently large
+B
+(e.g.,
+B=64
+when
+g=4
+), this hierarchy significantly improves the accumulation throughput.
+
+4.
+Implementation
+
+We implement and integrate Vec-LUT to llama.cpp, the most popular open-source LLM inference framework on edge devices with SOTA performance.
+Vec-LUT supports two custom lossless packing methods:
+I1
+(b1.60) and
+I2
+(b2.00).
+Due to the tensor layout mismatch, we implement the optional activation and output transformation steps, and fuse them with LUT precomputing and accumulation, as described in §
+3.3
+.
+
+Topological precomputing
+
+To further reduce the LUT precomputing cost, we adopt a topological precomputing method that minimizes the operations required.
+It’s based on the observation that there are many repetitive calculations when precomputing different entries in the LUT.
+Vec-LUT avoids them by reusing intermediates, as shown in Figure
+7
+.
+Topological precomputing reduces the number of operations from
+2\times 3^{g-1}g
+(as in the vanilla Alg.
+1
+) to
+3^{g}
+, providing a
+(2g/3)\times
+precomputing speedup (e.g., by
+3.3\times
+when
+g=5
+).
+
+Figure 7
+.
+Examples of topological precomputing to reduce redundant calculations by reusing intermediates. Dependencies of LUT entries:
+79\rightarrow 78,79\rightarrow 80\rightarrow 0
+.
+
+Tile size selection
+
+Vec-LUT can directly calculate the optimal tile size
+K_{tile}
+and
+N_{tile}
+based on hardware specifications, ensuring its out-of-box efficiency without tuning.
+
+(i) Determine
+N_{tile}
+by SIMD width.
+
+The gain of
+N
+tiling comes from a reduced memory footprint while being able to utilize hardware parallelism (e.g., SIMD addition).
+Therefore, it is optimal to minimize
+N_{tile}
+while keeping it as multiples of the maximum SIMD width in INT16 (the accumulation precision).
+For example, ARM NEON (128-bit)
+(
+3
+)
+requires
+8\mid N_{tile}
+, and AVX2 (256-bit)
+(
+19
+)
+requires
+16\mid N_{tile}
+.
+In our evaluation,
+N_{tile}=32
+is empirically the most performant and universal configuration.
+
+(ii) Determine
+K_{tile}
+by L1 cache size.
+
+The gain of
+K
+tiling comes from reusing output registers when accumulating from different LUT channels (i.e.,
+K/g
+) to the same output row (i.e.,
+M
+), while not exceeding L1 cache size.
+Therefore, it is optimal to maximize
+K_{tile}
+below the cache-decided threshold, i.e.,
+3^{g}N_{tile}K_{tile}/g<\text{L1}
+for INT16 accumulation.
+We use
+K_{tile}=2g=10
+when
+g=5
+and
+K_{tile}=4g=16
+when
+g=4
+during evaluation on most devices, except the AWS Graviton 3 server that performs best with
+K_{tile}=g
+.
+
+5.
+Evaluation
+
+We conduct a comprehensive evaluation across 3 real-world ternary LLMs and 5 devices, in both single and multi-thread.
+The key takeaways are as follows:
+
+\bullet
+
+Vec-LUT outperforms all baselines (both LUT-based and MAD-based) on tested devices, with
+1.5-5.0\times
+,
+1.2-4.1\times
+, and
+1.4-3.0\times
+average speedup in the mpGeMM benchmark, end-to-end prefilling, and parallel decoding, respectively.
+
+\bullet
+
+Vec-LUT’s
+I1
+(b1.60), which is the most compact ternary packing to date, outperforms all sub-2-bit baselines by up to
+4.7\times
+,
+4.2\times
+, and
+3.2\times
+
+, in the mpGeMM benchmark, end-to-end prefilling, and parallel decoding, respectively.
+
+\bullet
+
+Vec-LUT can seamlessly support mixed prefilling and decoding workloads like in continuous batching, achieving a 273.5 tokens/s throughput (
+1.4\times
+of llama.cpp) on an affordable CPU server ($0.50/h on AWS).
+
+Table 3.
+The support matrix of models, frameworks, and packings. llama.cpp falls back to 4-bit on HF BitNet 3B. LUT-based packings are underlined.
+
+Frame-
+
+works
+
+Packing
+
+Methods
+
+BPWs
+
+HF BitNet
+
+3B
+(
+1
+)
+
+Llama3
+
+8B
+(
+30
+)
+
+Falcon3
+
+1B
+(
+38
+)
+
+Ours
+
+I2
+
+2.00
+
+\checkmark
+
+\checkmark
+
+\checkmark
+
+I1
+
+1.60
+
+\checkmark
+
+\checkmark
+
+\checkmark
+
+T-MAC
+
+INT_N
+
+2.00
+
+\checkmark
+
+\checkmark
+
+\times
+
+bitnet.cpp
+
+I2_S
+
+2.00
+
+\times
+
+\checkmark
+
+\checkmark
+
+TL2
+
+1.67
+
+\checkmark
+
+\checkmark
+
+\times
+
+llama.cpp
+
+TQ2_0
+
+2.06
+
+Q4_0
+
+\checkmark
+
+\checkmark
+
+TQ1_0
+
+1.69
+
+Q4_0
+
+\checkmark
+
+\checkmark
+
+Table 4.
+Specifications of tested devices. We only use performance cores for evaluation.
+
+Device Name (Type)
+
+Chip/Processor Name
+
+ISA & SIMD
+
+Tested Cores
+
+L1D Cache per Core
+
+Intel PC
+
+Intel Core i7-13700k
+
+x86 AVX2 (256-bit)
+
+4
+
+48 KiB
+
+Legion 5 Pro (Laptop)
+
+AMD Ryzen 7 5800H
+
+x86 AVX2 (256-bit)
+
+4
+
+32 KiB
+
+Orange Pi 5 Plus (SBC)
+
+RK3588 (ARM Cortex-A76)
+
+ARM NEON (128-bit)
+
+4
+
+64 KiB
+
+Xiaomi 15 (Smartphone)
+
+QCOM Snapdragon 8 Elite
+
+ARM NEON (128-bit)
+
+2
+
+96 KiB
+
+AWS Graviton 3 (Server)
+
+ARM Neoverse-V1
+
+ARM SVE (256-bit)
+
+8
+
+64 KiB
+
+(a)
+
+Single-thread mpGeMM
+
+(b)
+
+Multi-thread mpGeMM
+
+Figure 8
+.
+mpGeMM kernel benchmark across devices and threads, using real-world LLMs’ GeMM shapes.
+
+(a)
+
+Single-thread prefilling
+
+(b)
+
+Multi-thread prefilling
+
+Figure 9
+.
+End-to-end prefilling comparison across models, devices and threads. Sub-2-bit packings are hatched.
+
+5.1.
+Experimental Setup
+
+Devices
+
+We evaluate Vec-LUT on 5 edge devices, as listed in Table
+4
+.
+We evaluate both single-thread and multi-thread inference, and only use performance cores since efficient cores would cause performance degradation for all frameworks in multi-thread inference.
+
+Baseline frameworks and packings
+
+We compare Vec-LUT with 3 baseline frameworks and 5 packings as listed in Table
+3
+.
+(i) llama.cpp
+(
+15
+)
+is the state-of-the-art MAD-based inference framework for ternary LLMs. It has two MAD-based packings:
+TQ1_0
+(b1.69) and
+TQ2_0
+(b2.06).
+(ii) T-MAC
+(
+41
+)
+is the state-of-the-art LUT-based mpGeMM kernel for ternary LLMs. It uses TVM
+(
+8
+)
+for kernel tuning, and is integrated with llama.cpp for end-to-end inference. It has one LUT-based packing:
+INT_N
+(b2.00).
+(iii) bitnet.cpp
+(
+40
+)
+is Microsoft’s official inference framework for ternary LLMs, built atop llama.cpp. Its LUT-based kernel is based on T-MAC. It has 3 packings supporting different devices and models: MAD-based
+I2_S
+(b2.00), and LUT-based
+TL1
+(b2.00) and
+TL2
+(b1.67).
+We fail to run bitnet.cpp (#8f75f99) on tested ARM devices, and only test it on x86 devices with supported packings.
+
+Models and quantizations
+
+We use 3 real-world ternary LLMs to evaluate Vec-LUT. The models and packings that support them are listed in Table
+3
+.
+We include both 2-bit and sub-2-bit packing for comparison as long as supported by models, frameworks, and devices.
+One exception is that llama.cpp falls back to
+Q4_0
+(b4.50) quantization for HF BitNet 3B, as it only supports weights shapes divisible by 256.
+Although not our baseline for comparison due to the large gap in BPW (
+>2\times
+), we still show its evaluation results.
+
+Tasks and metrics
+
+The evaluation is focused on system performance, rather than model accuracy, since our method is lossless for ternary weights.
+Specifically, we conduct a kernel-level mpGeMM benchmark in §
+5.2
+, and end-to-end comparisons on 3 real-world workloads in §
+5.3
+, including prefilling (§
+5.3.1
+), parallel decoding, and continuous batching that mixes prefilling and decoding (§
+5.3.2
+).
+We compare runs/s (higher is better) in the mpGeMM benchmark, and tokens/s (higher is better) in the end-to-end tests.
+
+5.2.
+mpGeMM Kernel Benchmark
+
+We evaluate the mpGeMM kernel performance on different devices in different threads, using real-model GeMM shapes (results in Fig.
+8
+).
+T-MAC is tuned for tested GeMM shapes.
+bitnet.cpp is excluded as it doesn’t provide a kernel-level benchmark tool, and is similar to T-MAC’s design.
+
+Comparison with MAD-based mpGeMM
+
+Both
+I1
+and
+I2
+packing of Vec-LUT outperform MAD-based llama.cpp in all test cases.
+When comparing in similar BPWs (i.e.,
+I1
+(b1.60) vs.
+TQ1_0
+(b1.69) and
+I2
+(b2.00) vs.
+TQ2_0
+(b2.06)), Vec-LUT respectively achieve
+3.4-4.7\times
+and
+1.7-2.9\times
+speedup in single-thread mpGeMM, and
+2.9-3.7\times
+and
+1.6-2.8\times
+speedup in multi-thread mpGeMM, averaged among GeMM shapes.
+Notably, Vec-LUT’s
+I1
+achieves comparable or slightly higher performance than
+I2
+, while llama.cpp’s
+TQ1_0
+is significantly slower than
+TQ2_0
+, which demonstrates the bit-scaling efficiency of Vec-LUT.
+
+Comparison with scalar LUT-based mpGeMM
+
+Vec-LUT also outperforms scalar LUT-based T-MAC in all test cases.
+Specifically, Vec-LUT’s
+I2
+(b2.00) achieves
+1.8-3.2\times
+and
+1.5-1.9\times
+average speedup over T-MAC’s
+INT_N
+(b2.00) in single-thread and multi-thread mpGeMM, respectively.
+In some cases (e.g., Intel PC and AMD laptop), T-MAC cannot outperform llama.cpp’s MAD-based
+TQ2_0
+, which proves the necessity of our vector LUT design for parallel inference.
+
+Speedup with different threads
+
+Although Vec-LUT outperforms baselines in different threads, the improvement in multi-thread is less significant than in single-thread.
+For example, the speedup of Vec-LUT’s
+I1
+over llama.cpp’s
+TQ1_0
+drops from
+3.4-4.7\times
+in single-thread to
+2.9-3.7\times
+in multi-thread.
+The main reason is that during LUT precomputing, different threads access the activation concurrently, and compete for the main memory bandwidth.
+
+5.3.
+End-to-End LLM Inference
+
+We evaluate the end-to-end inference throughput on different devices, threads, and workloads (prefilling, parallel decoding, and continuous batching).
+We follow llama.cpp’s practice to quantize output and token embedding weights to
+Q6_K
+and
+Q4_K
+, respectively
+(
+9
+)
+.
+We denote llama.cpp’s
+TQ2_0
+and
+TQ1_0
+as
+Q4_0
+explicitly when they fall back on unsupported GeMM shapes.
+bitnet.cpp is only evaluated on x86 devices since it fails to run on the tested ARM devices.
+
+5.3.1.
+Prefilling
+
+The prefilling evaluation covers all devices, frameworks, and models, with different prompt lengths and thread configurations (results in Fig.
+9
+).
+
+Comparison with MAD-based inference
+
+There are 3 MAD-based baselines: llama.cpp’s
+TQ1_0
+(b1.69) and
+TQ2_0
+(b2.06), and bitnet.cpp’s
+I2_S
+(2.00).
+Vec-LUT’s
+I2
+(b2.00) outperforms them consistently on different devices, by
+3.0-4.1\times
+,
+1.5-2.9\times
+, and
+1.6-2.3\times
+in single-thread, and
+2.7-3.5\times
+,
+1.2-2.6\times
+, and
+1.2-2.2\times
+in multi-thread, averaged among different models and prompt lengths.
+For sub-2-bit packing specifically, Vec-LUT’s
+I1
+(b1.60) outperforms llama.cpp’s
+TQ1_0
+by
+3.1-4.0\times
+in single-thread and
+2.5-3.0\times
+in multi-thread.
+Despite the overall speedup (consistent with §
+5.2
+), llama.cpp’s
+Q4_0
+on AWS Graviton 3 is an exception.
+The main reason is that llama.cpp’s 4-bit kernel is highly optimized on ARM devices with hardware intrinsics, outperforming both its 2-bit kernel and T-MAC.
+Considering the large gap in memory requirements (by
+>2\times
+), Vec-LUT is still preferable in memory-constrained scenarios.
+
+Comparison with scalar LUT-based inference
+
+There are 2 LUT-based baselines: T-MAC’s
+INT_N
+(b2.00) and bitnet.cpp’s
+TL2
+(b1.67).
+Vec-LUT outperforms both of them, except HF BitNet 3B prefilling on the smartphone in single-thread.
+When comparing in similar BPWs (i.e., Vec-LUT’s
+I2
+(b2.00) vs. T-MAC, and
+I1
+(b1.67) vs. bitnet.cpp’s
+TL2
+), Vec-LUT respectively achieves
+1.1-2.6\times
+and
+1.9-2.4\times
+single-thread speedup, and
+1.3-2.0\times
+and
+1.7-1.8\times
+multi-thread speedup.
+
+5.3.2.
+Parallel Decoding and Continuous Batching
+
+The parallel decoding evaluation is conducted on the PC and server in multi-thread, to reflect real-world deployment configurations.
+We measure the decoding throughput with a fixed prompt length and token generation length (16), and varying batch sizes (results in Fig.
+10
+).
+We also evaluate continuous batching, to demonstrate Vec-LUT’s capability to support more complex parallel workloads with mixed prefilling and decoding.
+
+Figure 10
+.
+Multi-thread parallel decoding comparison across models and devices. Sub-2-bit packings hatched.
+
+Table 5.
+Vec-LUT’s latency breakdown in HF BitNet 3B prefilling. Measured with VTune
+(
+20
+)
+.
+
+Total
+
+Precomp. (%)
+
+Accum. (%)
+
+Lookup (%)
+
+Others (%)
+
+15.05s
+
+1.85
+
+65.24
+
+0.59
+
+32.32
+
+Parallel decoding
+
+Vec-LUT achieves similar speedup in parallel decoding as in prefilling, with up to
+2.1\times
+,
+2.1\times
+, and
+3.0\times
+improvements over T-MAC, bitnet.cpp, and llama.cpp, respectively.
+Despite the overall improvements, we notice 2 exceptions.
+(i) llama.cpp’s
+Q4_0
+still outperforms Vec-LUT for HF BitNet 3B on AWS Graviton 3, due to the same reason explained in §
+5.3.1
+.
+(ii) bitnet.cpp’s MAD-based
+I2_S
+(b2.00) slightly outperforms Vec-LUT on intel PC and AMD laptop with Falcon 1B. The main reason is that Falcon 1B has much smaller
+M
+in its GeMM shapes (e.g.,
+2048-6144
+in Falcon 1B vs.
+4096-14436
+in Llama3 8B), which limits the benefit from table lookup.
+Besides, the concurrent memory access, as discussed in §
+5.2
+, also makes Vec-LUT’s multi-thread acceleration less significant.
+
+Continuous Batching
+
+We conduct an end-to-end serving test with continuous batching to showcase Vec-LUT’s capability to support complex parallel workloads.
+On an 8-core AWS Graviton 3 server that costs only $0.50/h, Vec-LUT’s
+I2
+can serve Falcon 1B for a 273.5 tokens/s average throughput over 32 parallel requests, including 152.6 tokens/s prefilling and 120.9 tokens/s decoding, outperforming llama.cpp’s
+TQ2_0
+by
+1.4\times
+.
+This also demonstrates the viability of deploying ternary LLMs on affordable CPU servers, making advanced language models more accessible without requiring specialized hardware or expensive computational resources.
+
+Figure 11
+.
+Prefilling throughput of HF BitNet 3B on Intel PC, with Vec-LUT’s techniques applied step by step. Accum: hierarchical accumulation; Stream: streamed lookup; Topo: topological precomputing.
+
+Figure 12
+.
+Prefilling throughput of HF BitNet 3B on Intel PC, with different prompt lengths. As the prompt length increases, Vec-LUT’s throughput improves, but T-MAC’s throughput remains nearly constant.
+
+5.4.
+Breakdown Analysis
+
+Table
+5
+shows the end-to-end prefilling latency breakdown of Vec-LUT.
+Non-mpGeMM operators (e.g., floating-point GeMM in Attention) take up 32% of the total latency,
+results accumulation (essentially vector addition) takes up 65% of the total latency, and precomputing and lookup consume little execution time.
+Notably, comparing to T-MAC (results in Table
+1
+), the ratio of lookup cost drops from 47% to below 1%, and the ratio of accumulation increases from 25% to 64%.
+This validates our vector LUT paradigm that turns random and non-contiguous table lookup into contiguous vector addition, and could inspire future works on vector LUT-centric accelerator design.
+
+5.5.
+Ablation Study
+
+Different techniques
+
+Fig.
+11
+demonstrates the effectiveness of all main techniques of Vec-LUT, including vector LUT-centric tensor layout, hierarchical accumulation, streamed precomputing-lookup, topological precomputing, and locality-aware tiling.
+Specifically, the layout optimizations provides the initial
+10.6-11.9\times
+speedup, and the streamed LUT optimizations provide another
+4.1-9.0\times
+speedup.
+
+Different input lengths
+
+Fig.
+12
+shows Vec-LUT’s performance under different input lengths and
+N
+-tiling sizes.
+Unlike T-MAC’s constant throughput despite increased parallel tokens,
+Vec-LUT’s throughput increases linearly with the prompt length, and reaches its peak when the prompt length equals
+N
+-tiling size.
+Also, the tiling size of 32 outperforms 64.
+This is consistent with the analysis in §
+4
+.
+
+6.
+Discussion
+
+6.1.
+Different Hardware Platforms
+
+Following existing LUT-based works
+(
+41
+;
+40
+)
+, we demonstrate Vec-LUT’s effectiveness on the ubiquitous and LUT-friendly CPUs. It is particularly important for edge and IoT devices.
+Specifically, CPU has a good support for table lookup and vector addition (Vec-LUT’s main operation).
+Other hardware (e.g., GPU and NPU), although becoming prevalent on new generation devices, are multiplication-centric, and doesn’t suit ultra-low-bit inference.
+Besides, it is often impractical to use them (e.g., GPU might be reserved for rendering only), or difficult to program them (e.g., the NPU ecosystem is quite closed and tend to support fixed quantization formats).
+Moreover, we hope Vec-LUT to inspire future research on vector LUT-centric hardware.
+
+6.2.
+Different Bits of Quantization
+
+Current Vec-LUT implementation particularly targets the pareto-optimal ternary LLMs. The idea of vector LUT could be extended to different bits (e.g., 1, 2, 3, 4-bit) by adapting the weight packing and indexing methods (e.g., in Fig.
+5
+).
+Besides, Vec-LUT’s design is orthogonal to T-MAC’s bit decomposition technique, which decomposes n-bit weights to n of 1-bit weights for unified handling of different quantization bits.
+The main trade-off is that higher bits will increase the LUT size and lookup complexity.
+
+6.3.
+Combination with Existing Methods
+
+Since Vec-LUT and existing scalar LUT-based methods are optimized for different input lengths (shown in Fig.
+12
+), it is feasible to combine them to build a universal solution for more diverse inference workloads.
+For example, when processing a single user request, it is optimal to use Vec-LUT during prefilling (parallel), and switch to scalar LUT-based kernels during decoding (usually not parallel), to minimize the end-to-end inference latency.
+
+7.
+Related Works
+
+7.1.
+Ultra-Low-Bit LLM Quantization
+
+Large language models (LLMs) have demonstrated remarkable capabilities but require substantial resources for deployment.
+To mitigate this, low-bit quantization has emerged as a crucial technique to reduce model size while maintaining model accuracy.
+For example, LLM.int8()
+(
+10
+)
+and SmoothQuant
+(
+43
+)
+adopt 8-bit quantization for both weights and activations to save memory and computation.
+GPTQ
+(
+14
+)
+and AWQ
+(
+25
+)
+further compress the LLM weights to 4 and 3-bit with comparable accuracy to floating point baselines, while keeping activations at FP16 due to random outliers.
+Besides the post-training quantization (PTQ) methods above,
+quantization-aware training (QAT) methods (e.g., BitDistiller
+(
+12
+)
+, EfficientQAT
+(
+6
+)
+, and ParetoQ
+(
+26
+)
+) further push the bit width boundary to 2-bit and below.
+Moreover, Microsoft trains the native ternary (1.58-bit) LLM BitNet from scratch
+(
+39
+;
+28
+;
+27
+)
+, which is followed by the community with many emerging ternary LLMs
+(
+1
+;
+30
+;
+38
+;
+21
+)
+.
+However, the mixed-precision challenge of low-bit, especially ternary LLMs, remains unsolved and significantly hinders their practical deployment on current hardware.
+
+7.2.
+LUT-based mpGeMM Optimization
+
+To efficiently support low-bit LLM inference without native hardware support of mpGeMM, LUT-based methods are proposed in replacement of conventional MAD-based methods (more in §
+2.2
+).
+For example, LUT-GEMM
+(
+34
+)
+first proposes LUT-based mpGeMM for low-bit LLMs on GPU.
+T-MAC
+(
+41
+)
+utilizes the table lookup instructions on CPU to accelerate LUT-based mpGeMM, and even outperforms GPU/NPU-based solutions in single-batch decoding.
+bitnet.cpp
+(
+40
+)
+, Microsoft’s official inference framework for ternary LLMs, extends T-MAC’s LUT-based kernel design with ternary-specific optimizations and achieves a remarkable inference speed on CPU.
+Architectural works (e.g., LUT Tensor Core
+(
+31
+)
+, TENET
+(
+16
+)
+, and T-SAR
+(
+33
+)
+) further accelerate LUT-based mpGeMM by co-designing the LUT algorithm and hardware architecture, demonstrating the superior efficiency of LUT-based solutions.
+However, all of the existing methods adopt the scalar LUT paradigm, which is inefficient for parallel inference, as discussed in §
+2.2.2
+.
+
+8.
+Conclusion
+
+We present Vec-LUT, a LUT-based mpGeMM kernel for parallel inference of ultra-low-bit LLMs on edge devices.
+Through the novel vector LUT paradigm that performs
+1\rightarrow N
+lookup, instead of
+1\rightarrow 1
+lookup in existing scalar LUT-based kernels,
+Vec-LUT avoids repetitive table loading and lookup, and accelerates mpGeMM via fully utilizing the memory bandwidth. On the ubiquitous CPU backend with llama.cpp integration, Vec-LUT’s
+I1
+(b1.60) and
+I2
+(b2.00) achieve up to
+4.2\times
+and
+2.6\times
+prefilling speedup respectively, compared to baselines of similar BPWs.
+Moreover, Vec-LUT’s
+I1
+is the most compact and versatile ternary packing for now.
+

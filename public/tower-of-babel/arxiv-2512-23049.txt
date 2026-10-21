@@ -1,0 +1,3144 @@
+Accelerating Language Model Workflows with Prompt Choreography
+TJ Bai, Jason Eisner
+
+Abstract
+Large language models are increasingly deployed in multi-agent workflows. We introduce Prompt Choreography, a framework that efficiently executes LLM workflows by maintaining a dynamic, global KV cache. Each LLM call can attend to an arbitrary, reordered subset of previously encoded messages. Parallel calls are supported. Though caching messages’ encodings sometimes gives different results from re-encoding them in a new context, we show in diverse settings that fine-tuning the LLM to work with the cache can help it mimic the original results. Prompt Choreography significantly reduces per-message latency (2.0–6.2 × \times faster time-to-first-token) and achieves substantial end-to-end speedups (>2.2 × \times ) in some workflows dominated by redundant computation.
+
+
+
+1
+Introduction
+
+Large language models (LLMs) are increasingly deployed beyond simple prompt-response interactions in multi-step
+workflows
+that compose many LLM calls across interconnected
+agents
+. These workflows have driven measurable progress across diverse domains
+(
+8
+)
+.
+
+We introduce Prompt Choreography, a framework for Transformer LLMs where every LLM call is instructed to attend over some
+arbitrary reordered subset
+of previously encoded messages. This mechanism frees workflow developers to break from traditional prompted autoregressive decoding, in which each decoded token attends to
+all
+previous tokens.
+Developers can strategically reuse cached Transformer key-value (KV)
+encodings
+to reduce redundant computation, while still choosing which messages should be visible to each agent, and in what positions.
+
+The traditional approach requires each call to the LLM to encode the entire prompt from scratch.
+Yet as agents work on a problem,
+it is common to reuse input and output messages across multiple calls. After all, each agent usually conditions on most of its own previous output and on fixed system instructions, and multiple agents usually share substantial context, such as background documents and previous inter-agent communications. While
+prefix caching
+strategies
+(
+37
+;
+36
+)
+will reuse some message encodings for some workflows, this simple optimization must be generalized for multi-agent workflows to reap similar benefits.
+
+Figure 1
+:
+Prompt Choreography manages a global KV cache of messages, which is shared and extended by all participating agents.
+When assembling a prompt, an agent selects messages and may specify their start positions; this allows reordering, gaps, and overlaps (not shown). Parallel decoding is possible whenever multiple prompts can be created from the current cache state.
+
+Previous methods, particularly Prompt Cache
+(
+7
+)
+, partially address this by pre-computing a
+cache
+of messages that can be selectively used at run-time, such as contextual documents. However, these approaches are generally static; messages that are dynamically generated at run-time cannot be reused. Prompt Choreography overcomes this limitation by introducing a
+global KV cache
+that can be arbitrarily updated and accessed by all agents at run-time.
+
+Drawing an analogy to computing architectures, traditional LLM agents are processes in a distributed memory model, where each process has a
+private
+context window, so sharing information requires expensive copying or re-computation. Prompt Choreography instead opts for a
+shared
+memory model
+(
+14
+)
+, where processes access
+virtual
+views of a dynamic global context, allowing computational states to be efficiently shared while maintaining isolation when needed.
+
+In
+Section
+
+2.1
+, we develop the core ideas behind Prompt Choreography and describe how it may be implemented and used in practice, as in our reference implementation.
+1
+1
+
+1
+
+https://github.com/tjbai/choreo
+Our approach uses several novel techniques to enable fine-grained KV cache management while maintaining ease of use. We combine a dynamic attention masking strategy (controlling
+which
+previous messages each agent sees) with efficient position updates
+(controlling
+where
+those messages appear in the prompt) to support virtualized, parallel generation.
+This allows messages to be decoded fully in parallel over a shared KV cache while roughly maintaining appropriate logical isolation of agents. Together, these methods significantly reduce redundant computation while facilitating efficient, parallel generation.
+
+Using Prompt Choreography does require care. It sometimes results in different message encodings than in a standard workflow (for good or for ill). For example, it is now possible for message 3 to attend to both messages 1 and 2, each of which was encoded into KV vectors without attention to the other.
+In
+Section
+
+3
+, we discuss this kind of
+information blockage
+, which makes messages more independent,
+as well as
+information leakage
+, where a choreography—in the name of efficiency—allows agent B indirect access to agent A’s private context by reusing agent A’s own encoding of an output message.
+Through targeted experiments, we examine the potential adverse downstream impact of choreography. We then show that lightweight
+parameter-efficient fine-tuning
+effectively and efficiently mitigates these issues.
+
+In
+Section
+
+4
+, we evaluate three representative workflows on the standard MATH benchmark
+(
+9
+)
+.
+While choreographed workflows may underperform with an LLM that was not trained for such usage,
+fine-tuning on a few hundred examples quickly regains, and sometimes exceeds, baseline performance. The fine-tuning work is then amortized by a nice run-time speedup—the resulting workflows achieve between 2.0–6.2
+\times
+faster time-to-first token and consistent end-to-end speedups. Through further scaling in
+prefill-bound
+workflows, we show that Prompt Choreography can obtain up to a 2.2
+\times
+end-to-end speedup.
+
+Figure 2
+:
+Workflows for the experiments of
+Section
+
+4
+.
+Full code sketches using our API appear in
+Figure
+
+7
+in
+Appendix
+
+E
+. Each box is a message, with arrows to it from its parents. Pink boxes are prefilled. Each non-pink box has an additional parent (not shown): a system prompt corresponding to its color. For instance, each blue “Voter” in
+middle
+is generated with attention to instructions on how to select the best candidate.
+
+2
+Prompt Choreography
+
+2.1
+Core Idea
+
+We extend the industry-standard
+Chat API
+for accessing LLMs
+
+23
+. The Chat API is invoked with a sequence of
+messages
+—text strings annotated with agent roles. Conditioned on a concatenation of these messages, the LLM generates and returns a new message. All messages are tokenized internally.
+
+A message typically corresponds to a turn in a dialogue, an example input or output, a document to read, or an instruction.
+Messages are natural units for caching because a message is often reused in its entirety across prompts, with essentially the same meaning each time.
+This stability means that the encodings computed by one agent can often be effectively reused by another agent, eliminating redundant work in workflows that exhibit large amounts of message reuse.
+
+Prompt Choreography maintains a global
+cache
+of messages that are shared by all agents throughout a workflow’s execution. Each message comprises not only a span of tokens, but also their corresponding Transformer KV encodings.
+LLM calls add new input or output messages to the cache, conditioning their encodings on any subset of the previously cached messages.
+A
+prompt choreography
+is an arbitrary program that specifies how each call should select and arrange this subset.
+
+Implementing this approach requires addressing three key issues:
+
+First, retrieving cached encodings must be faster than simply recomputing them (which is already efficient with GPU parallelism). We accomplish this through memory locality, keeping the cache on the same device as the LLM and using a dynamic attention mask computed on-the-fly to control which cached encodings each new message accesses.
+
+Second,
+LLMs care about the relative position of previous tokens, so we must control where to place the selected messages. Our position updating technique assumes a relative positional encoding scheme such as RoPE
+(
+30
+)
+. Under this scheme, the KV cache
+is translationally invariant,
+so we can arbitrarily reposition messages without full recomputation.
+
+Third,
+the Chat API allows parallel sampling of multiple responses to the
+same
+prompt. We extend this ability and allow multiple messages to be decoded simultaneously, each attending to a
+different
+prompt that is choreographed from the same KV cache. Our implementation interleaves the tokens of the decoded-in-parallel messages as it appends them to cache storage.
+
+2.2
+Simplifying Assumptions
+
+We will make the following practical assumptions:
+
+1.
+
+The global KV cache fits entirely in GPU memory, allowing cached encodings to be easily attended to during inference.
+2
+2
+
+2
+
+When this assumption does not hold, one could temporarily swap messages out to CPU, reduce the memory footprint through cache compression, or drop less important tokens via cache eviction. See
+15
+.
+
+2.
+
+LLM calls are generated programmatically and fairly rapidly. There are no pauses in the choreography---e.g., to wait for a human dialogue participant or a slow software tool to provide the next message. Thus, executing the choreography does not selfishly lock GPU memory that may be needed by other workflows running on the same LLM server.
+3
+3
+
+3
+
+Again, this could be mitigated by swapping the cache out to CPU memory when the choreography is idle.
+
+3.
+
+The encoding of a token does not reflect its absolute position in the prompt
+32
+,
+but only its position relative to other tokens
+25
+;
+30
+. This lets us reposition past messages relative to the start of a new message before sequentially generating and encoding the new message’s tokens.
+Our implementation assumes the currently popular RoPE scheme for relative position embeddings
+30
+, since it is used by the LLMs we experiment with.
+
+2.3
+A Prompt Choreography API
+
+The standard Chat API provides a single function,
+\texttt{complete}(\texttt{inputs})\rightarrow\texttt{output}
+, which autoregressively generates an output message conditioned on a ordered list of input messages. Internally, this operation can be decomposed into two phases: a parallel
+prefill
+phase that computes encodings for all input messages at once, followed by a sequential
+decode
+phase that produces the output message token-by-token.
+
+Our API explicitly separates these phases into
+prefill
+and
+decode
+functions. Each function appends a newly encoded message to the global KV cache and returns a unique new identifier for this message for future reference.
+4
+4
+
+4
+
+Fancier parallel versions of these functions, which are discussed in
+Section
+
+2.4
+, can return
+multiple
+new message identifiers.
+(A message’s textual content can be retrieved from its identifier.)
+
+1.
+
+prefill(message: str,
+
+prefill(
+parents: List[id],
+
+prefill(
+offsets: List[Optional[int]],
+
+prefill(
+new_offset: Optional[int])
+
+\to
+
+id
+
+Tokenizes
+message
+and encodes its tokens in parallel, allowing each to attend to the preceding tokens and also to all tokens in the existing messages
+parents
+. Returns an identifier for the resulting prefilled message. For purposes of computing relative-position attention, the
+parents
+are repositioned to start at the respective
+offsets
+,
+5
+5
+
+5
+
+Repositioning might not actually be essential unless the past messages need to be reordered. The LLM might be robust to gaps and overlaps among messages in the prompt, either off-the-shelf
+
+(
+7
+)
+or after our fine-tuning (
+Section
+
+3.2
+).
+and the new message is positioned at
+new_offset
+. Any omitted offset defaults to the position immediately after the end of the preceding parent message.
+
+2.
+
+decode(header: str,
+
+decode(
+parents: List[id],
+
+decode(
+offsets: List[Optional[int]],
+
+decode(
+new_offset: Optional[int])
+
+\to
+
+id
+
+Generates
+6
+6
+
+6
+
+Outputs may be generated using an arbitrary decoding scheme, such as temperature sampling or beam search.
+
+a new message, conditioning each token and its encoding on the encodings of previous tokens and messages, with relative-position attention as before. Returns an identifier for the new message. The new message is constrained to start with
+header
+—for example, “
+Assistant:
+” for a role-based output or “
+{
+” for a JSON output.
+
+The
+header
+in
+decode
+must be non-empty,
+7
+7
+
+7
+
+LLMs standardly require special tokens in each message, in particular to mark the start/end of the message and specify its role. We have presented
+prefill
+and
+decode
+here as if the caller must provide these tokens, but in fact our implementation adds them transparently.
+since the first unconstrained token will be generated from the top-layer encoding of the last header token. (The list of
+\geq 0
+repositioned parents may not have any obvious “last token” to use for this purpose.)
+
+2.4
+Implementation: Managing the KV Cache
+
+Suppose the given Transformer language model
+(
+32
+)
+
+has
+
+L
+layers, each employing
+h
+attention heads that consume separate keys and values in
+\mathbb{R}^{d}
+. Then all the keys and values for a single token can be gathered into tensors
+K,V\in\mathbb{R}^{L\times h\times d}
+.
+Caching these tensors makes it fast to attend to that token in the future.
+
+The global KV cache stores
+K
+and
+V
+for all previously
+prefill
+ed or
+decode
+d tokens. These reside contiguously in GPU memory. We maintain a count of currently cached tokens, and new messages are appended sequentially to the end of the currently occupied portion of the cache. This append-only strategy is simple and fast.
+8
+8
+
+8
+
+See
+Footnote
+
+2
+for potential enhancements.
+
+When
+prefill
+or
+decode
+appends a new message with identifier
+m
+at
+new_offset
+
+o
+, it rotates each new token’s key vectors under the RoPE scheme to “place” the
+i
+th
+token at logical position
+j=o+i
+within the prompt. We store the small integer pair
+(m,j)
+alongside the token’s key vector. If a future API call needs to reposition this message, it modifies
+j
+and the rotated key vector---doing so non-destructively during model fine-tuning (to support backpropagation through the computation graph), but destructively during inference.
+9
+9
+
+9
+
+If attention does not mutate key encodings to apply positional embeddings, such as in ALiBi
+(
+25
+)
+and T5
+(
+27
+)
+, then this distinction is unnecessary.
+
+Figure 3
+:
+Attention masks used in Prompt Choreography. Vertical axis represents attention query positions while horizontal axis represents key/value positions. Blue cells represent parent message tokens (green) and within-message tokens (yellow) that each decoding token may attend to.
+Top (
+prefill
+)
+encodes 2
+input
+messages, each consisting of 3 tokens. All 6 tokens are encoded in parallel using this mask, while attending to disjoint subsets of 3 cached messages.
+Bottom (
+decode
+)
+encodes the second tokens of 3
+output
+messages. Only 3 tokens are encoded in parallel, since under causal decoding, they could not be predicted until the first tokens of their respective messages were fully encoded.
+
+Position Updates
+
+To reposition a token from
+j
+to
+j^{\prime}
+under the RoPE scheme, we rotate its key vector through an angle proportional to
+(j^{\prime}-j)
+.
+
+For a slight speedup, we precompute the rotation matrices for all possible position differences within our context window and store them as a lookup table. Each API call determines the correct shifts using position metadata, then applies the appropriate rotation to each key in parallel across all attention heads and layers.
+
+Dynamic Masking
+
+Both
+prefill
+and
+decode
+construct attention masks so that tokens in the new message will attend only to the
+parents
+and to earlier tokens in the new message. Other tokens in the KV cache are rendered invisible.
+
+Each attention mask can be efficiently computed on-the-fly
+using the stored
+m
+values. We implement this using FlexAttention
+(
+4
+)
+, which compiles our custom masking logic into kernels comparable in performance to optimized attention backends, such as FlashAttention
+(
+2
+)
+. Thus, dynamic masking has negligible overhead compared to standard attention.
+
+Parallel API Calls
+
+For additional speed, we support adding
+n
+messages to the cache in parallel, as long as they do not attend to one another. We overload
+prefill
+and
+decode
+so that they can be passed a length-
+n
+list of parallel calls and return a length-
+n
+list of message identifiers.
+While all the new tokens are appended to the same physical KV cache, each token’s stored
+(m,j)
+pair keeps track of its logical message and position.
+
+When
+prefilling
+multiple messages in parallel, we keep each message physically contiguous because the message lengths are known in advance. But when
+decoding
+multiple messages in parallel, we interleave their tokens. Consider decoding
+I have a fat dog
+and
+She loves cats
+in parallel. These tokens appear in physical memory as:
+I
+
+She
+
+have
+
+loves
+
+a
+
+cats
+
+fat
+
+dog
+. Each decoding step can generate a pair of tokens in parallel: The top-layer encodings of
+have
+
+loves
+respectively predict
+a
+
+cats
+. Their top-layer encodings in turn predict
+fat
+
+eos
+. As
+eos
+marks the
+e
+nd
+o
+f the red
+s
+equence, the next step only has
+
+fat
+predict
+dog
+, which predicts
+eos
+.
+
+This distinction between virtual and physical addresses slightly complicates the computation of positional rotations and attention masks.
+Token
+a
+can attend to the blue message’s parents and
+to
+I have
+(at the next lower Transformer layer), but cannot attend to any tokens of the red message. This prevents interference among messages decoded in parallel.
+Dynamic attention masks for parallel prefilling and decoding are contrasted in
+Figure
+
+3
+.
+
+In our current implementation, parallel calls that use the same parents must place them at the same relative offsets.
+10
+10
+
+10
+
+This limitation stems from RoPE, which directly embeds positional information into each key encoding, effectively fixing it to one position. This can be avoided by creating copies of parent messages, or adopting positional embeddings that leave key encodings intact (see
+Footnote
+
+9
+).
+
+2.5
+Simple Examples
+
+A common workflow appends messages to a growing conversational history that serves as the
+parents
+for subsequent calls:
+
+⬇
+
+1
+
+history
+
+=
+
+[]
+
+2
+
+3
+
+history
+.
+append
+(
+prefill
+(
+
+4
+
+message
+=
+’User:
+
+What
+
+is
+
+the
+
+capital
+
+of
+
+China?’
+,
+
+5
+
+parents
+=
+history
+
+6
+
+))
+
+7
+
+8
+
+history
+.
+append
+(
+decode
+(
+
+9
+
+header
+=
+’Assistant:’
+,
+
+10
+
+parents
+=
+history
+
+11
+
+))
+
+12
+
+13
+
+history
+.
+append
+(
+prefill
+(
+
+14
+
+message
+=
+’User:
+
+How
+
+about
+
+Ethiopia?’
+,
+
+15
+
+parents
+=
+history
+
+16
+
+)
+
+17
+
+18
+
+history
+.
+append
+(
+decode
+(
+
+19
+
+header
+=
+’Assistant:’
+,
+
+20
+
+parents
+=
+history
+
+21
+
+))
+
+One can also branch the history by backtracking to an earlier cached prefix: here
+Lines
+
+15
+and
+26
+have the same
+parents
+.
+
+⬇
+
+21
+
+history
+.
+pop
+()
+
+22
+
+history
+.
+pop
+()
+
+23
+
+24
+
+history
+.
+append
+(
+prefill
+(
+
+25
+
+message
+=
+’User:
+
+How
+
+about
+
+Bolivia?’
+,
+
+26
+
+parents
+=
+history
+
+27
+
+))
+
+The above patterns would be handled
+automatically
+by prefix caching
+(
+37
+;
+36
+)
+. However, Prompt Choreography is more general. It also supports patterns resembling Prompt Cache
+(
+7
+)
+and Block-Attention
+(
+31
+)
+, which use
+precomputed
+encodings for a collection of static documents or prompts. Block-Attention includes a position update step so that all retrieved messages have sequential positions, which is the default provided by our API when the offsets are omitted.
+
+In this example, we use the parallel API (
+Section
+
+2.4
+), in which
+prefill
+is given a
+list
+of calls and returns a
+list
+of message identifiers.
+
+⬇
+
+1
+
+doc_messages
+
+=
+
+prefill
+({
+
+2
+
+’tokens’
+:
+
+’Source
+
+Document:
+
+{doc}’
+,
+
+3
+
+’parents’
+:
+
+[]
+
+4
+
+}
+
+for
+
+doc
+
+in
+
+knowledge_base
+)
+
+5
+
+6
+
+def
+
+answer
+(
+question_str
+):
+
+7
+
+relevant
+
+=
+
+[
+doc_messages
+[
+i
+]
+
+for
+
+i
+
+in
+
+retrieve
+(
+knowledge_base
+,
+
+question_str
+)]
+
+8
+
+question
+
+=
+
+prefill
+(
+question_str
+,
+
+parents
+=[])
+
+9
+
+return
+
+decode
+(
+header
+=
+’Assistant:’
+,
+
+10
+
+parents
+=[*
+relevant
+,
+
+question
+])
+
+Figure
+
+7
+demonstrates more complex workflows built from the same building blocks.
+
+3
+Working with Modified Attention
+
+3.1
+A Baseline Approach
+
+To contrast Prompt Choreography with the Chat API (see
+Section
+
+2.3
+), imagine the following
+naive implementation
+of our API. It can be used to mimic the behavior of the Chat API, but is invoked via our
+prefill
+and
+decode
+methods instead of the traditional
+generate
+.
+It does not cache any Transformer encodings. Each identifier now refers to just the
+text
+of a message, not its contextual encoding:
+
+•
+
+prefill
+does not use the LLM. It ignores the
+parents
+argument. It simply stores
+message
+and returns a new
+id
+that can be used in future to refer to this new
+text
+input message.
+
+•
+
+decode
+concatenates the
+parents
+(i.e., the text messages referred to by those
+id
+s) into an LLM prompt. It uses the LLM to generate a new output message starting with
+header
+, again returning a new
+id
+for the message
+text
+.
+
+Because the naive
+decode
+re-encodes its prompt, each message in its
+parents
+will attend to all and only the previous messages in the same
+parents
+.
+11
+11
+
+11
+
+Both naive methods ignore
+offsets
+and
+new_offset
+.
+
+One can enhance the naive implementation with prefix caching, which speeds it up while preserving its semantics. We implement this version—our
+baseline method
+—and compare it experimentally with our Prompt Choreography implementation.
+
+Prompt Choreography differs because when
+prefill
+or
+decode
+creates a new input or output message, respectively, it also computes and stores a contextual encoding of that message. These cached contextual encodings are reused whenever a message is reused—even if the message appears in a new prompt! This is faster but gets different results than the baseline method. It can lead to
+information blockage
+(seeing too little) and
+information leakage
+(seeing too much), as explained in
+Sections
+
+3.3
+–
+3.4
+below.
+Appendix
+
+A
+explains the formal difference as a difference in graphical models.
+
+3.2
+Distillation (via Fine-Tuning)
+
+When information blockage or information leakage harms performance, we may attempt to recover baseline-level accuracy—while remaining faster and cheaper—through
+parameter-efficient fine-tuning (PEFT) of the choreographed workflow.
+
+We generate training data by sampling execution “traces” using the baseline method at temperature 1.
+We then switch to the choreographed implementation and fine-tune it to (try to) reproduce the traces. That is, we evaluate the total log-loss of the
+decode
+calls when they are forced to produce the output messages from the baseline traces, and we adjust the parameters along the gradient of this log-loss. The gradient is computed by back-propagating through all
+prefill
+and
+decode
+steps in the choreographed workflow.
+
+In the following sections, we conduct experiments with Llama3.1-8B
+(
+21
+)
+.
+12
+12
+
+12
+
+For evaluation, we decode at temperature
+0.7
+.
+For PEFT, we train LoRA adapters
+(
+10
+)
+with a fixed hyperparameter setting.
+13
+13
+
+13
+
+\text{rank}=64,\alpha=32,\text{and dropout}=0.05
+. This hyperparameter setting was chosen through limited validation set sweeps in the Tree of Thought setting, detailed in
+Section
+
+4
+.
+
+PEFT modifies
+<1\%
+of the model parameters and thus requires only a few hundred training traces.
+
+3.3
+Information Blockage
+
+Information blockage arises when a step of Prompt Choreography uses
+parents
+that were prefilled or decoded independently (e.g., in parallel for efficiency). In this case, the messages that appear later in
+parents
+were encoded without attention to the ones that appear earlier—in contrast to the baseline method. This independence may be beneficial, for example to eliminate unwanted ordering effects
+(
+18
+)
+. On the other hand, it may weaken the Transformer’s contextual understanding of the later parents or its ability to compare them with the earlier parents. The Transformer may also become confused by the fact that distinct parent messages reuse the same token positions.
+
+To quantify the impact of blockage, we examine two settings: multi-question QA (MultiQA) and branch-solve-merge (BSM) for constrained story generation
+(
+29
+)
+.
+
+MultiQA
+
+We first design a contrived task that presents an LLM with
+two
+independently
+prefill
+ed questions from TriviaQA
+(
+12
+)
+and
+decode
+s a
+single
+answer message. The system prompt instructs to “Answer all questions” within this message. We compare three approaches (depicted in
+Appendix
+
+B
+): the
+baseline
+workflow allows question #2 to attend to question #1 during prefilling, the
+choreographed serial
+workflow prefills the two questions
+independently
+but still offsets question #2 after question #1 during answer decoding, and the
+choreographed parallel
+workflow completely eliminates question order by placing both encoded questions at the same offset during answer decoding, so that they overlap. The answer is placed immediately after the rightmost question token (via
+new_offset
+in
+decode
+).
+
+As the LLM was never trained on choreographed positions, it fails catastrophically (
+Table
+
+1
+). Correctness on both questions drops from
+56.4\%\to 0.4\%
+. Through manual inspection, we identified that the model always gives only a single answer, despite the system prompt. In the serial case, the LLM prefers to answer the
+second
+question (61.0% correct) while almost completely ignoring the first (2.0% correct). In the parallel case, neither question is “first” or “second” and it may answer either one, though with limited accuracy.
+
+We then apply our fine-tuning recipe on 200 examples over 2 epochs to
+choreographed parallel
+and evaluate on 500 held-out question pairs. Fine-tuning strongly improves over the untrained choreographed implementation, recovering most of the baseline performance in each column.
+
+Implementation
+
+Q1 (%)
+
+Q2 (%)
+
+Both (%)
+
+Baseline
+
+71.8
+
+74.8
+
+56.4
+
+Choreo. Serial
+
+2.0
+
+61.0
+
+0.4
+
+Choreo. Parallel
+
+32.8
+
+26.2
+
+0.4
+
+Choreo. Parallel + FT
+
+68.1
+
+71.9
+
+49.3
+
+Table 1
+:
+Percentage of correct answers on the MultiQA task across different implementation. FT denotes distillation via fine-tuning. Bold denotes best performance or not significantly worse (
+p>0.05
+, McNemar’s test).
+
+Concept Coverage (%)
+
+Win rate vs. Baseline (%)
+
+Implementation
+
+Overall
+
+(Diff. CI)
+
+Group 1
+
+Group 2
+
+Baseline Wins
+(CI)
+
+Baseline Loses
+(CI)
+
+Baseline
+
+81.0
+
+87.6
+
+82.4
+
+—
+
+—
+
+Baseline + FT
+
+78.8
+
+(-5.2,+1.0)
+
+87.0
+
+77.5
+
+32.0
+(20.0,46.0)
+
+68.0
+(54.0,80.0)
+
+Choreo. Serial
+
+65.1
+(-20.2,-11.6)
+
+80.5
+
+53.0
+
+58.0
+(44.0,77.0)
+
+8.0
+(2.0,16.0)
+
+Choreo. Parallel
+
+63.0
+(-22.1,-14.0)
+
+67.4
+
+65.0
+
+56.0
+(42.0,70.0)
+
+6.0
+(0.0,14.0)
+
+Choreo. Parallel + FT
+
+81.6
+
+(-2.7,+3.8)
+
+85.6
+
+85.3
+
+30.0
+(18.0,44.0)
+
+30.0
+(18.0,42.0)
+
+Table 2:
+Left:
+The percentage of concepts successfully incorporated into the final story. Group 1 and Group 2 show the percentage of concepts incorporated into the final story, out of the groups generated in the branch step. We report 95% confidence intervals on the difference from baseline. Underlining denotes a statistically significant difference in Group 1 and Group 2 coverage (
+p<0.05
+). Boldface in each column denotes best performance or not significantly worse (
+p<0.05
+).
+Right:
+Head-to-head win rates as judged by GPT-4o (prompt in
+Appendix
+
+D
+, remaining percentage represents ties), with 95% CIs. All statistical tests use the paired bootstrap.
+
+Branch-Solve-Merge
+
+To assess blockage in a more realistic setting, we replicate the BSM workflow of
+29
+for the CommonGen task
+(
+17
+)
+, which requires generating a coherent story that incorporates a set of 30 keyword concepts.
+14
+14
+
+14
+
+We use training, development, and evaluation splits of size 100, 50, and 50, each example using a different 30 concepts.
+As it may be difficult to generate a coherent story in one prompt, the workflow involves: (1) a
+branch
+step that divides concepts into two smaller groups, (2) parallel
+solve
+steps that generate a sub-story for each group, and (3) a final
+merge
+step that combines the two sub-stories into a final narrative. Similar to MultiQA, we compare settings where the sub-stories are positioned both in serial and parallel to generate the final story.
+15
+15
+
+15
+
+In contrast to MultiQA, each sub-story is dynamically added to the cache from an intermediate
+decode
+call during the workflow’s execution. They also
+leak
+some information from the solve system prompt (see
+Section
+
+3.4
+).
+
+Both choreographed workflows perform substantially worse than the baseline when using the untuned LLM (
+Table
+
+2
+), just as in MultiQA. In contrast to MultiQA, positional bias now tends to favor the story appearing as the
+earlier
+parent (in the sense of using more of its concepts),
+in both baseline and choreographed serial workflows.
+
+Happily, fine-tuning the choreographed parallel workflow,
+on 100 traces over 4 epochs, makes it statistically indistinguishable from the baseline.
+16
+16
+
+16
+
+Fine-tuning may teach the Transformer to consume parallel encodings (as for MultiQA). The second line of
+Table
+
+2
+confirms that fine-tuning does not have a
+general
+benefit: fine-tuning the baseline on the same examples (namely, outputs of the untuned baseline) does not help.
+
+Head-to-head comparisons judged by an LLM (
+Appendix
+
+D
+) show that fine-tuning also restores narrative quality, not merely coverage.
+Meanwhile, the baseline’s unwanted positional bias is—of course—eliminated by the parallel workflow. See
+Table
+
+2
+.
+
+3.4
+Information Leakage
+
+C
+
+D
+
+C
+
+(3, 3)
+
+(0, 5)
+
+D
+
+(5, 0)
+
+(1, 1)
+
+Alice’s Strategy
+
+Bob’s Cooperation Rate (%)
+
+Baseline
+
+Choreo.
+
+(Diff. CI)
+
+Choreo. + FT
+
+(Diff. CI)
+
+No Explicit Strategy
+
+78.3
+
+63.9
+(-20.7,-9.6)
+
+76.8
+(-6.1,+4.4)
+
+Always Cooperate
+
+87.7
+
+78.2
+(-14.2,-4.2)
+
+83.9
+(-6.0,+2.8)
+
+Always Defect
+
+72.8
+
+46.7
+(-30.9,-18.9)
+
+68.3
+(-8.1,+3.7)
+
+Table 3
+:
+Left:
+Prisoner’s Dilemma payoff matrix showing
+(\text{Alice utility},\text{Bob utility})
+, depending on if each player cooperates (C) or defects (D).
+Right:
+Bob’s cooperation rates with across different strategies and implementations. We report 95% CIs on the difference in cooperate, with respect to the baseline, obtained via McNemar’s Test.
+18
+18
+
+18
+
+Specifically, the implementation
+mcnemarExactDP
+provided by the
+exact2x2
+R package.
+
+The second type of modified attention, information leakage, occurs when choreography allows a model to “see too much.” This may happen when an agent uses a parent message that was originally encoded with attention to context that was intended to be private from the current agent, such as hidden system prompts, internal reasoning steps, or confidential data. Leakage may be particularly concerning in privacy-sensitive applications or simulations requiring strict information asymmetry, such as in role-playing simulations
+(
+24
+)
+or games
+(
+11
+)
+. In contrast, leakage may be benign (or even helpful) in purely collaborative settings. While fine-tuning can teach the LLM to
+behave
+during choreography like the baseline workflow, this does not provide any strict
+guarantees
+; careful choreography design is left to the developer.
+
+Prisoner’s Dilemma
+
+To evaluate the effects of
+unwanted
+leakage, we investigate a workflow based on the classic Prisoner’s Dilemma (
+Appendix
+
+C
+). Two game-playing agents, Alice and Bob, are each prompted to choose a
+strategy through a private chain-of-thought. They then engage in two rounds of open conversation before each privately reflects and decides whether to “cooperate” or “defect.” The game’s payoff matrix (
+Footnote
+
+17
+) incentivizes defection, but the conversation phase allows the agents to negotiate toward mutual cooperation (possibly deceptively). Llama3.1-8B cooperates remarkably often, perhaps because it was trained by RLHF to be a friendly and helpful agent.
+
+Bob sees his own private system prompt and strategic thoughts, as well as all conversational utterances by both agents. The problem arises when Bob sees
+cached
+versions of Alice’s utterances, which were encoded by Alice as she generated them, with attention to
+her
+own private system prompt and thoughts. These encodings create a channel for her private information to leak to Bob.
+
+To study leakage, we experimentally intervene by telling Alice (as part of her system prompt) to “always cooperate” or “always defect.” Bob’s behavior may be affected by Alice’s knowledge of this prompt or her thoughts about it, as revealed through her encoded utterances.
+
+When comparing to baseline attention, which has no leakage, we improve statistical power by constructing paired examples. To construct a pair, first we run the baseline workflow. Then we run the choreographed workflow, forcing it to use the same system prompt and strategic thoughts by prefilling them (rather than decoding new thoughts). The subsequent conversation and decision can diverge from the baseline workflow. We use fixed random seeds to generate
+training, development, and evaluation splits of size 400, 100, and 500, respectively. Half the games in each split are played with Alice speaking first, with Bob going first in the others.
+
+Footnote
+
+17
+provides compelling evidence of information leakage. Across all settings, Bob’s cooperation rate decreases. As one might expect, the decrease is largest when Alice is instructed to “always defect” (72.8%
+\to
+46.7%),
+and smallest when Alice is instructed to “always cooperate.”
+
+Why does (indirect) access to Alice’s private messages always make Bob more likely to defect?
+Defection is actually the optimal response to
+any
+action by Alice, and friendly helpful Bob may become more self-interested when he sees that Alice is
+considering
+defecting. As an ablation, we try giving Bob versions of Alice’s utterances that are re-encoded to
+only
+attend to Alice’s system prompt
+or
+her private plan (
+Figure
+
+8
+). The results do weakly
+support our hypothesis. In the conditions where only the system prompt is leaked, adding “always cooperate” to it makes Bob somewhat more likely to cooperate, and adding “always defect” to it makes Bob
+far
+more likely to defect. The same pattern appears in the conditions where only Alice’s plan is leaked. When the system prompt does not include “always defect,” leaking Alice’s plan depresses Bob’s cooperation rate more than leaking the system prompt, perhaps because her plan (strategic chain of thought) considers defection more seriously than the system prompt does.
+
+We conducted an additional experiment where Bob is explicitly prompted to predict Alice’s decision after the conversation phase.
+We found no evidence that Bob actually discerns Alice’s strategy. Rather, in all circumstances, Prompt Choreography makes him (non-significantly) more likely to predict that Alice will defect (
+Table
+
+7
+), as well as (significantly) more likely to defect himself (
+Footnote
+
+17
+). Our fine-tuning reversed only the latter effect, presumably because it only attempted to restore Bob’s ordinary workflow to the baseline, not his additional predictions in this experiment.
+
+4
+Main Experiments
+
+Figure 4
+:
+E2E speedup of the ToT workflow across varying numbers of branches (candidate solutions) and voters. Voting attends to all
+B
+branches, which is equally slow for both implementations. But Prompt Choreography skips re-encoding the branches before decoding votes, so it always saves time. Interestingly, the speedup is greatest for
+B=2
+and
+B=4
+, perhaps due in part to how the computation is mapped onto the GPU.
+
+Workflow
+
+Implementation
+
+Acc.
+(Diff. CI)
+(%)
+
+Direct
+
+Baseline
+
+18.8
+
+MADiter
+
+Baseline
+
+39.0
+
+Choreographed
+
+24.8
+(-21.7,-9.8)
+
+Choreo. + FT
+
+38.6
+
+(-5.9,+5.1)
+
+Distilled Baseline
+
+1.8
+(-41.8,-32.3)
+
+ToT
+
+Baseline
+
+39.6
+
+Choreographed
+
+30.2
+(-15.5,-3.3)
+
+Choreo. + FT
+
+41.4
+
+(-5.3,+8.9)
+
+Distilled Baseline
+
+29.6
+(-14.7,-5.3)
+
+MADpar
+
+Baseline
+
+64.6
+
+Choreographed
+
+52.4
+(-16.9,-7.4)
+
+Choreo. + FT
+
+60.0
+(-9.0,-0.02)
+
+Distilled Baseline
+
+5.2
+(-63.9,-54.2)
+
+Table 4:
+Accuracy on MATH problems across various workflows and implementations. We report 95% CIs on the difference in accuracy, with respect to the baseline, obtained via McNemar’s Test.
+
+Workflow
+
+TTFT Ratio
+(CI)
+
+E2E Ratio
+(CI)
+
+MADiter
+
+2.0
+(1.94,2.07)
+
+1.036
+(1.028,1.045)
+
+ToT
+
+3.5
+(3.26,3.82)
+
+1.031
+(1.026,1.036)
+
+MADpar
+
+6.2
+(5.6,6.8)
+
+1.027
+(1.023,1.032)
+
+Table 5:
+Performance improvements of choreographed workflows over baseline counterparts (baseline ÷ choreographed). TTFT measures average time-to-first token for each step in the workflow while “E2E” measures end-to-end wall-clock time. We report 95% confidence intervals obtained via bootstrapping.
+
+To evaluate Prompt Choreography across diverse real settings, we implement three workflows representing common architectural patterns (
+Figures
+
+2
+and
+E
+).
+All workflows are evaluated on MATH
+(
+9
+)
+, a standard dataset of challenging competition mathematics problems.
+
+1.
+
+Iterative Multi-Agent Debate (MADiter)
+
+(
+16
+)
+, characterized by
+sequential
+, turn-by-turn interaction among distinct agents with a shared conversation history.
+
+2.
+
+Tree of Thoughts (ToT)
+
+(
+35
+)
+with a depth-1 tree. Multiple agents (sharing a prompt) generate solutions in parallel; then multiple voters (sharing a prompt) choose their favorites in parallel.
+
+3.
+
+Parallel Multi-Agent Debate (MADpar)
+
+(
+5
+)
+has many identical agents generate in parallel while conditioning on one another’s outputs from previous rounds.
+
+4.1
+Task Accuracy
+
+We apply the fine-tuning recipe from
+Section
+
+3
+to Llama3.1-8B.
+19
+19
+
+19
+
+We sample training, development, and evaluation splits of size 500, 280, and 500, respectively.
+(See
+Appendix
+
+F
+for supplemental results on Qwen3-8B and Qwen3-14B.) We train LoRA adapters for up to 8 epochs and select the best-performing checkpoint by validation accuracy. Training takes 1--3 seconds per example,
+20
+20
+
+20
+
+Training on one example executes the entire workflow and then back-propagates its loss.
+depending on the workflow, so even our most expensive training runs require less than 3 hours on a single A100-80GB GPU.
+
+We also compare to a fast
+direct
+workflow that prompts the LLM to answer the problem in a single step.
+To improve upon this, we also train a
+distilled baseline
+where we fine-tune the single-step direct workflow to try to produce the same final output as the multi-step baseline workflow.
+
+The results are presented in
+Table
+
+4
+. As expected, naive application of Prompt Choreography without fine-tuning generally degrades downstream accuracy. However, applying our fine-tuning recipe proves effective once again. Fine-tuning even exceeds baseline accuracy in ToT and MADiter, while recovering a significant amount of baseline performance in MADpar. The far poorer performance of the distilled baseline indicates that distillation alone is not enough: the final result of the choreographed workflow cannot be reached by skipping over its intermediate steps, especially for the iterative refinement methods (MADpar and MADiter).
+
+4.2
+Performance
+
+To evaluate the speedup obtained through Prompt Choreography, we run both baseline and choreographed implementations on 30 input problems from the MATH dataset. We constrain the choreographed workflow to output the same tokens as the baseline, while
+simulating
+normal decoding. The baseline also implements prefix caching, as previously mentioned, to ensure a fair comparison.
+
+Each workflow we consider shares dynamically generated messages among agents, which would force the naive implementation (
+Section
+
+3.1
+) to re-encode these messages each time they are used. Only some of this re-encoding is avoided by prefix caching.
+
+We consider two metrics: (1) average time-to-first-token (TTFT)
+(
+28
+)
+and (2) end-to-end wall-clock time (E2E). TFTT measures the delay to produce the first token in each intermediate
+decode
+step in the workflow, including any retrieval or re-encoding of its
+parent
+messages.
+
+We see substantial TTFT improvements in
+Table
+
+5
+. MADpar sees the largest gain (6.2
+\times
+TTFT), for instance, because the baseline must redundantly re-encode
+all
+prior agents’ messages for
+each
+agent in the current round. In contrast, MADiter sees smaller gains (2.0
+\times
+TTFT), as only the opponent’s last turn needs to be re-encoded. End-to-end (E2E) speedups in these specific configurations are more modest but still welcome, around 1.03
+\times
+(
+Table
+
+5
+). This is expected under Amdahl’s Law, as workflow run-time is commonly dominated by decoding.
+
+Even runs with the same number of messages have random variation in message lengths and in the E2E speedup afforded by Prompt Choreography. We found that some runs enjoyed greater speedups (up to 1.10
+\times
+), presumably because a larger than average fraction of their baseline runtime was spent on redundant prefilling.
+To widen the range of variation, we ran ToT across a broader range of configurations, and found that in some configurations, Prompt Choreography achieved average E2E speedups as high as 2.2
+\times
+(
+Figure
+
+4
+).
+
+5
+Related Work
+
+Prompt Choreography extends prior work accelerating LLM workflows with increased flexibility. While prefix caching
+(
+36
+;
+37
+)
+reuses common prefixes and Prompt Cache
+(
+7
+)
+allows selective reuse of
+static
+prompt components, neither handles reusing content generated at run-time or arbitrary context reordering. Methods that pre-compute cached encodings for on-demand use, for instance in information retrieval, have similar limitations
+(
+31
+;
+22
+;
+33
+;
+6
+)
+. Recent approaches have also demonstrated feasibility beyond prefix caching through selective re-encoding of tokens
+(
+34
+)
+or layers
+(
+19
+)
+.
+
+Prior work on efficient LLM inference, such as KV cache compression
+(
+15
+)
+and LLM serving systems
+(
+13
+;
+37
+;
+1
+;
+20
+)
+, may make it faster to encode a token, by having it attend to fewer preceding tokens or attend to them more efficiently. In contrast, Prompt Choreography skips encoding the token in the first place by reusing a previously encoded token.
+
+6
+Conclusions
+
+Prompt Choreography provides a general framework for reducing computation in LLM workflows by reusing message encodings through a dynamically managed, global KV cache. It can provide real speedups, and the impact on output distributions can be reduced through parameter-efficient fine-tuning.
+We provide a usable reference implementation, and hope that the approach can be incorporated into production systems like vLLM.
+
+Appendix A
+Losing Conditional Independence
+
+3
+describe LLM workflows as graphical models, which they call “language model cascades.” In this framing, our
+prefill
+ed and
+decode
+d messages correspond to random variables that are
+observed
+and
+ancestrally sampled
+, respectively. Each variable depends on its
+parents
+.
+
+Section
+
+3.1
+contrasts a naive baseline implementation of our API with the actual Prompt Choreography implementation. The difference can be formalized using language model cascades.
+In the naive implementation, each variable is simply a text string (
+Figure
+
+6
+a); encodings are constructed only ephemerally, during each sampling operation (
+Figure
+
+6
+a
+′
+). Prompt choreography uses the same graphical model topology, but each random variable is now an
+encoded
+text string (
+Figure
+
+6
+b).
+This reifies the encodings and makes them persistent. It is now faster to sample a variable given its parents, but the graphical model’s semantics are different: a message’s text is no longer conditionally independent of its ancestors given its parents’ text, but only given its parents’
+encoded
+text (
+Figure
+
+6
+b
+′
+), whose encoding may leak additional information about the ancestors.
+
+Appendix B
+MultiQA
+
+Figure 5
+:
+Attention topologies compared in MultiQA. Boxes represent messages, solid arrows represent attention dependencies, and horizontal displacement represents relative position, starting from position 0 on the left and increasing rightwards.
+Top
+depicts baseline,
+middle
+depicts choreographed serial, and
+bottom
+depicts choreographed parallel.
+
+Figure 6
+:
+The message
+foo
+is prefilled, and then the other messages
+bar
+,
+baz
+, and
+buz
+are decoded.
+Top left
+shows the naive implementation, where
+baz
+is conditionally independent of
+foo
+given the text of
+bar
+.
+Bottom left
+reveals the ephemeral encodings constructed within each decoding step, which achieve this conditional independence by generating
+bar
+from
+foo
+using the green encodings, but then generating
+baz
+from
+bar
+using the blue encodings, which re-encode
+bar
+independent of
+foo
+.
+Top right
+shows how the Prompt Choreography implementation instead uses persistent encodings;
+bottom right
+reveals the exact dependencies. Here
+baz
+is no longer conditionally independent of
+foo
+given the text
+bar
+, because it still depends on
+foo
+through the
+encoding
+of
+bar
+.
+(The naive implementation does permit some persistence: on the
+left
+,
+foo
+and
+bar
+’s yellow encodings are identical to their respective green/blue encodings, and our naive implementation will reuse them via prefix caching.)
+
+Appendix C
+Prisoner’s Dilemma Prompts
+
+C.1
+System Prompt
+
+Your name is {{ name }}, and you are
+a participant in the Prisoner’s
+Dilemma with the following payoffs:
+
+If you both cooperate: You will each
+receive {{ R }} points.
+If one of you cooperates and the other
+defects: The cooperator will receive
+{{ S }} points while the defector
+receives {{ T }} points.
+If you both defect: You will each
+receive {{ P }} points.
+
+The game will consist of a private
+planning phase, two turns of open
+discussion, and then a final
+decision.
+
+{% if always_defect %}
+IMPORTANT: You must ALWAYS choose to
+DEFECT, regardless of what the other
+player says or does. However, you
+should still engage naturally in
+discussion and attempt to manipulate
+Bob into cooperating. Your ultimate
+goal is to maximize points by
+ensuring you defect while convincing
+them to cooperate.
+{% elif always_cooperate %}
+IMPORTANT: You must ALWAYS choose to
+COOPERATE, regardless of what the other
+player says or does. However, you
+should still engage naturally in
+discussion and attempt to build trust,
+convincing Bob to also cooperate.
+Your ultimate goal is to establish
+mutual cooperation, even though you
+will cooperate regardless.
+{% endif %}
+
+C.2
+Plan Prompt
+
+Before proceeding, first think carefully
+through your strategy and describe
+your plan. This planning will not be
+revealed to the other participant.
+
+C.3
+Conversation Prompt
+
+We include “
+To {{ other_agent }}:
+" in each agent’s header during the conversation rounds.
+
+C.4
+Decision Prompt
+
+Now, reflect on the conversation and
+make a final decision. Include in your
+message a JSON string with a single "decision"
+field: COOPERATE or DEFECT.
+
+Appendix D
+Branch-Solve-Merge Judge Prompt
+
+Act as an impartial judge and evaluate
+the quality of the stories provided by
+two AI assistants.
+
+Both stories were generated using the
+following instructions:
+"Given a set of concepts, write a concise
+and coherent story consisting of a few
+sentences using those concepts. The story
+should naturally integrate all of the
+following concepts: {{ concepts }}"
+
+Your evaluation should consider
+TWO primary factors:
+
+1. Concept Integration (50% weight):
+- Are concepts integrated naturally
+or are they forced into the narrative?
+- Does the story cover all required
+concepts without omissions?
+
+2. Overall Story Quality (50% weight):
+- Coherence and flow of the narrative
+- Engagement and creativity
+- Grammatical correctness
+- Logical consistency
+
+Begin your evaluation by identifying which
+concepts from the list are included in each
+story. Then, analyze how well each story
+incorporates these concepts naturally while
+maintaining narrative quality. Finally,
+provide an overall comparison of the two
+stories based on BOTH concept integration
+AND story quality.
+
+Required concepts: {{ concepts }}
+
+Story A:
+{{ story_a }}
+
+Story B:
+{{ story_b }}
+
+Avoid any position biases and ensure that
+the order in which the stories were
+presented does not influence your decision.
+Do not allow the length of the responses
+to influence your evaluation. Do not
+favor certain names of the assistants.
+Be as objective as possible.
+
+After providing your explanation, output your
+final verdict by strictly following this format:
+"[[A]]" if story A is better, "[[B]]" if story
+B is better, and "[[C]]" for a tie.
+
+Appendix E
+Workflow Details for Main Experiments
+
+We use the same prompts and structure from each reference paper and implementation. We evaluate at temperature 0.7 and nucleus sampling
+p=0.95
+. See
+Figure
+
+7
+for pseudocode and
+https://github.com/tjbai/choreo
+for the full implementation.
+
+E.1
+Iterative Multi-Agent Debate
+
+https://github.com/Skytliang/Multi-Agents-Debate
+
+Three debate rounds with moderator-led early-stopping and level 2 "debate-level" system prompts
+(
+16
+)
+.
+
+E.2
+Tree of Thoughts
+
+https://github.com/princeton-nlp/tree-of-thought-llm
+
+One-level breadth-first search with 8 solution branches and 4 votes. We generate a final solution conditioned on the “winning" chain-of-thought
+(
+35
+)
+.
+
+E.3
+Parallel Multi-Agent Debate
+
+https://github.com/composable-models/llm_multiagent_debate
+
+Three agents over three debate rounds
+without
+intermediate summarization
+(
+5
+)
+.
+
+Appendix F
+Supplemental Qwen Results
+
+Per reviewers’ request, we include additional experiments with the Qwen3 model family, which was released after this paper’s submission
+(
+26
+)
+. The results are provided in
+Table
+
+6
+.
+
+Workflow
+
+Implementation
+
+Qwen3-8B Acc.
+(Diff. CI)
+(%)
+
+Qwen3-14B Acc.
+(Diff. CI)
+
+Direct
+
+Baseline
+
+37.6
+
+39.4
+
+MADiter
+
+Baseline
+
+76.5
+
+78.6
+
+Choreographed
+
+78.8
+(-4.6,+5.4)
+
+84.6
+(+2.1,+9.9)
+
+Choreo. + FT
+
+81.4
+(-1.8,+7.5)
+
+–
+
+ToT
+
+Baseline
+
+63.0
+
+62.8
+
+Choreographed
+
+56.0
+(-12.1,-1.9)
+
+72.6
+(+4.0,+12.4)
+
+Choreo. + FT
+
+64.6
+(-3.0,+6.2)
+
+–
+
+MADpar
+
+Baseline
+
+42.2
+
+45.8
+
+Choreographed
+
+36.6
+(-10.7,-0.4)
+
+56.4
+(+9.0,+17.4)
+
+Choreo. + FT
+
+41.4
+(-5.0,+3.4)
+
+–
+
+Table 6:
+Qwen3-8B shows the same pattern on MATH as Llama3.1-8B (
+Table
+
+4
+): Prompt Choreography sometimes degrades accuracy, but fine-tuning consistently restores or exceeds the baseline performance. Surprisingly, the larger Qwen3-14B significantly
+improves
+in all settings by using Prompt Choreography, even without fine-tuning. Fine-tuning Qwen3-14B might help further, but these results are omitted due to time and compute constraints.
+
+⬇
+
+1
+
+system_prompts
+
+=
+
+{...}
+
+#
+
+constant
+
+msgs
+
+2
+
+question
+
+=
+
+prefill
+(
+question_str
+,
+
+[])
+
+3
+
+4
+
+context
+
+=
+
+[
+question
+]
+
+5
+
+for
+
+_
+
+in
+
+range
+(
+ROUNDS
+):
+
+6
+
+#
+
+for
+
+each
+
+of
+
+the
+
+3
+
+participants
+
+7
+
+for
+
+role
+,
+
+header
+
+in
+
+[
+
+8
+
+(
+’aff’
+,
+
+’Affirmative:’
+),
+
+9
+
+(
+’neg’
+,
+
+’Negative:’
+),
+
+10
+
+(
+’mod’
+,
+
+’Moderator:’
+)
+
+11
+
+]:
+
+12
+
+#
+
+decode
+
+new
+
+message
+
+13
+
+msg
+
+=
+
+decode
+(
+
+14
+
+header
+=
+header
+,
+
+15
+
+parents
+=[
+
+16
+
+system_prompts
+[
+role
+],
+
+17
+
+*
+context
+
+18
+
+]
+
+19
+
+)
+
+20
+
+21
+
+if
+
+role
+
+!=
+
+’mod’
+:
+
+22
+
+context
+.
+append
+(
+msg
+)
+
+23
+
+elif
+
+parse_stop
+(
+msg
+):
+
+24
+
+break
+
+#
+
+mod
+
+says
+
+stop
+
+early
+
+25
+
+26
+
+return
+
+parse_solution
+(
+msg
+)
+
+⬇
+
+1
+
+system_prompts
+
+=
+
+{...}
+
+#
+
+constant
+
+msgs
+
+2
+
+question
+
+=
+
+prefill
+(
+question_str
+,
+
+[])
+
+3
+
+4
+
+#
+
+generate
+
+candidate
+
+CoTs
+
+5
+
+cots
+
+=
+
+decode
+([{
+
+6
+
+’header’
+:
+
+’Assistant:’
+,
+
+7
+
+’parents’
+:
+
+[
+
+8
+
+prompts
+[
+’gen_cot’
+],
+
+9
+
+question
+
+10
+
+]
+
+11
+
+}
+
+for
+
+_
+
+in
+
+range
+(
+CANDIDATES
+)])
+
+12
+
+13
+
+#
+
+vote
+
+on
+
+best
+
+CoT
+
+14
+
+votes
+
+=
+
+decode
+([{
+
+15
+
+’header’
+:
+
+’Assistant:’
+,
+
+16
+
+’parents’
+:
+
+[
+
+17
+
+system_prompts
+[
+’vote’
+],
+
+18
+
+question
+,
+
+19
+
+*
+cots
+
+20
+
+]
+
+21
+
+}
+
+for
+
+_
+
+in
+
+range
+(
+VOTERS
+)])
+
+22
+
+23
+
+#
+
+solution
+
+considers
+
+best
+
+CoT
+
+only
+
+24
+
+return
+
+decode
+(
+
+25
+
+header
+=
+’Assistant:’
+,
+
+26
+
+parents
+=[
+
+27
+
+system_prompts
+[
+’solve’
+],
+
+28
+
+question
+,
+
+29
+
+cots
+[
+parse_best
+(
+votes
+)]
+
+30
+
+]
+
+31
+
+)
+
+⬇
+
+1
+
+system_prompts
+
+=
+
+{...}
+
+#
+
+constant
+
+msgs
+
+2
+
+question
+
+=
+
+prefill
+(
+question_str
+,
+
+[])
+
+3
+
+4
+
+context
+
+=
+
+[]
+
+#
+
+msgs
+
+from
+
+previous
+
+round
+
+5
+
+for
+
+_
+
+in
+
+range
+(
+ROUNDS
+):
+
+6
+
+calls
+
+=
+
+[]
+
+7
+
+for
+
+i
+
+in
+
+range
+(
+AGENTS
+):
+
+8
+
+others
+
+=
+
+[
+
+9
+
+message
+
+10
+
+for
+
+j
+,
+
+message
+
+11
+
+in
+
+enumerate
+(
+context
+)
+
+12
+
+if
+
+i
+
+!=
+
+j
+
+13
+
+]
+
+14
+
+15
+
+#
+
+prepare
+
+parallel
+
+calls
+
+16
+
+calls
+.
+append
+({
+
+17
+
+’header’
+:
+
+f
+’Agent
+
+{i}’
+,
+
+18
+
+’parents’
+:
+
+[
+
+19
+
+system_prompts
+[
+’debate’
+],
+
+20
+
+question
+,
+
+21
+
+*
+others
+
+22
+
+]
+
+23
+
+})
+
+24
+
+25
+
+#
+
+new
+
+msgs
+
+in
+
+this
+
+round
+
+26
+
+context
+
+=
+
+decode
+(
+calls
+)
+
+#
+
+in
+
+parallel
+
+27
+
+28
+
+return
+
+parse_consensus
+(
+context
+)
+
+Figure 7
+:
+A graphical model diagram (
+Appendix
+
+A
+) and a Python code sketch for each workflow we analyze in
+Section
+
+4
+. The parallel API (
+Section
+
+2.4
+) is used for ToT and MADpar.
+
+Figure 8
+:
+Shift in cooperation rates between choreographed and baseline implementations of the Prisoner’s Dilemma. “Leak Both” is the normal choreographed implementation, whereas “Leak System” and “Leak Plan” are ablations that explicitly re-encode Alice’s output encodings to strictly attend to her private system prompt
+or
+planning phase. Error bars represent 95% CIs on the difference relative to the baseline, obtained via McNemar’s Test.
+
+Baseline
+
+Alice’s
+
+Alice Actual
+
+Bob Predicted
+
+Outcome
+
+Strategy
+
+Cooperate
+
+Cooperate
+
+Correct
+
+Exploits
+
+Defends
+
+No Explicit Strategy
+
+82%
+
+84%
+
+80%
+
+13%
+
+6%
+
+Always Cooperate
+
+100%
+
+96%
+
+98%
+
+14%
+
+3%
+
+Always Defect
+
+0%
+
+70%
+
+30%
+
+17%
+
+13%
+
+Choreographed
+
+Alice’s
+
+Alice Actual
+
+Bob Predicted
+
+Outcome
+
+Strategy
+
+Cooperate
+
+Cooperate
+
+Correct
+
+Exploits
+
+Defends
+
+No Explicit Strategy
+
+76%
+
+76%
+
+79%
+
+18%
+
+5%
+
+Always Cooperate
+
+99%
+
+88%
+
+89%
+
+15%
+
+4%
+
+Always Defect
+
+2%
+
+55%
+
+45%
+
+27%
+
+32%
+
+Choreographed + Fine-tuned
+
+Alice’s
+
+Alice Actual
+
+Bob Predicted
+
+Outcome
+
+Strategy
+
+Cooperate
+
+Cooperate
+
+Correct
+
+Exploits
+
+Defends
+
+No Explicit Strategy
+
+79%
+
+87%
+
+80%
+
+19%
+
+8%
+
+Always Cooperate
+
+98%
+
+84%
+
+92%
+
+20%
+
+4%
+
+Always Defect
+
+1%
+
+60%
+
+41%
+
+14%
+
+23%
+
+Table 7:
+Results from prompting Bob to explicitly predict Alice’s decision, over 100 games. We say that Bob
+exploits
+Alice when he predicts that she will cooperate, so he chooses to defect. In contrast, Bob
+defends
+when he predicts that Alice will defect, so he chooses to defect.
+

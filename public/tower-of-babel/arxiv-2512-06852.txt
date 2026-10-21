@@ -1,0 +1,493 @@
+A Chunked-Object Pattern for Multi-Region Large Payload Storage in Managed NoSQL Databases
+Manideep Reddy Chinthareddy
+
+Abstract
+Many managed key–value and NoSQL databases—such as Amazon DynamoDB, Azure Cosmos DB, and Google Cloud Firestore—enforce strict maximum item sizes (e.g., 400 KB in DynamoDB). This constraint imposes significant architectural challenges for applications requiring low-latency, multi-region access to objects that exceed these limits. The standard industry recommendation is to offload payloads to object storage (e.g., Amazon S3) while retaining a pointer in the database. While cost-efficient, this “pointer pattern” introduces network overhead and exposes applications to non-deterministic replication lag between the database and the object store, creating race conditions in active-active architectures. This paper presents a “chunked-object” pattern that persists large logical entities as sets of ordered chunks within the database itself. We precisely define the pattern and provide a reference implementation using Amazon DynamoDB Global Tables. The design generalizes to any key–value store with per-item size limits and multi-region replication. We evaluate the approach using telemetry from a production system processing over 200,000 transactions per hour. Results demonstrate that the chunked-object pattern eliminates cross-system replication lag hazards and reduces p ​ 99 p99 cross-region time-to-consistency for 1 MB payloads by keeping data and metadata within a single consistency domain.
+
+
+
+1
+Introduction
+
+Managed NoSQL databases are widely adopted for latency-sensitive, high-throughput applications due to their horizontal scalability and managed multi-region replication. However, systems such as Amazon DynamoDB
+[
+1
+]
+, Azure Cosmos DB, and Google Cloud Firestore impose strict limits on item size (400 KB, 2 MB, and 1 MB, respectively). Applications managing moderately sized payloads—such as aggregated analytics snapshots or large JSON documents—must often offload data to separate object storage services.
+
+The prevailing design pattern involves storing the payload in object storage (e.g., Amazon S3) and referencing it via a pointer in the database
+[
+4
+]
+. While effective for archival data, this approach introduces heterogeneous consistency models. In multi-region “active-active” architectures, the database and object store replicate asynchronously and independently. This creates a hazard where a secondary region may receive the database pointer before the object storage payload has replicated, leading to “dangling pointer” errors.
+
+In this paper, we propose and evaluate a database-centric
+Chunked-Object Pattern
+. By splitting logical entities into fragments that fit within the database’s item limit, we enforce atomic visibility of the payload and metadata within a single replication stream.
+
+Our contributions are:
+
+•
+
+A precise definition of the chunked-object pattern for overcoming item size limits in distributed NoSQL stores.
+
+•
+
+A multi-cloud analysis of replication behavior, highlighting the risks of hybrid storage (Database + Object Store) in active-active topologies.
+
+•
+
+An empirical evaluation based on production telemetry comparing the proposed pattern against the traditional S3-pointer approach, demonstrating the elimination of cross-region race conditions.
+
+2
+Background and Motivation
+
+2.1
+The Multi-Region Replication Gap
+
+Managed databases typically offer optimized replication for small items. DynamoDB Global Tables and Cosmos DB, for instance, utilize log-based replication that propagates changes in sub-seconds to seconds. Conversely, object storage replication (e.g., S3 Cross-Region Replication) is throughput-optimized rather than latency-optimized.
+
+In a typical active-active design, a write request may land in Region A, followed immediately by a read or update in Region B. If the application relies on the “Pointer Pattern,” correctness depends on the convergence of two distinct distributed systems. Since no major cloud provider offers a cross-region replication latency SLA for object storage, the “Time-to-Consistency” is non-deterministic, often trailing the database by seconds or minutes under load.
+
+2.2
+Motivating Case Study
+
+This research is motivated by a production financial services system requiring multi-region availability for request payloads ranging from 400 KB to 2 MB. The system processes approximately 55 transactions per second. Initial stress testing of the standard S3-Pointer pattern revealed that while database metadata replicated in
+<2
+seconds, S3 payloads frequently lagged by 15–30 seconds. This discrepancy necessitated complex application-side retry logic and exponential backoff, violating the system’s latency Service Level Objectives (SLOs).
+
+3
+The Chunked-Object Pattern
+
+3.1
+Data Model
+
+We represent a logical entity
+E
+with identifier
+id
+as a collection of database items sharing a Partition Key (PK).
+
+•
+
+Metadata Record:
+Stores versioning, checksums, and the total chunk count.
+
+•
+
+Chunk Records:
+Store binary fragments of the payload.
+
+By utilizing the Sort Key (SK) for ordering (e.g.,
+CHUNK#001
+,
+CHUNK#002
+), the database allows efficient retrieval of all fragments via a single range query.
+
+3.2
+Write Protocol
+
+To ensure consistency, we utilize an optimistic locking strategy. The write operation is formalized in Algorithm
+1
+.
+
+Algorithm 1
+
+Chunked-Object Write Protocol
+
+1:
+
+Entity Identifier
+ID
+, Binary Payload
+P
+, Max Chunk Size
+C_{max}
+
+2:
+
+Payload persisted to database
+
+3:
+
+V_{new}\leftarrow\text{GenerateMonotonicVersion}()
+
+4:
+
+Chunks\leftarrow\text{Split}(P,C_{max})
+
+5:
+
+WriteBatch\leftarrow\emptyset
+
+6:
+
+\triangleright
+
+Step 1: Prepare Chunk Items
+
+7:
+
+for
+
+i\leftarrow 0
+
+to
+
+\text{Length}(Chunks)-1
+
+do
+
+8:
+
+Item_{chunk}\leftarrow\{\text{PK}:ID,\text{SK}:\text{CHUNK}\#i,\text{Ver}:V_{new},\text{Data}:Chunks[i]\}
+
+9:
+
+\text{Add }Item_{chunk}\text{ to }WriteBatch
+
+10:
+
+end
+
+for
+
+11:
+
+\triangleright
+
+Step 2: Prepare Metadata Item
+
+12:
+
+Item_{meta}\leftarrow\{\text{PK}:ID,\text{SK}:\text{META},\text{Ver}:V_{new},\text{Count}:\text{Length}(Chunks)\}
+
+13:
+
+\text{Add }Item_{meta}\text{ to }WriteBatch
+
+14:
+
+\triangleright
+
+Step 3: Execute Write
+
+15:
+
+if
+
+\text{Size}(WriteBatch)\leq\text{TransactionLimit}
+
+then
+
+16:
+
+TransactWriteItems
+(
+WriteBatch
+)
+
+17:
+
+else
+
+18:
+
+\triangleright
+Fallback for very large payloads
+
+19:
+
+TwoPhaseWrite
+(
+WriteBatch
+,
+Item_{meta}
+)
+
+20:
+
+end
+
+if
+
+As outlined in Algorithm
+1
+, inclusion of the metadata item in the transactional batch serves as a commit barrier. Readers query the metadata first; if the metadata for version
+V
+exists, the database guarantees (via transactional atomicity) that the corresponding chunks also exist.
+
+For payloads that exceed the transactional item limit,
+TwoPhaseWrite
+first writes chunk records with a provisional status (e.g.,
+status = WRITING
+) and only marks the metadata record as committed (e.g.,
+status = COMMITTED
+) once all chunks have been successfully persisted. Readers ignore versions that are not yet in the COMMITTED state, ensuring that partially written entities are never exposed.
+
+3.3
+Read Path and Reassembly
+
+The read operation performs a query for
+PK = ID
+. This efficiently retrieves the metadata and all chunk items in a single network round-trip (provided the result set fits within the database’s page size). The application validates the chunk count against the metadata before concatenating the binary data. If the number of retrieved chunks does not match the metadata count, or if checksums do not validate, the reader can fall back to a previous version or retry.
+
+3.4
+Applicability to Cosmos DB and Firestore
+
+Although the reference implementation targets DynamoDB, the pattern maps naturally to other managed NoSQL systems:
+
+•
+
+In
+Cosmos DB
+, the partition key plays the role of PK, while a synthetic sort attribute (e.g.,
+type + chunkIndex
+) can act as SK. The chunked-object pattern can take advantage of Cosmos DB’s transactional batch support within a partition and its tunable consistency levels (e.g., Bounded Staleness) to bound replica lag.
+
+•
+
+In
+Firestore
+, chunks can be modeled as documents in a subcollection under a parent document that stores metadata (version, count). Firestore’s strong global consistency simplifies reasoning about versioning and conflict resolution, at the cost of different performance and pricing trade-offs.
+
+In all three systems, the core idea of a metadata record plus ordered chunk records remains unchanged.
+
+4
+Multi-Region Behavior Analysis
+
+We analyze the replication characteristics of the three major cloud providers in Table
+1
+. A consistent finding is that while NoSQL stores offer tunable consistency or low-latency replication, object stores prioritize durability and throughput over replication speed.
+
+Table 1:
+Multi-Region Capabilities of Managed NoSQL Databases
+
+Feature
+
+DynamoDB
+
+Cosmos DB
+
+Firestore
+
+Architecture
+
+Active-Active
+
+Active-Active
+
+Multi-Region Instance
+
+Replication Lag
+
+<1
+s (Eventual)
+
+10–100ms
+
+Sync/Near-Sync
+
+Consistency Model
+
+Eventual
+
+Tunable*
+
+Strong
+
+Active Writes
+
+Multi-Master
+
+Multi-Master
+
+Yes (multi-region instance)
+
+Object Store Peer
+
+S3
+
+Blob Storage
+
+Cloud Storage
+
+Obj. Store Lag SLA
+
+None
+
+None
+
+None
+
+Max Item Size
+
+400 KB
+
+2 MB
+
+1 MB
+
+*Includes Strong, Bounded Staleness, Session, Consistent Prefix, and Eventual.
+
+The key observation from Table
+1
+is the architectural mismatch. While databases like Cosmos DB and DynamoDB enable sub-second cross-region propagation (via log-shipping), the associated object storage services (S3, Blob, Cloud Storage) operate on asynchronous, throughput-optimized queues. This creates a “replication gap” where metadata exists in the destination region before the payload arrives.
+
+5
+Empirical Evaluation
+
+To validate the pattern, we analyzed telemetry data from the production environment described in Section 2.2 over a 6-month period. The system operates two distinct microservices—one utilizing the legacy S3-Pointer pattern and another utilizing the Chunked-Object pattern—processing a combined peak load of approximately 200,000 transactions per hour.
+
+5.1
+Cross-Region Replication Latency
+
+We compared the “Time-to-Consistency” between the S3-Pointer implementation and the Chunked-Object implementation. Figure
+1
+illustrates the replication lag for a 1 MB payload.
+
+p50
+p95
+p99
+0
+10
+20
+30
+0.4
+0.9
+1.8
+1.2
+4.5
+28.5
+Latency (seconds)
+Cross-Region Replication Latency (1MB Payload)
+Chunked-Object
+S3-Pointer
+
+Figure 1:
+Comparison of replication latency. The Chunked-Object pattern (Blue) maintains tight consistency, whereas the S3-Pointer pattern (Red) exhibits significant tail latency (
+p99\approx 28.5s
+) due to asynchronous object replication.
+
+The S3-Pointer pattern exhibited a “long tail” behavior. While median performance was acceptable, the
+p99
+lag extended to nearly 30 seconds during periods of high throughput.
+
+Worst-Case Analysis:
+During peak load windows (
+>200
+k transactions/hour), we observed significant divergence in worst-case behavior. The S3-based microservice experienced replication delays exceeding
+180 seconds (3 minutes)
+for multi-file transactions, resulting in persistent
+404 Not Found
+errors for cross-region consumers. In contrast, the DynamoDB-backed implementation, while also experiencing lag increases due to congestion, remained strictly bounded within
+5 seconds
+. This demonstrates that the chunked pattern offers deterministic upper bounds on consistency even under saturation, whereas object storage replication remains unbounded.
+
+5.2
+The “Dangling Pointer” Race Condition
+
+The disparity in replication speeds illustrated above introduces a critical race condition in active-active architectures. This failure mode, which we term the “Dangling Pointer Hazard,” occurs because the metadata channel is faster than the payload channel.
+
+Figure
+2
+visualizes the race condition. The Reader in Region B receives the metadata almost immediately (
+t_{1}
+) but attempts to fetch the payload (
+t_{2}
+) before S3 replication completes (
+t_{3}
+).
+
+Writer (Reg A)
+DynamoDB
+S3
+Reader (Reg B)
+1. Put Payload
+2. Put Metadata
+3. Replicate (Fast)
+4. Get Metadata (Success)
+5. Get Payload (404 Fail)
+X
+6. Replicate (Slow)
+
+Figure 2:
+Sequence Diagram of the Dangling Pointer Hazard. The Reader in Region B successfully reads the metadata (Step 4) but fails to read the payload (Step 5) because S3 replication (Step 6) lags behind DynamoDB replication.
+
+Table
+2
+quantifies this failure rate. We measured the probability of a
+404
+error when performing a read in the secondary region immediately following the appearance of the metadata.
+
+Table 2:
+Secondary Region Read Failures (Dangling Pointer Errors)
+
+Metric
+
+S3-Pointer
+
+Chunked-Object
+
+Replication Model
+
+Decoupled
+
+Unified
+
+Avg. Lag Delta
+
+4.2
+s
+
+0.0
+s
+
+p99
+Lag Delta
+
+28.5
+s
+
+<0.1
+s
+
+404 Error Rate
+
+12.4%
+
+<
+0.01%
+
+By migrating to the Chunked-Object pattern, the system reduced the cross-region 404 error rate from 12.4% to near zero, validating the hypothesis that unifying the replication stream eliminates the dangling pointer hazard.
+
+6
+Related Work
+
+The concept of splitting large objects is well-established in distributed systems. The Google File System (GFS) utilizes fixed-size chunks to manage large files across distributed nodes
+[
+2
+]
+. Similarly, Log-Structured Merge-trees (LSM), the underlying storage structure for DynamoDB and Cassandra, manage write amplification by segmenting data
+[
+3
+]
+.
+
+The challenge of synchronizing large state across geo-distributed nodes is not unique to databases. Recent work in Edge AI, such as DisCEdge
+[
+8
+]
+, utilizes similar tokenization and replication strategies to ensure user context travels consistently across regions, validating the efficacy of granular data management in high-latency environments. Our work adapts these fundamental principles to the application layer of managed NoSQL databases. While cloud providers advocate for the “Claim Check” pattern (offloading to S3)
+[
+5
+]
+, this paper demonstrates that for active-active multi-region architectures, application-side chunking provides superior consistency guarantees by keeping both metadata and payload within a single replication and consistency domain.
+
+7
+Conclusion
+
+We presented a chunked-object pattern for storing large logical entities in managed NoSQL databases. By retaining data within the database’s replication boundary, the pattern eliminates cross-system race conditions inherent to hybrid storage designs. Production data confirms that this approach significantly improves
+p99
+cross-region consistency latency and availability in active-active topologies.
+
