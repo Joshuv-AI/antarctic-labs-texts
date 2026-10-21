@@ -1,0 +1,1108 @@
+NestedFP: High-Performance, Memory-Efficient Dual-Precision Floating Point Support for LLMs
+Haeun Lee, Omin Kwon, Yeonhong Park, Jae W. Lee
+
+Abstract
+Large Language Models (LLMs) are playing a crucial role in latency-critical, high-throughput services like virtual assistants and code generation. While techniques such as continuous batching and paged attention address service-level objectives (SLOs), and quantization methods accelerate inference, the dynamic and efficient adaptation of precision at runtime remains a significant, largely underexplored challenge. The emergence of hardware support for FP8 arithmetic, offering up to 2 × \times the throughput of FP16, presents an attractive opportunity for interactive LLM serving. However, current approaches like co-deploying FP8 and FP16 models suffer from increased storage overhead and fail to unlock FP8’s full potential. To address these limitations, we introduce NestedFP, a novel precision-adaptive serving technique enabling seamless FP8 and FP16 inference from a single 16-bit model representation, thereby incurring no additional memory cost. NestedFP decomposes each FP16 weight into two 8-bit components, facilitating efficient FP8 execution while preserving full FP16 accuracy. We demonstrate the practical viability of our approach by implementing a custom CUTLASS-based GEMM kernel that reconstructs FP16 operands on-the-fly, integrated within the vLLM serving framework. Our evaluation shows that NestedFP delivers up to 1.55 × \times throughput improvement in FP8 mode with negligible accuracy degradation compared to FP16 precision, while introducing only 3.9% performance overhead on average in FP16 mode across various models. NestedFP thus provides a flexible foundation for dynamic, SLO-aware precision selection, paving the way for more scalable and efficient LLM serving under bursty and heterogeneous workloads.
+
+
+
+1
+Introduction
+
+Large Language Models (LLMs) have emerged as foundational components in modern AI systems, enabling a wide range of applications such as virtual assistants, text and code generation, and multi-modal tasks that integrate textual and visual information. Their broad applicability and strong performance have driven widespread adoption, leading to substantial user demand. For example, OpenAI reportedly generates over a billion words per day—equivalent to more than one million words per second
+marlin
+—with production query rates frequently surpassing 200 requests per second
+scale_llm
+. This widespread deployment in latency-sensitive, user-facing services has intensified the need for inference infrastructures that are not only scalable and efficient, but also capable of satisfying stringent latency and throughput constraints.
+
+The latency of LLM inference is commonly evaluated using two standard metrics: Time To First Token (TTFT), which measures the prefill latency, and Time Per Output Token (TPOT), which captures the average latency for generating each output token. For interactive applications, industry-standard service-level objectives (SLOs) typically require TTFT to be under 200 ms and TPOT to remain below 33.3 ms in order to ensure a responsive user experience
+baseten_slo
+. To meet these stringent latency targets under growing demand, several optimization techniques have been proposed. ORCA
+orca
+introduces efficient batching mechanisms that consolidate linear layer execution across both the prefill and decode phases. PagedAttention
+paged_attention
+addresses memory inefficiencies arising from unpredictable output sequence lengths by reducing over-allocation, thereby increasing the number of concurrently served requests. More recently, Sarathi-Serve
+sarathi_serve
+proposes chunked execution of the prefill phase and constructs hybrid batches combining prefill and decode requests to further improve scheduling efficiency.
+
+Recent studies have shown that the FP8 format can achieve accuracy comparable to FP16 across a variety of large language model tasks
+fp8_formats_for_deep_learning
+;
+training_and_inference_llm_fp8
+;
+efficient_ptq_fp8
+. The introduction of native FP8 support on modern accelerators—such as NVIDIA Hopper GPUs and Intel Gaudi HPUs—has made FP8 increasingly practical for large-scale inference. On NVIDIA Hopper, FP8-compatible tensor cores can offer up to 2× higher peak throughput compared to their FP16 counterparts, making FP8 particularly advantageous for latency-sensitive or bursty workloads. In this work, we propose leveraging both FP8 and FP16 representations to better satisfy service-level objectives (SLOs). However, co-deploying models in both formats is non-trivial, as it is difficult to ensure robust accuracy and performance without introducing additional storage overhead beyond the originally required 16-bit model.
+
+We present NestedFP, a technique that enables dynamic selection between FP8 and FP16 precision from a single, unified model representation. By analyzing the value distribution of FP16 weights, our approach restructures each weight tensor into two 8-bit components, enabling accurate FP16 reconstruction while supporting efficient FP8 execution—all with no additional memory storage. To realize this format, we develop a custom General Matrix Multiplication (GEMM) kernel built on the CUTLASS library
+cutlass
+, which reconstructs FP16 values from the two 8-bit components on-the-fly during GEMM kernel execution. The kernel incurs an average performance overhead of 6.47% across varying GEMM shapes, relative to the vanilla CUTLASS kernels, respectively. Moreover, our 8-bit tensor for FP8 inference achieves FP8 inference accuracy comparable to that of standard FP8 quantized models.
+
+We integrate our custom kernel into the vLLM serving framework
+vllm
+and show that it incurs only 3.90% end-to-end performance overhead on average across models in FP16 mode, while delivering up to 1.55
+\times
+performance improvements when executing in FP8 mode. NestedFP provides a flexible and memory-efficient foundation for adaptive precision serving, making it well-suited for fluctuating request rates and stringent latency constraints.
+
+2
+Background
+
+2.1
+Floating Point Representation
+
+A floating point format with
+x
+exponent bits and
+y
+mantissa bits is denoted as E
+x
+M
+y
+. The exponent width
+x
+determines the dynamic range of representable values, while the mantissa width
+y
+governs numerical precision. A floating point value
+X_{FP}
+in this format can be expressed as shown in Equation
+1
+, where
+S
+is the sign bit,
+M_{j}
+are the mantissa bits,
+E
+is the unsigned integer formed by the exponent bits, and
+b
+is the exponent bias.
+
+X_{FP}=(-1)^{S}\cdot\left(1+\sum_{j=1}^{y}M_{j}\cdot 2^{-j}\right)\cdot 2^{E-b},\hskip 9.24994ptE\in\{0,1,\ldots,2^{x}-1\}
+
+(1)
+
+Commonly used 16-bit formats include FP16 (E5M10) and BF16 (E8M7), while prevalent 8-bit formats include E4M3 and E5M2. These formats are natively supported by many modern hardware platforms and have become standard choices in low-precision machine learning computations
+investigation_fp8_across_accelerators
+.
+
+2.2
+FP8 Quantization for LLMs
+
+Rise of FP8 Quantization for LLMs.
+
+While FP16 has become the de facto standard for LLM serving, 8-bit floating-point formats (FP8) are gaining traction for scenarios demanding even greater efficiency. This trend is driven by two main factors: (1) the representational advantages of floating-point formats, and (2) the increasing hardware support for FP8 arithmetic.
+
+First, floating-point quantization is generally better suited for LLMs than integer quantization due to its wider dynamic range. Unlike in computer vision tasks—where integer quantization is prevalent—LLMs often exhibit activation outliers amplified by operations such as LayerNorm
+efficient_ptq_fp8
+. These outliers can significantly degrade model performance if not properly managed
+investigation_fp8_across_accelerators
+. Although recent work has attempted to mitigate this issue in integer quantization through static outlier-aware techniques
+efficient_ptq_fp8
+;
+smoothquant
+, these methods still underperform compared to floating-point quantization, which inherently better accommodates long-tailed distributions and high dynamic ranges
+llm_fp4
+;
+fp8_formats_for_deep_learning
+;
+int_or_fp
+.
+
+Second, FP8 support is rapidly being adopted by modern hardware accelerators, including NVIDIA Hopper GPUs and Intel Gaudi HPUs
+investigation_fp8_across_accelerators
+. Leveraging this support, FP8 GEMM operations can achieve up to
+2\times
+speedup compared to their FP16 counterparts. This growing availability is accelerating the adoption of floating-point quantization—particularly FP8—further highlighting its relevance for efficient LLM deployment.
+
+E4M3 Format.
+
+Among the two widely adopted FP8 formats—E4M3 and E5M2—existing studies have consistently shown that E4M3 yields higher inference accuracy for Transformer-based language models
+fp8_formats_for_deep_learning
+;
+efficient_ptq_fp8
+;
+hybrid_fp8_training_and_inference
+. However, due to its reduced dynamic range compared to FP16, the effectiveness of E4M3 critically depends on the application of appropriate scaling strategies
+the_power_of_exponent
+;
+fp8_formats_for_deep_learning
+;
+hybrid_fp8_training_and_inference
+. Scaling is applied to align the dynamic range of tensor values with the numerical bounds of the E4M3 format. Scaling factors may be determined statically—based on heuristics such as the absolute maximum, percentile clipping, or mean squared error (MSE) minimization
+fp8_formats_for_deep_learning
+—or computed dynamically during runtime. Weight tensors are typically scaled statically on a per-channel basis
+llm_fp4
+;
+efficient_ptq_fp8
+;
+int_or_fp
+, most commonly using the absolute maximum value. Activation tensors, by contrast, may be scaled offline on a per-tensor basis
+llm_fp4
+;
+efficient_ptq_fp8
+;
+int_or_fp
+or dynamically on a per-token basis during inference. While the latter approach can improve accuracy, it incurs additional runtime cost due to the overhead of computing scaling factors on-the-fly
+investigation_fp8_across_accelerators
+;
+training_and_inference_llm_fp8
+.
+
+FP8 Results.
+
+While FP8 quantization offers significant efficiency benefits and shows promising results, it still lags behind FP16 in terms of accuracy. Table
+1
+presents a comparison between FP8 and FP16 across various benchmarks that require sophisticated reasoning capabilities. The FP8 results are obtained using the vLLM framework
+vllm
+, with E4M3 quantization applied using per-channel weight scaling and per-token activation scaling based on absolute maximum value. Quantization is applied exclusively to linear layers, with embedding layers left in higher precision. FP8 generally exhibits a measurable drop in accuracy, highlighting its current limitations for tasks that demand high output fidelity.
+
+Llama 3.1 8B
+
+Mistral Nemo
+
+Phi-4
+
+Mistral Small
+
+FP16
+
+FP8
+
+\Delta
+
+FP16
+
+FP8
+
+\Delta
+
+FP16
+
+FP8
+
+\Delta
+
+FP16
+
+FP8
+
+\Delta
+
+Minerva Math
+
+18.1
+
+17.6
+
+-
+0.54
+
+17.1
+
+16.9
+
+-
+0.20
+
+42.7
+
+42.9
+
++
+0.16
+
+35.4
+
+34.6
+
+-
+0.84
+
+MMLU Pro
+
+33.3
+
+32.8
+
+-
+0.49
+
+35.4
+
+34.9
+
+-
+0.44
+
+53.1
+
+52.7
+
+-
+0.37
+
+54.3
+
+53.6
+
+-
+0.71
+
+BBH
+
+39.5
+
+38.6
+
+-
+0.83
+
+41.7
+
+41.2
+
+-
+0.49
+
+27.5
+
+27.1
+
+-
+0.38
+
+52.5
+
+51.8
+
+-
+0.65
+
+Table 1
+:
+Downstream task accuracy for FP8 quantized models relative to FP16 models.
+
+3
+Motivation
+
+3.1
+Challenge: Dynamic Resource Demand in LLM Serving
+
+LLM serving is characterized by substantial variability in request rates, as well as input prompt and output sequence lengths across requests
+andes
+;
+hygen
+. These variability is particularly problematic because the batch size scheduled at each iteration can fluctuate significantly, directly affecting the large deviations in TTFT and TPOT. Such fluctuations occur in a highly dynamic and often unpredictable manner
+llumnix
+, making it difficult for service providers to consistently meet service-level objectives (SLOs).
+
+To quantify the extent of this variability, we analyzed production traces from Microsoft Azure’s LLM inference service
+azure_llm_inference_trace
+. These traces contain timestamps of incoming requests, from which we constructed the per-second request rate on May 10, 2024, as shown in Figure
+1
+. Our analysis reveals that the request rate ranged from 0 to 100 requests/s across the entire day, and exhibited intra-day variations of up to 5.8-fold within the most variable 1-hour window (14:00–15:00 UTC; min: 17, max: 98) and 3.2-fold within the most variable 1-minute window (18:12–18:13 UTC; min: 31, max: 98).
+
+To cope with such highly variable request patterns, auto scaling is a commonly used to automatically adjusts computational resources based on real-time demand
+auto_scaling
+. However, auto scaling is feasible mainly in cloud environments with sufficient available resources, and is typically limited to time scales of few minutes to hours
+auto_scaling_timescale
+. Therefore, it struggles to respond effectively to sharp second-level spikes and is infeasible for adjusting hardware at millisecond-level intervals.
+
+In contrast, LLM serving systems operate on a continuous batching basis
+orca
+, where requests are scheduled at the granularity of iteration steps usually every tens to hundreds of milliseconds.
+As the batch size of each step directly impacts token-level latency, variability in request rates must therefore be evaluated at the same short-term timescale.
+Therefore, high variability within second-level time scales can cause substantial fluctuations in TTFT and TPOT, underscoring the need for serving strategies that can operate effectively at finer timescales, independent of slower hardware scaling mechanisms.
+
+(a)
+
+(b)
+
+Figure 1
+:
+(a) Request rates fluctuations observed on May 10, 2024 from Azure LLM inference trace. (b) Comparison of p90 TPOT across different model precisions, using the Azure LLM inference trace recorded on May 10, 2024.
+
+3.2
+Our Proposal: Dual-Precision LLM Serving
+
+To address short-term fluctuations in resource demand during LLM serving, we propose a simple yet effective dual-precision strategy that dynamically switches between FP16 and FP8 execution. When system load is low, FP16 is used to preserve maximum model quality. Under high load conditions, the system falls back to FP8 execution to reduce computational and memory overhead, thereby maintaining responsiveness. Although FP8 may incur slight accuracy degradation, it is preferable to violating SLOs during periods of request surges.
+
+Figure
+1
+shows p90 TPOT under three precision modes—FP16, FP8, and our dual-precision scheme—using the Llama 3.1 8B model with vLLM on an H100 GPU. Request patterns are based on Microsoft Azure’s LLM inference trace
+azure_llm_inference_trace
+, downscaled to 20%. During the 60-second interval with fluctuating load (1–11 req/s, avg. 5.05 req/s), FP16 incurs 19 seconds of SLO violation (TPOT > 33 ms), while FP8 reduces this to 8 seconds. Our dual-precision strategy maintains the same SLO compliance as FP8 while preserving FP16 accuracy for over 68% of the time. This demonstrates its effectiveness in improving latency robustness without sacrificing model quality.
+
+3.3
+How to Implement Dual-Precision LLM Serving?
+
+To enable adaptive use of both FP8 and FP16 precision in LLM serving, two straightforward implementation strategies can be considered: separate storage and on-the-fly dequantization.
+
+Separate Storage.
+
+One simple approach is to maintain both FP8 and FP16 models in memory and switch between them based on task requirements. While this enables the on-demand selection between lower- and higher-precision models, it results in a 50% memory overhead—an impractical burden for LLM serving systems already constrained by model size. This memory capacity overhead not only limits the maximum model size that can be deployed but also reduces the available memory for key-value (KV) caching, thereby restricting the number of concurrent requests and degrading overall serving throughput.
+
+On-the-fly Quantization.
+
+An alternative approach is to store only the FP16 model and perform on-the-fly quantization to enable execution on FP8 tensor cores. Unlike the separate storage method, this approach avoids additional memory capacity overhead. However, it can lead to severely suboptimal GEMM performance in FP8 mode. Despite executing in 8-bit precision, the full 16-bit weights must still be fetched from memory, effectively doubling memory traffic compared to native FP8 execution. As a result, memory bandwidth becomes a bottleneck, limiting the potential throughput gains of FP8 and negating its advantages over the FP16 baseline.
+
+These limitations highlight the need for a more sophisticated dual-precision serving mechanism—one that eliminates additional memory overhead while enabling efficient GEMM execution in both FP16 and FP8 modes.
+
+4
+NestedFP
+
+4.1
+NestedFP Overview
+
+For efficient dual-precision LLM serving, we propose NestedFP, a scheme that stores only 16-bit weights in memory and extracts 8-bit upper tensor from them when operating in FP8 mode. This approach not only avoids additional memory usage, but also prevents memory traffic amplification—such as fetching 16-bit weights when performing 8-bit GEMM. Figure
+2
+illustrates the core concept of NestedFP, which addresses the following two key challenges to make this approach viable.
+
+First, the extracted 8-bit representation must maintain accuracy comparable to existing FP8 quantization methods. Naively truncating the upper 8 bits of FP16 values (which use the E5M10 format) produces a low-precision representation similar to E5M2, which offers limited precision compared to the commonly preferred E4M3 format for LLM inference. Note that FP16 is basically E5M10. Moreover, this naive truncation often performs worse due to indiscriminate rounding, further degrading accuracy. This motivates the need for a quantization-aware format that simultaneously supports both FP16 and FP8 execution. Section
+4.2
+elaborates on this data format design.
+
+Second, kernel efficiency must be maintained across both precisions. Achieving this requires storing the two 8-bit halves of each 16-bit weight as separate tensors. On H100 GPUs, where DRAM is accessed in 64-byte units, extracting individual bytes from packed 16-bit data results in wasted bandwidth. Separating the 8-bit components enables efficient FP8 execution using a single tensor, while FP16 models require reconstructing the original 16-bit weights via a custom GEMM kernel that dynamically fuses the components at runtime. Section
+4.3
+details this kernel design.
+
+Figure 2
+:
+FP16 weight is first pre-processed into 8-bit Upper and Lower parts. Both parts are used for FP16 model execution while only Upper part is used for FP8 model execution.
+
+4.2
+Compact yet Effective Data Format for Dual-Precision LLM
+
+Opportunities: Low-Entropy Exponent Bit in FP16 Models.
+
+Figure
+3
+shows the the weight distributions of FP16 linear layers—including QKVO projections and MLPs—across four different LLMs. The vast majority of weight values have absolute magnitudes less than or equal to 1.75, which means that their most significant exponent bits in FP16 are zero. Specifically, as shown in Figure
+3
+, three of the four evaluated models exhibit this trait across all layers. The sole exception, Phi-4, contains some layers that deviate from this pattern, but these account for only 8.75% of its layers. This strong tendency suggests an opportunity for lossless exponent mapping from FP16 to the FP8 E4M3 format, which also uses 4 exponent bits.
+
+(a)
+
+Min
+
+Max
+
+NestedFP Applicable Layers
+
+Llama 3.1 (8B)
+
+-0.92
+
+0.91
+
+128 of 128 (100%)
+
+Mistral Nemo Base (12B)
+
+-0.92
+
+0.95
+
+160 of 160 (100%)
+
+Phi-4 (14B)
+
+-3.60
+
+3.89
+
+146 of 160 (91.25%)
+
+Mistral Small Base (24B)
+
+-0.49
+
+0.45
+
+160 of 160 (100%)
+
+(b)
+
+Figure 3
+:
+(a) Weight distributions of linear layers across different models. (b) Per-model weight range (min/max) and count of linear layers eligible for NestedFP quantization.
+
+Our Proposal.
+Leveraging the unused exponent bit in FP16, NestedFP restructures FP16 values so that high-quality E4M3 representations can be directly extracted. Figure
+4
+a illustrates the refactoring process. The lower 8 bits of new format of NestedFP is simply constructed by inheriting lower 8 bits of the FP16 mantissa. The upper 8 bits are formed from the sign bit and 4 exponent bits (excluding the most significant bit of the FP16 exponent) of the original FP16 value, along with a 3-bit mantissa obtained by quantizing its 10-bit mantissa.
+
+This simple mapping scheme introduces a fixed scaling factor determined by the difference in exponent bias between the FP16 and E4M3 formats, which is
+2^{8}
+. In other words, NestedFP effectively applies E4M3 quantization with a scaling factor of
+2^{8}
+. To quantize the 10-bit FP16 mantissa down to 3 bits, we employ a round-to-nearest-even strategy. Specifically, we examine the 7 least significant bits of the FP16 mantissa (i.e., bits M[4:10]) to determine whether the value lies above or below the midpoint (64). If the value is greater than 64, we round up. If the value equals 64, we round up only when the least significant bit of the resulting 3-bit mantissa (M3) is 1. If the value is less than 64, we round down. This division process is done offline prior to model execution.
+
+FP8 GEMM can be performed directly using the upper 8 bits, whereas FP16 GEMM requires online reconstruction of 16-bit values, introducing additional complexity. Figure
+4
+b illustrates this reconstruction process. Essentially, it concatenates the upper 8 bits and lower 8 bits, but not by simple concatenation. The earlier rounding decision must be reversed by checking an implicit checksum; if the LSB of the upper 8 bits differs from the MSB of the lower 8 bits, a rounding-down correction is applied before recombining the exponent and mantissa bits into a valid FP16 value. This process ensures precise, lossless recovery of the original FP16 values.
+
+(a)
+
+Refactoring to NestedFP
+
+(b)
+
+Reconstruction of FP16
+
+Figure 4
+:
+(a) Pre-processing FP16 weight value into two 8-bit NestedFP components (Offline). (b) On-the-fly reconstruction of FP16 weight values for tensor core execution (Online).
+
+Handling Exception Layers.
+Since most models do not contain weights with absolute values exceeding 1.75, we leave these values in their original FP16 format without pre-processing. As a result, the corresponding layers are always executed in FP16, consistent with standard FP16 model execution. As shown in Sections
+5
+, this exception handling preserves both model accuracy and end-to-end performance, as these layers constitute only a small portion of the total linear layers.
+
+4.3
+GPU Kernel Design
+
+While executing FP8 GEMM in NestedFP is straightforward—simply performing GEMM on the NestedFP upper tensor, FP16 GEMM is more complex. Figure
+6
+illustrates the FP16 GEMM process in both a standard FP16 CUTLASS kernel and the NestedFP16 kernel. In the standard FP16 kernel, weights are loaded into shared memory, transferred to registers, and directly consumed by tensor cores without any transformation. In contrast, the FP16 path in NestedFP requires a reconstruction step before tensor core execution; weights are stored as two 8-bit tensors, which must be loaded into shared memory, copied to registers, and then reconstructed into full FP16 values through SIMT-level bitwise operations. Only after this reconstruction can the data be used by the tensor cores.
+
+This additional step introduces a source of overhead absent in traditional FP16 pipelines. To prevent it from becoming a performance bottleneck, SIMT operations must be highly efficient, and their latency must be effectively hidden within the broader compute pipeline. We present two key optimization strategies to address this challenge: (1) SIMT operation optimization and (2) pipelining and scheduling optimizations to prevent SIMT operations from stalling the tensor core pipeline.
+
+SIMT Reconstruction Operation Optimization.
+
+To mitigate the overhead introduced by SIMT operations, we fuse four 8-bit bitwise operations into a single 32-bit operation, following a strategy similar to
+any_precision_llm
+;
+fp6_llm
+. As shown in Figure
+6
+, the reconstruction process combines two 8-bit tensors,
+W_{1}
+and
+W_{2}
+, stored in registers, into a full 16-bit FP16 weight. It begins with a correction step for
+W_{1}
+, followed by dropped
+E_{1}
+restoration, and ends with the final fusion of
+W_{1}
+and
+W_{2}
+. In this scheme, the lower 8 bits of the FP16 mantissa,
+M[3:10]
+, are taken directly from
+W_{2}
+. The upper tensor,
+W_{1}
+, contains
+E[2:5]
+and
+M[1:2]
+, which may require correction depending on rounding. Rounding is detected using a checksum condition: the LSB of
+W_{1}
+(
+M_{3}^{\prime}
+) and the MSB of
+W_{2}
+(
+M_{3}
+) should match. If
+M_{3}^{\prime}=1
+and
+M_{3}=0
+, no correction is needed for
+E[2:5]
+and
+M[1:2]
+. If
+M_{3}^{\prime}=0
+and
+M_{3}=1
+, rounding may have corrupted
+E[2:5]
+and
+M[1:2]
+, and correction is applied by subtracting 1 at the
+M_{3}
+bit position.
+To unify both cases and eliminate branching, we apply a branch-free correction; by subtracting
+M_{3}
+from
+W_{1}
+and taking only bits that corresponds to bit position
+E[2:5]
+and
+M[1:2]
+from
+W_{1}
+. Omitted zero is then restored and the full FP16 value is reconstructed using NVIDIA’s __byte_perm instruction.
+
+Figure 5
+:
+FP16 execution flow comparison.
+
+Figure 6
+:
+Algorithm of SIMT-Efficient Bitwise Reconstruction of FP16 Weights.
+
+Pipelining and Scheduling Optimizations.
+
+The standard FP16 GEMM kernel sources weight elements from registers and employs a two-stage pipeline, overlapping shared memory-to-register transfers with tensor core execution. Following prior work that integrates SIMT operations into the tensor core pipeline
+fp6_llm
+, we extend this design to a three-stage pipeline that concurrently overlaps register to shared memory transfers, SIMT operations, and tensor core execution. However, simply adopting a three stage pipeline is insufficient to fully hide the overhead of SIMT operations. Through empirical analysis, we find that distinct optimization strategies are required for non-cooperative and cooperative kernels. In the non-cooperative kernel, four warps jointly execute a single warp group MMA (Matrix Multiply Accumulate), whereas the cooperative kernel employs eight warps to execute two warp group MMAs concurrently.
+
+While shared memory transfers and tensor core executions are asynchronous operations—allowing subsequent instructions to be issued without waiting for completion—SIMT operations are synchronous and block instruction issue during their execution. In the non-cooperative kernel, we advance the scheduling of shared memory to register transfers relative to the naive three stage pipeline and issue multiple copies in bulk. This approach not only allows multiple shared memory to register copy concurrent with SIMT execution, but also allows SIMT instruction to be issued without delay as operands are pre-loaded into registers. However, in the cooperative kernel, which leverages additional compute parallelism by executing two warp group MMAs concurrently, warp groups contend for shared resources such as SIMT pipelines, tensor core pipelines, and shared memory bandwidth. This contention reduces the effectiveness of the optimizations used in the non-cooperative kernel. To address this, we explored several alternatives and found that inserting a compiler-level fence—specifically, an NVVM code motion barrier—after the transformation stage significantly improves performance. This fence inhibits compiler optimizations that may delay or reorder memory operations and serves as a signal for the imminent use of a transformed input in a register, preventing the compiler from eliminating or deferring its materialization.
+
+5
+Evaluation
+
+5.1
+NestedFP8 Accuracy
+
+To evaluate the accuracy of our NestedFP8 model, we compare it with an FP8 model using commonly adopted quantization configurations—per-channel weight quantization and per-token activation quantization, both scaled by the absolute maximum value.
+We evaluate on four models (Llama 3.1 8B, Mistral Nemo (12B), Phi-4 (14B), and Mistral Small(24B)) using three downstream tasks: Minerva Math, MMLU Pro, and BBH. All models are integrated into the vLLM framework, and accuracy is assessed using the LM Evaluation Harness
+lm-evaluation-harness
+framework. As noted in Section
+4.2
+, 8.75% of linear layers in Phi-4 are not applicable to NestedFP and are thus executed in FP16. Our method internally applies a single global scaling factor (256) to all weight tensors. For activation quantization, we apply per-tensor scaling based on the absolute maximum value. As shown in Table
+2
+, our method achieves accuracy comparable to the FP8 baseline despite foregoing fine-grained quantization, demonstrating that NestedFP8 can preserve accuracy.
+
+Llama 3.1 8B
+
+Mistral Nemo
+
+Phi-4
+
+Mistral Small
+
+FP8(B)
+
+FP8(N)
+
+FP8(B)
+
+FP8(N)
+
+FP8(B)
+
+FP8(N)
+
+FP8(B)
+
+FP8(N)
+
+Minerva Math
+
+17.6
+
+17.2
+
+16.9
+
+16.8
+
+42.9
+
+41.3
+
+34.6
+
+35.7
+
+MMLU Pro
+
+32.8
+
+33.0
+
+34.9
+
+35.0
+
+52.7
+
+53.3
+
+53.6
+
+53.7
+
+BBH
+
+38.6
+
+38.8
+
+41.2
+
+40.6
+
+27.1
+
+27.9
+
+51.8
+
+51.4
+
+Table 2
+:
+Accuracy comparison between FP8 baseline and NestedFP8. FP8(B) denotes FP8 baseline, and FP8(N) denotes NestedFP8.
+
+5.2
+NestedFP16 Kernel Performance
+
+Comparison over Vanilla FP16 Kernel.
+
+To compare the performance of NestedFP16 kernel with normal FP16 GEMM kernel fairly, we implemented a highly optimized FP16 baseline using the same CUTLASS codebase. This baseline selects the best configuration for each GEMM shape through exhaustive search over the design space, closely matching cuBLAS performance (validated in Appendix).
+Our kernel design space includes non-cooperative and cooperative variants. For non-cooperative kernels, we perform a grid search over tile shapes with
+T_{m}\in{16,32,64,128,256}
+,
+T_{n}\in{64,128,256}
+, and
+T_{k}\in{64,128,256}
+. Cooperative kernels use larger tiles (
+T_{n}\in{128,256}
+), and configurations that fail to compile are excluded. Non-cooperative kernels use
+(1,1,1)
+clusters, while cooperative ones use
+(2,1,1)
+, assigning two thread blocks per GPU Processing Cluster. We use the standard data parallel scheduler for non-cooperative kernels and both the standard data parallel and Stream-K
+streamk
+schedulers for cooperative ones. All benchmarks are conducted on an NVIDIA H100 SXM GPU.
+
+Our NestedFP16 kernels are optimized using the same design space as the FP16 baseline, ensuring that each GEMM shape is paired with its optimal kernel configuration. We benchmark both kernels across all linear-layer GEMM shapes used in LLaMA 3.1–8B, Mistral Nemo, Phi-4, and Mistral Small, each of which involves four distinct
+(N,K)
+shapes. The batch dimension
+(M)
+, determined by the number of input tokens during inference, is swept from 32 to 2048 in increments of 32, yielding a total of 882 GEMM configurations across 14 unique
+(N,K)
+shapes.
+
+Figure
+7
+compares the performance of the largest
+(N,K)
+GEMM configurations across the four models.
+As shown, our kernel consistently maintains low SIMT overheads across all
+M
+values.
+Compared to the CUTLASS baseline, the average relative overheads across all GEMM configurations of each model are 5.69% (LLaMA 3.1–8B), 6.83% (Mistral Nemo), 6.65% (Phi-4), and 6.71% (Mistral Small).
+Additional results for other GEMM shapes, as well as comparisons with PyTorch W16A16 kernels, which exhibit similar trends, are provided in Appendix. While certain kernel performance regarding certain
+M
+show more variability, the average overhead remains modest, demonstrating the practicality of our approach across diverse shapes in real LLM inference scenario.
+
+Impact of Optimization Techniques.
+
+To quantify the impact of successive kernel-level optimizations, we measure latency for a matrix multiplication of shape
+M\times 5120\times 32768
+. Figure
+7
+illustrates the latency reduction achieved across three optimization stages. Level 1 introduces a three-stage pipeline that overlaps shared memory transfers with SIMT execution and tensor core operations.
+Level 2 incorporates SIMT-level FP16 reconstruction optimization. This transition yields a substantial 38.3% reduction in latency relative to Level 1. Level 3 applies additional pipelining and scheduling optimizations resulting in a further 11.0% reduction compared to Level 2. Each stage contributes a measurable improvement, highlighting the cumulative benefits of the proposed optimization strategies.
+
+(a)
+
+(b)
+
+Figure 7
+:
+(a) CUTLASS baseline and NestedFP16 kernel performance comparison. (b) Kernel latency reduction with different levels of optimization strategies.
+
+5.3
+End-to-End Performance
+
+We integrated NestedFP into the vLLM framework as a quantization configuration.
+The system supports per-iteration precision switching, allowing the scheduler to dynamically select FP16 or FP8 based on workload and SLO demands.
+To ensure fair comparison, both FP16 baselines and NestedFP models were compiled using the vLLM 0.8.3 V1 engine and PyTorch 2.6.0+cu12.4. Experiments were run on a single NVIDIA H100 GPU with fixed request sizes (256 input, 512 output tokens) and batch sizes (
+M
+) ranging from 32 to 512 to assess throughput scaling. Throughput is reported in tokens per second (tok/s).
+Figure
+8
+shows end-to-end performance under FP16 and NestedFP. The FP16 runs use torch.matmul, which dispatches to cuBLAS by default within the vLLM framework. Compared to this baseline, NestedFP16 introduces only minor overhead—4.50% (LLaMA 3.1–8B), 4.51% (Mistral Nemo), 2.69% (Phi-4), and 3.91% (Mistral Small)—generally lower than kernel-level overheads, likely due to amortization across non-GEMM components. In contrast, NestedFP8 achieves clear speedups over NestedFP16: 1.24
+\times
+, 1.32
+\times
+, 1.29
+\times
+, and 1.53
+\times
+, respectively. Larger models gain more, reflecting the growing cost of matrix multiplication. Overall, NestedFP improves efficiency for large-scale LLMs.
+
+Figure 8
+:
+End-to-end performance comparison with four models using FP16, NestedFP16 and NestedFP8.
+
+6
+Conclusion
+
+In this paper, we introduce NestedFP, a precision-aware serving framework designed to better satisfy service-level objectives (SLOs) under dynamic request conditions. We propose a novel approach for decomposing FP16 weights into two 8-bit tensors, enabling one to be used directly as an FP8 representation. Our FP8 format achieves accuracy comparable to that of standard quantized FP8 models. In addition, we develop a custom 16-bit GEMM kernel tailored to this dual-format representation. Experimental results show that our kernel achieves an average performance gap of 6.47% compared to the CUTLASS baseline kernel. Furthermore, by integrating our method into the vLLM framework, we observe up to 1.55
+\times
+speedup in FP8 model execution relative to FP16 model execution, while incurring average 3.90% overhead across models when executing in FP16 mode. These results demonstrate that NestedFP successfully bridges the gap between FP16 accuracy and FP8 efficiency, requiring the same memory footprint as a standard FP16 model while supporting both precision modes. By enabling iteration-level precision selection, our approach allows production LLM serving systems to dynamically balance performance and accuracy requirements under varying workload conditions, providing a flexible and efficient solution for real-world deployment scenarios.
+
+Appendix A
+Evaluation Details
+
+We conducted our evaluation using the Mistral Nemo Base 2407 and Mistral Small 24B Base 2501 models. For accuracy assessment, we employed the Math Verify Metric on the Minerva Math task, the Open LLM Leaderboard configuration (5-shot, multiple choice) for the MMLU Pro task, and a zero-shot evaluation setting for the BBH task. Kernel performance was measured using NVIDIA Nsight Compute. In order to get optimal kernel, we padded activation in the multiple of tile dimension
+T_{m}
+as it provides more robust performance. During performance measurement, we flushed all caches using the cache-control option, but did not fix the GPU clock frequency using the clock-control option.
+
+Appendix B
+Extended Kernel Performance for NestedFP16
+
+Figure 9
+:
+Performance comparison between our CUTLASS baseline and NestedFP16 kernel across 14 unique
+(N,K)
+GEMM shapes. Each subplot represents a different shape configuration, with batch size
+(M)
+on the
+x
+-axis and latency on the
+y
+-axis.
+
+Figure
+9
+compares our method against the CUTLASS FP16 baseline across all 14 GEMM shapes for the four evaluated models: Llama 3.1 8B, Mistral Nemo, Phi-4, and Mistral Small. The matrix dimension
+M
+is varied in increments of 32, ranging from 32 to 2048. Our results show that NestedFP consistently incurs only moderate overhead across all GEMM configurations, with an average performance difference of 6.1%. The per-graph average overhead ranges from 4.3% to 7.2%, demonstrating stable performance regardless of matrix shape. This consistency highlights the effectiveness of our kernel-level optimizations.
+
+Appendix C
+Extended End-to-End Throughput Evaluation
+
+(a)
+
+(32, 512)
+
+(b)
+
+(1024, 512)
+
+(c)
+
+(32, 32)
+
+(d)
+
+(1024, 32)
+
+Figure 10
+:
+Extended end-to-end throughput evaluation across different input/output token configurations. Each subplot shows throughput comparison for FP16, NestedFP16, FP8 and NestedFP8 across four models (Llama 3.1 8B, Mistral Nemo, Phi-4, Mistral Small) under different request size settings: (a) 32 input, 512 output tokens (b) 1024 input, 512 output tokens (c) 32 input, 32 output tokens and (d) 1024 input, 32 output tokens.
+
+We extend our end-to-end evaluation to further demonstrate the robustness of NestedFP. Figure
+10
+presents results for four additional input/output configurations: (32, 512), (1024, 512), (32, 32), and (1024, 32). Across all settings, NestedFP16 exhibits minimal overhead compared to the FP16 baseline, with an average degradation of 3.88% and a maximum of 8.22%. On a per-model basis, the average overhead is 5.15% for LLaMA 3.1 (8B), 4.19% for Mistral-Nemo (12B), 3.35% for Mistral-Small (24B), and 2.81% for Phi-4 (14B). In contrast, NestedFP8 achieves significant speedups over NestedFP16, with average throughput gains of 1.26
+\times
+for LLaMA 3.1, 1.33
+\times
+for Mistral-Nemo, 1.53
+\times
+for Mistral-Small, and 1.36
+\times
+for Phi-4 across all input/output shapes. Notably, the largest model, Mistral-Small, benefits the most from the NestedFP8 quantization. These results indicate that the performance gains of NestedFP are consistent and robust across a wide range of input/output configurations.
+
+When compared to Torch FP8, NestedFP8 maintains competitive performance, achieving 96.84% of Torch FP8’s throughput for LLaMA 3.1, 97.76% for Mistral-Nemo, 98.79% for Mistral-Small, and 96.77% for Phi-4. Our limited search space shows potential gain that can be achieved with further FP8 kernel optimization. We note that we did adopt Stream-K scheduling for NestedFP8.
+
+Our evaluation setup mirrors the configuration used in the main throughput experiments. All tests were conducted on a single NVIDIA H100 GPU using the vLLM 0.8.3 V1 engine with PyTorch 2.6.0+cu12.4 for both the baseline and our proposed NestedFP implementations. Chunked prefill, enabled by default in the vLLM V1 engine, was used throughout the evaluation. This feature segments the prefill phase into smaller chunks, which are processed concurrently with decoding tokens within the same batch. At each iteration, the GEMM operation shape
+(M,N,K)
+is determined based on the number of tokens grouped in that step, with
+M
+denoting the total token count. To systematically evaluate throughput under different batch sizes, we adjusted the max_num_batched_token and max_num_seqs parameters to constrain the batch size accordingly.
+
+Appendix D
+CUTLASS FP16 GEMM Kernel
+
+We extend the open-source NVIDIA CUTLASS 3.6 library to support our custom format. We begin by describing the efficient design of GEMM kernels within CUTLASS for the NVIDIA H100 GPU and introduce key components that define our design space. In the following section, we benchmark our CUTLASS kernels against PyTorch to validate strong performance of CUTLASS baseline.
+
+D.1
+GEMM Kernel Design
+
+(e)
+
+(f)
+
+(g)
+
+Figure 11
+:
+(a) Data parallel scheduling. A single output tile is processed by a single thread block. (b) Stream-K scheduling. A single output tile is processed collaboratively across multiple thread blocks. (c) DRAM to shared memory copy handled by 4 warps in producer warp group and TMA engine.
+
+(a)
+
+(b)
+
+Figure 12
+:
+(a) Non-cooperative kernel. A single warp group is responsible for processing entire input tile. (b) Cooperative kernel. Two warp groups are each responsible for processing half of the first input tile and corresponding output tile.
+
+GEMM operates on a weight matrix of shape
+N\times K
+and an activation matrix of shape
+M\times K
+. To parallelize this computation, CUTLASS partitions the input matrices into tiles of size
+T_{n}\times T_{k}
+and
+T_{m}\times T_{k}
+, respectively. These tiles define the granularity at which work is distributed across thread blocks.
+
+As illustrated in Figure
+11
+, each input tile is processed along the
+K
+dimension to produce a corresponding output tile, which is accumulated in registers. CUTLASS employs a persistent tile scheduler, assigning each thread block to a fixed streaming multiprocessor (SM) for the duration of execution. In
+data-parallel scheduling
+, each SM processes the full
+K
+dimension for a given output tile independently. In contrast,
+stream-K scheduling
+enables multiple thread blocks to collaboratively compute a single output tile by dividing the
+K
+-dimension workload across thread blocks, as shown in Figure
+11
+. The partial results are later merged to form the final output. In all cases, the computed output tiles are written back to global memory (DRAM).
+
+To hide DRAM latency and enable compute–memory overlap, tiles are
+asynchronously
+loaded from global memory into shared memory. As shown in Figure
+11
+, shared memory is partitioned to hold multiple tiles, allowing future iterations to be staged while the current tile is being processed. On NVIDIA H100 GPUs, this transfer is managed by the
+Tensor Memory Accelerator (TMA)
+engine. CUTLASS uses warp specialization to pipeline these operations: one warp group (four warps) handles TMA data transfers (producers), while one or two other warp groups (consumers) execute matrix-multiply-accumulate (MMA) operations, depending on the kernel configuration.
+
+Once data is available in shared memory, the kernel proceeds with MMA using one of two configurations. In the RS (register-shared) kernel, weights are loaded into registers and processed with activations from shared memory—this approach enables bit-level manipulations required by our custom format. In contrast, SS (shared-shared) kernels source both operands directly from shared memory. On Hopper, SM90 MMA instructions require the second operand to come from shared memory.
+MMA operations
+are executed at the
+warp group granularity
+, requiring all warps in a group to be ready before issuing the instruction. Consequently, SIMT-level manipulations on weights must complete across all four warps before any warp group MMA operation begins.
+
+CUTLASS supports both
+non-cooperative
+and
+cooperative
+kernel modes. Non-cooperative kernels use a single consumer warp group, while cooperative kernels employ two consumer groups that share activations but process distinct weight tiles. The behavioral differences between these modes are illustrated in Figure
+12
+.
+
+D.2
+CUTLASS FP16 Baseline and cuBLAS W16A16 Kernel Comparison
+
+Figure 13
+:
+Performance comparison between PyTorch
+torch.matmul
+and our CUTLASS baseline across 14 unique
+(N,K)
+GEMM shapes. Each subplot represents a different shape configuration, with batch size
+(M)
+on the
+x
+-axis and latency on the
+y
+-axis.
+
+To validate the robustness of our CUTLASS baseline, we compare its performance against the cuBLAS kernels employed by PyTorch 2.6.0 with CUDA 12.4. Using a weak baseline could underestimate the overhead introduced by NestedFP, leading to overly optimistic conclusions about its practical efficiency. Figure
+13
+provides a detailed comparison across 14
+(N,K)
+configurations, extracted from the linear layers of the four models evaluated in our main experiments—Llama 3.1 8B, Mistral Nemo, Phi-4, and Mistral Small. For each configuration, we sweep the batch size
+M
+from 32 to 2048 in increments of 32, covering the typical range encountered in LLM inference workloads.
+
+Our results show that the FP16 baseline closely matches the performance of the cuBLAS implementation, with an average performance difference of just 1.8% across all 14 GEMM shapes. In 11 of the 14 configurations, our baseline achieves higher average performance than PyTorch, with performance differences reaching up to 3.3%. For the remaining three shapes—corresponding to smaller GEMMs—PyTorch slightly outperforms our implementation, with differences ranging from 0.3% to 0.9%, well within the bounds of normal GPU performance variability. These results confirm that our CUTLASS baseline is not only competitive but often exceeds production-level kernel performance, ensuring a reliable and fair comparison when evaluating NestedFP’s overhead.
+
+Appendix E
+Broad Applicability of NestedFP
+
+Model
+
+GEMM1
+
+GEMM2
+
+GEMM3
+
+GEMM4
+
+Total
+
+CodeLlama 7B
+
+96/96
+
+32/32
+
+64/64
+
+31/32
+
+223/224 (99.6%)
+
+CodeLlama 13B
+
+120/120
+
+40/40
+
+80/80
+
+37/40
+
+277/280 (98.9%)
+
+Gemma 3 4B
+
+207/264
+
+64/88
+
+123/176
+
+34/34
+
+429/563 (76.2%)
+
+Gemma 3 12B
+
+249/306
+
+78/102
+
+151/204
+
+48/48
+
+527/661 (79.7%)
+
+Gemma 3 27B
+
+291/348
+
+92/116
+
+179/232
+
+62/62
+
+625/759 (82.3%)
+
+Llama 3.1 8B
+
+96/96
+
+32/32
+
+64/64
+
+32/32
+
+224/224 (100.0%)
+
+Llama 3.1 70B
+
+224/240
+
+80/80
+
+141/160
+
+78/80
+
+523/560 (93.4%)
+
+Mistral Nemo 12B
+
+120/120
+
+40/40
+
+80/80
+
+40/40
+
+280/280 (100.0%)
+
+Mistral Small 24B
+
+120/120
+
+40/40
+
+80/80
+
+40/40
+
+280/280 (100.0%)
+
+Phi-3.5 Mini
+
+26/32
+
+31/32
+
+31/32
+
+24/32
+
+112/128 (87.5%)
+
+Phi-4 14B
+
+40/40
+
+38/40
+
+40/40
+
+28/40
+
+146/160 (91.2%)
+
+Qwen 3 8B
+
+108/108
+
+35/36
+
+72/72
+
+34/36
+
+249/252 (98.8%)
+
+Qwen 3 14B
+
+120/120
+
+40/40
+
+80/80
+
+38/40
+
+278/280 (99.3%)
+
+Qwen 3 32B
+
+192/192
+
+63/64
+
+127/128
+
+56/64
+
+438/448 (97.8%)
+
+Table 3
+:
+Layer-wise applicability of NestedFP across models. Format X/Y indicates X applicable layers out of Y total layers for each GEMM type.
+
+Our scheme is broadly applicable to a wide range of LLMs beyond those evaluated in the main experiments. In Table
+3
+, we analyze ten additional models that exhibit the key characteristic: the majority of their weight values have absolute magnitudes less than or equal to 1.75. For each model, we examine four distinct GEMM shapes corresponding to different linear layer types: GEMM1 (QKV projections), GEMM2 (output projections), GEMM3 (MLP gate/up projections), and GEMM4 (MLP down projections). Each entry is shown as X/Y, indicating that X out of Y layers of that type satisfy the weight magnitude constraint (absolute value
+\leq
+1.75).
+
+Our analysis indicates that most models exhibit high applicability rates. The Gemma 3 family shows the lowest rates (76.2%–82.3%), primarily due to multi-modal projection layers containing weights with significantly higher magnitudes (up to 26.25). Among the various GEMM types, GEMM4 (MLP down projections) tends to include more layers exceeding the threshold in models such as Phi-4 14B (70.0% applicability) and Qwen 3 32B (87.5%). While the majority of models have maximum weight values below 3.0, notable outliers include Llama 3.1 70B (maximum value of 93.0) and the Gemma 3 series (maximum value of 26.25). These extreme values are typically confined to a small number of layers and have limited impact on the overall applicability of our method. The consistently high applicability rates across diverse model families affirm the robustness and generalizability of our approach’s core assumption regarding weight distributions.
+
