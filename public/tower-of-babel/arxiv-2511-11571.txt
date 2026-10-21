@@ -1,0 +1,2963 @@
+Optimizing Mixture of Block Attention
+Guangxuan Xiao, Junxian Guo, Kasra Mazaheri, Song Han
+
+Abstract
+Mixture of Block Attention (MoBA) ( 23 ) is a promising building block for efficiently processing long contexts in LLMs by enabling queries to sparsely attend to a small subset of key-value blocks, drastically reducing computational cost. However, the design principles governing MoBA’s performance are poorly understood, and it lacks an efficient GPU implementation, hindering its practical adoption. In this paper, we first develop a statistical model to analyze MoBA’s underlying mechanics. Our model reveals that performance critically depends on the router’s ability to accurately distinguish relevant from irrelevant blocks based on query-key affinities. We derive a signal-to-noise ratio that formally connects architectural parameters to this retrieval accuracy. Guided by our analysis, we identify two key pathways for improvement: using smaller block sizes, and applying a short convolution on keys to cluster relevant signals, which enhances routing accuracy. While theoretically better, small block sizes are inefficient on GPUs. To bridge this gap, we introduce FlashMoBA , a hardware-aware CUDA kernel that enables efficient MoBA execution even with the small block sizes our theory recommends. We validate our insights by training LLMs from scratch, showing that our improved MoBA models match the performance of dense attention baselines. FlashMoBA achieves up to 14.7× speedup over FlashAttention-2 for small blocks, making our theoretically-grounded improvements practical.
+
+
+
+1
+Introduction
+
+Large Language Models (LLMs)
+(
+11
+;
+26
+)
+are expanding into multimodal domains like video understanding
+(
+20
+;
+37
+)
+and video generation
+(
+17
+)
+, requiring the ability to handle exceptionally long contexts. This vision is bottlenecked by the self-attention mechanism
+(
+36
+)
+, whose quadratic computational cost makes processing long sequences costly. Sparse attention
+(
+44
+;
+12
+;
+40
+)
+aims to solve this by focusing computation only on important regions. Among these methods,
+Mixture of Block Attention (MoBA)
+
+(
+23
+)
+is a promising approach where a learned router directs each query to a small subset of key-value blocks, reducing complexity to near-linear.
+
+However, MoBA’s success is hindered by two critical issues: the design principles governing its performance are poorly understood, and it lacks an efficient GPU implementation, especially for small block sizes. This raises a key question: how does the router reliably select a handful of correct blocks from thousands of candidates—a ”needle-in-a-haystack” problem—and how can we make this process fast on hardware?
+
+To answer this, we develop a statistical model of MoBA’s mechanics. Our analysis reveals that retrieval accuracy is governed by a signal-to-noise ratio (SNR) that directly links architectural parameters to performance:
+
+\text{SNR}\propto\sqrt{\frac{d}{B}}
+
+where
+d
+is the head dimension and
+B
+is the block size. This insight yields two key design principles: (1) optimizing the
+head-dimension-to-block-size ratio (
+d/B
+)
+, which we validate by systematically varying
+B
+while holding
+d
+constant, and (2) applying a
+short convolution on keys
+to better cluster relevant signals for the router.
+
+Figure 1:
+FlashMoBA forward pass in two stages.
+
+MoBA
+splits keys and values into blocks; each query scores
+centroids
+of key-blocks
+\tilde{\mathbf{K}}
+and attends only to its top-
+k
+blocks (plus causally to its own block).
+
+1) Tiled Top-
+k
+Selection:
+a fused kernel streams tiles of
+\mathbf{Q}
+and
+\tilde{\mathbf{K}}
+to emit a sparse routing mask
+without
+materializing the full matrix.
+
+2) Dense Computation:
+for each selected key block, queries are
+gathered
+into on-chip SRAM, computed
+densely
+with FlashAttention-2 logic, then scattered back.
+This
+gather-and-densify
+strategy coalesces memory, maximizes hardware utilization and makes small-block MoBA fast on GPUs (See Section
+4
+for more details).
+
+While our theory advocates for small block sizes, they are notoriously inefficient on GPUs. To solve this, we introduce
+FlashMoBA
+, a hardware-aware CUDA kernel that makes these theoretically optimal configurations practical. By adapting techniques from FlashAttention
+(
+9
+;
+10
+)
+and adding novel optimizations for block-sparsity, FlashMoBA achieves significant speedups. We validate our approach by training LLMs from scratch, demonstrating that our improved MoBA models match the performance of dense attention baselines.
+
+Our contributions are threefold:
+
+•
+
+A statistical model of MoBA
+that connects architectural parameters (
+d,B
+) to router accuracy via a signal-to-noise ratio, providing a principled guide for design.
+
+•
+
+Two design principles for improving MoBA validated through controlled experiments
+: optimizing the
+d/B
+ratio (by varying block size
+B
+while controlling for model capacity) and applying a convolution on keys to improve signal clustering.
+
+•
+
+FlashMoBA
+, a hardware-aware CUDA kernel that makes theoretically optimal small block sizes practical, achieving
+up to 14.7× speedup
+on GPUs.
+
+2
+Preliminaries
+
+We briefly review MoBA
+(
+23
+)
+.
+Given a sequence of
+N
+key tokens, MoBA partitions them into
+n=N/B
+blocks of size
+B
+.
+For each query
+\mathbf{q}
+, instead of attending to all
+N
+keys and values, MoBA selects only the top
+k
+most relevant blocks.
+
+The block selection uses a gating mechanism.
+For block
+i
+with keys
+\mathbf{K}_{i}\in\mathbb{R}^{B\times d}
+, the relevance score is computed as
+
+s_{i}=\mathbf{q}^{\top}\cdot\mathbf{\tilde{k}}_{i}
+where
+\mathbf{\tilde{k}}_{i}=\frac{1}{B}\sum_{\mathbf{k}\in\mathbf{K}_{i}}\mathbf{k}
+represents the
+centroid
+—i.e., mean pooling of the block
+\mathbf{K}_{i}
+.
+The top-
+k
+blocks with highest scores are selected, and attention is computed only over their tokens:
+
+\text{MoBA}(\mathbf{q},\mathbf{K},\mathbf{V})=\text{softmax}(\mathbf{q}\mathbf{K}_{\mathcal{S}}^{\top}/\sqrt{d})\mathbf{V}_{\mathcal{S}},
+
+where
+\mathcal{S}
+contains all tokens from selected blocks.
+To preserve causality, blocks containing future tokens are masked during selection.
+Additionally, each query always attends to its current block with causal masking.
+
+This reduces complexity from
+O(N^{2})
+to
+O(N\cdot kB)
+when
+k\ll n
+.
+Our experiments systematically explore configurations with
+B\in\{512,256,128\}
+and corresponding
+k\in\{2,4,8\}
+to maintain constant sparsity of
+7/8
+when
+N=8192
+.
+To encourage within-block clustering, we optionally apply a short depthwise causal convolution on keys
+(
+41
+)
+(kernel size 3 or 5); details are provided in Appendix
+B
+.
+
+3
+A Statistical Model of MoBA
+
+For MoBA to be effective, its router must select the correct key-value block for a given query. This is challenging because the router scores a block using its centroid (the average of all its keys), a process that risks drowning out the signal from a single relevant token. To understand how MoBA succeeds, we developed a statistical model of its block selection mechanism.
+
+3.1
+Modeling the Block Selection Challenge
+
+We model the router’s task by treating the dot products between a query
+\mathbf{q}
+and the keys as random variables. We assume that for a given query, ”signal” keys (
+\mathbf{k}^{*}
+) it is seeking have a higher expected dot product than irrelevant ”noise” keys (
+\mathbf{k}
+).
+Let
+\mu_{\text{signal}}=\mathbb{E}[\mathbf{q}^{\top}\mathbf{k}^{*}]
+and
+\mu_{\text{noise}}=\mathbb{E}[\mathbf{q}^{\top}\mathbf{k}]
+. The fundamental separation between signal and noise is the difference
+\Delta\mu=\mu_{\text{signal}}-\mu_{\text{noise}}
+. For a router to function, this separation must be positive (
+\Delta\mu>0
+).
+
+The router scores each block
+j
+by computing the dot product with the block’s centroid,
+s_{j}=\mathbf{q}^{\top}\mathbf{\tilde{k}}_{j}
+, where
+\mathbf{\tilde{k}}_{j}=\frac{1}{B}\sum_{\mathbf{k}\in\text{block}_{j}}\mathbf{k}
+. The key question is whether the score of the signal-containing block (
+s_{j^{*}}
+) will reliably be higher than the score of any noise block (
+s_{j}
+).
+
+3.2
+Signal-to-Noise Ratio (SNR) Analysis
+
+To quantify when block selection succeeds, we analyze the
+signal-to-noise ratio (SNR)
+of the router’s scores. We consider the difference in scores,
+D=s_{j^{*}}-s_{j}
+, between the signal block
+j^{*}
+and a pure noise block
+j
+. The expected value of this difference represents the ”signal,” while its standard deviation represents the ”noise.”
+
+Through statistical analysis (see Appendix
+A
+), we find:
+
+\displaystyle\mathbb{E}[D]
+
+\displaystyle=\frac{\Delta\mu_{\text{eff}}}{B}
+
+(1)
+
+\displaystyle\text{Var}(D)
+
+\displaystyle\approx\frac{2}{dB}\quad\text{(for normalized vectors)}
+
+(2)
+
+Here,
+\Delta\mu_{\text{eff}}
+is the
+effective signal separation
+. If
+m
+related signal tokens are clustered within the target block, this separation is amplified:
+\Delta\mu_{\text{eff}}=\Delta\mu+(m-1)(\mu_{\text{cluster}}-\mu_{\text{noise}})
+, where
+\mu_{\text{cluster}}
+is the average affinity between the query and other clustered signal tokens.
+
+The SNR is the ratio of the expected outcome to its standard deviation, which is our central finding:
+
+\text{SNR}=\frac{\mathbb{E}[D]}{\sqrt{\text{Var}(D)}}=\Delta\mu_{\text{eff}}\sqrt{\frac{d}{2B}}
+
+(3)
+
+The probability of a retrieval failure—a noise block outranking the signal block—decreases exponentially as the SNR increases:
+p_{\text{fail}}=\Phi(-\text{SNR})
+, where
+\Phi
+is the standard normal CDF. For reliable top-
+k
+retrieval in a long context with thousands of blocks, a high SNR is essential.
+
+3.3
+Architectural Insights from the SNR Model
+
+The SNR formula provides two clear and actionable principles for designing effective MoBA architectures:
+
+1. The
+d/B
+ratio is the key.
+The SNR is proportional to
+\sqrt{d/B}
+. This ratio emerges as the most critical factor governing the router’s retrieval capability. This insight suggests two avenues for improvement: increasing the head dimension
+d
+or decreasing the block size
+B
+. However, the head dimension
+d
+is a
+confounding variable
+; increasing it not only improves the theoretical SNR but also increases the model’s parameters and computational cost (FLOPs), adding capacity that makes a controlled comparison difficult. Therefore, to isolate and empirically validate the
+d/B
+ratio’s impact on retrieval accuracy alone, our study fixes
+d
+(controlling for model capacity) and systematically varies
+B
+. Halving the block size improves the SNR by a factor of
+\sqrt{2}
+, making it easier for the router to find the signal.
+
+2. Within-block clustering is a performance multiplier.
+When semantically related tokens are grouped together in a block—a behavior encouraged by token-level key convolution
+(
+41
+)
+during training—the effective signal
+\Delta\mu_{\text{eff}}
+increases via larger
+m
+and
+\mu_{\text{cluster}}
+, significantly boosting the SNR.
+
+These principles form the theoretical foundation for our architectural improvements, which we validate systematically in Section
+5
+.
+
+4
+FlashMoBA: An Optimized Kernel for Small-Block MoBA
+
+Our theoretical model shows that
+smaller block sizes
+yield significant quality gains, but a naive GPU implementation is inefficient. The original MoBA implementation released by
+23
+, when configured with small blocks, suffers from performance bottlenecks that negate the computational savings from sparsity, resulting in slower execution than dense attention. We introduce
+FlashMoBA
+, an hardware-aware CUDA kernel designed to make small-block MoBA practical and fast.
+
+4.1
+Performance Challenges with Small Blocks
+
+Small block sizes introduce several critical performance challenges that must be addressed for practical deployment. First,
+inefficient memory access
+occurs when gathering sparse, non-contiguous key-value blocks for each query, leading to uncoalesced memory reads from HBM. Second,
+top-k and gating overhead
+becomes problematic as smaller block sizes
+B
+increase the number of blocks (
+n=N/B
+) that the router must score. The original implementation materializes a large
+N\times n
+score matrix, incurring substantial memory overheads. Finally,
+low GPU occupancy
+results from the reduced work per block and the overhead of launching many independent kernels, leading to poor parallelism and low hardware utilization.
+
+4.2
+FlashMoBA Kernel Design
+
+To overcome these challenges, FlashMoBA employs three fused kernels that minimize HBM round-trips and aligns computation with the GPU architecture, as depicted in Figure
+1
+.
+
+1. Tiled Top-K Selection
+
+The top-k selection process is a primary bottleneck in the original MoBA implementation
+23
+, which materializes a full score matrix and processes batched sequences serially. We replace this with
+Flash TopK
+(Step 1 in Figure
+1
+), a highly optimized three-stage pipeline of fused kernels. First, a Triton kernel computes key-block centroids, producing a much smaller matrix
+\mathbf{\tilde{K}}
+. Second, a tiled kernel inspired by FlashAttention-2 finds the top-k key-blocks for each query by computing scores between
+\mathbf{Q}
+and
+\mathbf{\tilde{K}}
+
+without ever materializing the full score matrix to HBM
+, as summarized in Algorithm
+3
+. Finally, an efficient epilogue reformats the query-centric indices into a key-block-centric varlen layout for the main attention pass. This entire pipeline is fully parallelized across batches and heads, eliminating the original performance bottleneck. The detailed breakdown of all three stages is provided in Appendix
+C.1
+.
+
+2. Forward Pass with Gather-and-Densify
+
+To handle MoBA’s irregular sparsity, our forward kernel uses a ”gather-and-densify” strategy based on a two-level blocking mechanism, detailed in Algorithm
+1
+. We distinguish between two types of blocks:
+
+•
+
+Logical Blocks:
+Large, contiguous blocks of queries (
+\mathbf{Q_{i}}
+) and keys (
+\mathbf{K_{j}}
+) that the kernel iterates over in its outer loops. A logical key block matches a MoBA key block.
+
+•
+
+Physical Blocks:
+Smaller tiles (e.g.,
+64\times 64
+or
+128\times 128
+) loaded into SRAM for matrix multiplication. Their optimal size depends on GPU architecture and head dimension.
+
+The kernel assigns a logical query block
+\mathbf{Q_{i}}
+to each thread block, iterating through all logical key blocks
+\mathbf{K_{j}}
+. For each pair, it uses varlen indices to find relevant queries. This subset is batched into dense physical blocks: a physical block of queries is gathered from HBM into a dense SRAM buffer for computation. This two-level approach is key, as caching the queries in SRAM allows reuse across all physical tiles of the logical key block, amortizing costly irregular memory access with efficient dense GEMMs.
+
+Algorithm 1
+
+FlashMoBA Forward Pass
+
+1:
+
+Matrices
+\mathbf{Q,K,V}\in\mathbb{R}^{N\times d}
+in HBM. Varlen indices
+A,\text{Offset},C
+. Logical block sizes
+B_{q},B
+. Physical tile sizes
+B_{r},B_{c}
+.
+
+2:
+
+Divide
+\mathbf{Q}
+into
+T_{q}=\lceil\frac{N}{B_{q}}\rceil
+logical blocks
+\mathbf{Q}_{i}
+of size
+B_{q}\times d
+.
+
+3:
+
+Divide
+\mathbf{K},\mathbf{V}
+into
+T_{k}=\lceil\frac{N}{B}\rceil
+logical blocks
+\mathbf{K}_{j},\mathbf{V}_{j}
+of size
+B\times d
+.
+
+4:
+
+Initialize output matrix
+\mathbf{O}\in\mathbb{R}^{N\times d}
+, temporary output matrix
+\mathbf{O_{tmp}}\in\mathbb{R}^{N\times d}
+and logsumexp vector
+L\in\mathbb{R}^{N}
+in HBM.
+
+5:
+
+for
+
+0\leq i<T_{q}
+
+do
+
+in parallel
+
+6:
+
+for
+
+0\leq j<T_{k}
+
+do
+
+7:
+
+Let
+\text{Indices}_{j}
+be the list of
+N_{j}
+query indices from
+\mathbf{Q}_{i}
+attending to
+\mathbf{K}_{j}
+.
+
+8:
+
+Define tile counts
+T_{c}=\lceil B/B_{c}\rceil,T_{r}^{(j)}=\lceil N_{j}/B_{r}\rceil
+.
+
+9:
+
+Divide
+\mathbf{K}_{j},\mathbf{V}_{j}
+into physical tiles
+\mathbf{K}_{j,k},\mathbf{V}_{j,k}
+.
+
+10:
+
+for
+
+0\leq r<T_{r}^{(j)}
+
+do
+
+11:
+
+Gather-load the
+r
+-th tile of queries from
+\mathbf{Q}
+into SRAM based on
+\text{Indices}_{j}
+.
+
+12:
+
+Gather-load the corresponding outputs from
+\mathbf{O_{tmp}}
+into on-chip accumulators.
+
+13:
+
+for
+
+0\leq k<T_{c}
+
+do
+
+14:
+
+Load
+\mathbf{K}_{j,k},\mathbf{V}_{j,k}
+from HBM to SRAM.
+
+15:
+
+On-chip, compute scores
+\mathbf{S}_{rk}=\mathbf{Q}_{r}^{(j)}(\mathbf{K}_{j,k})^{\top}
+.
+
+16:
+
+Update on-chip softmax stats and partial outputs in accumulators.
+
+17:
+
+end
+
+for
+
+18:
+
+Scatter-store the updated partial outputs from accumulators back to
+\mathbf{O_{tmp}}
+.
+
+19:
+
+end
+
+for
+
+20:
+
+end
+
+for
+
+21:
+
+Load data from
+\mathbf{O_{tmp}}
+, convert to output dtype, and write back to
+\mathbf{O}_{i}
+.
+
+22:
+
+end
+
+for
+
+3. Backward Pass with Recomputation
+
+Our backward pass leverages the memory-efficient design of FlashAttention-2 and is implemented as a sequence of three kernels (Algorithm
+5
+). The primary kernel parallelizes computation across the key dimension, with each thread block processing one key-block. To handle sparsity, it mirrors the forward pass’s ”gather-and-densify” strategy, using varlen indices to gather subsets of queries and output gradients into on-chip tiles. Following the FlashAttention-2 methodology, we recompute attention scores during the backward pass to avoid storing the full attention matrix in memory. While key and value gradients are written directly to HBM, the partial query gradients (
+\mathbf{dQ}
+) require accumulation across multiple key-blocks, which is handled efficiently and safely using atomic additions to a high-precision global buffer. This design ensures that the backward pass maintains linear complexity in sequence length, a critical improvement over the quadratic complexity of standard attention. As the backward pass typically constitutes the main performance bottleneck in optimized attention implementations (often 2-3
+\times
+slower than the forward pass
+10
+), the efficiency of our backward kernel is crucial for enabling practical training on long sequences.
+
+Table 1:
+Performance comparison on language modeling and zero-shot common-sense reasoning for 340M models trained on 100B tokens. MoBA-128 + kconv5 achieves the best average performance.
+
+Model
+
+Wiki
+
+OBQA
+
+PIQA
+
+Hella.
+
+Lamb.
+
+ARC-c
+
+TQA
+
+ARC-e
+
+Wino.
+
+Avg.
+
+ppl
+\downarrow
+
+acc
+\uparrow
+
+acc
+\uparrow
+
+acc
+\uparrow
+
+acc
+\uparrow
+
+acc
+\uparrow
+
+acc
+\uparrow
+
+acc
+\uparrow
+
+acc
+\uparrow
+
+acc
+\uparrow
+
+Dense
+
+19.6
+
+20.8
+
+69.7
+
+48.5
+
+39.8
+
+30.5
+
+27.1
+
+63.8
+
+53.5
+
+44.2
+
+MoBA-512
+
+20.9
+
+22.0
+
+68.7
+
+48.2
+
+39.7
+
+31.1
+
+29.7
+
+64.3
+
+53.4
+
+44.6
+
+MoBA-256
+
+20.3
+
+22.8
+
+68.8
+
+48.5
+
+39.2
+
+30.9
+
+27.8
+
+63.4
+
+55.1
+
+44.6
+
+MoBA-128
+
+19.7
+
+21.8
+
+69.0
+
+48.3
+
+40.9
+
+31.7
+
+28.2
+
+65.5
+
+55.4
+
+45.1
+
++ kconv3
+
+19.3
+
+25.6
+
+69.7
+
+48.3
+
+41.7
+
+32.6
+
+26.8
+
+64.7
+
+55.1
+
+45.6
+
++ kconv5
+
+19.5
+
+23.2
+
+68.9
+
+48.4
+
+40.0
+
+31.7
+
+36.1
+
+64.8
+
+56.3
+
+46.2
+
+Table 2:
+Performance comparison on language modeling and zero-shot common-sense reasoning for 1B models trained on 100B tokens. MoBA-128 + kconv3 achieves the best average performance.
+
+Model
+
+Wiki
+
+OBQA
+
+PIQA
+
+Hella.
+
+Lamb.
+
+ARC-c
+
+TQA
+
+ARC-e
+
+Wino.
+
+Avg.
+
+ppl
+\downarrow
+
+acc
+\uparrow
+
+acc
+\uparrow
+
+acc
+\uparrow
+
+acc
+\uparrow
+
+acc
+\uparrow
+
+acc
+\uparrow
+
+acc
+\uparrow
+
+acc
+\uparrow
+
+acc
+\uparrow
+
+Dense
+
+14.7
+
+26.2
+
+72.6
+
+59.4
+
+47.1
+
+38.4
+
+33.0
+
+71.3
+
+59.0
+
+50.9
+
+MoBA-128
+
+15.1
+
+26.2
+
+73.6
+
+59.7
+
+48.0
+
+41.4
+
+30.2
+
+73.0
+
+61.5
+
+51.7
+
++ kconv3
+
+14.5
+
+25.4
+
+72.6
+
+60.1
+
+48.1
+
+40.4
+
+43.5
+
+72.5
+
+58.7
+
+52.7
+
++ kconv5
+
+14.7
+
+27.8
+
+73.1
+
+59.7
+
+49.0
+
+39.9
+
+30.5
+
+73.3
+
+59.6
+
+51.6
+
+Table 3:
+Zero-shot performance on RULER S-NIAH tasks for 340M models trained on 100B tokens. Models trained on 8K contexts are evaluated on sequences up to 64K without fine-tuning. The reported scores are accuracy percentages from a 1000-sample test set.
+
+S-NIAH-1
+
+S-NIAH-2
+
+S-NIAH-3
+
+Avg.
+
+Model
+
+4K
+
+8K
+
+16K
+
+32K
+
+64K
+
+4K
+
+8K
+
+16K
+
+32K
+
+64K
+
+4K
+
+8K
+
+16K
+
+32K
+
+64K
+
+Dense
+
+100
+
+100
+
+79
+
+0
+
+0
+
+100
+
+99
+
+5
+
+0
+
+0
+
+78
+
+69
+
+0
+
+0
+
+0
+
+42.0
+
+MoBA-512
+
+90
+
+86
+
+72
+
+59
+
+35
+
+81
+
+41
+
+14
+
+4
+
+1
+
+63
+
+30
+
+7
+
+1
+
+0
+
+38.8
+
+MoBA-256
+
+100
+
+100
+
+100
+
+99
+
+94
+
+96
+
+64
+
+22
+
+5
+
+0
+
+37
+
+14
+
+5
+
+0
+
+0
+
+49.1
+
+MoBA-128
+
+100
+
+100
+
+100
+
+100
+
+85
+
+99
+
+92
+
+65
+
+17
+
+1
+
+52
+
+25
+
+5
+
+0
+
+0
+
+56.0
+
++ kconv3
+
+100
+
+100
+
+100
+
+99
+
+96
+
+99
+
+94
+
+58
+
+5
+
+0
+
+57
+
+22
+
+4
+
+0
+
+0
+
+55.5
+
++ kconv5
+
+100
+
+100
+
+100
+
+100
+
+100
+
+100
+
+99
+
+71
+
+3
+
+0
+
+95
+
+67
+
+22
+
+1
+
+0
+
+63.9
+
+Table 4:
+Zero-shot performance on RULER S-NIAH tasks for 1B models. Models trained on 8K contexts are evaluated on sequences up to 64K without fine-tuning. The reported scores are accuracy percentages from a 1000-sample test set.
+
+S-NIAH-1
+
+S-NIAH-2
+
+S-NIAH-3
+
+Avg.
+
+Model
+
+4K
+
+8K
+
+16K
+
+32K
+
+64K
+
+4K
+
+8K
+
+16K
+
+32K
+
+64K
+
+4K
+
+8K
+
+16K
+
+32K
+
+64K
+
+Dense
+
+100
+
+100
+
+100
+
+62
+
+0
+
+100
+
+99
+
+91
+
+0
+
+0
+
+94
+
+92
+
+81
+
+0
+
+0
+
+61.3
+
+MoBA-128
+
+100
+
+100
+
+100
+
+99
+
+74
+
+100
+
+98
+
+83
+
+16
+
+1
+
+81
+
+67
+
+29
+
+2
+
+0
+
+63.3
+
++ kconv3
+
+100
+
+100
+
+100
+
+100
+
+66
+
+100
+
+100
+
+95
+
+37
+
+2
+
+89
+
+78
+
+45
+
+10
+
+1
+
+68.2
+
++ kconv5
+
+100
+
+100
+
+100
+
+100
+
+100
+
+100
+
+96
+
+76
+
+17
+
+0
+
+98
+
+84
+
+44
+
+7
+
+0
+
+68.1
+
+Table 5:
+Performance on real-world LongBench tasks for 340M models trained on 100B tokens. MoBA-128 + kconv3 achieves the best average scores.
+
+Single-Doc QA
+
+Multi-Doc QA
+
+Summarization
+
+Few-shot
+
+Code
+
+Model
+
+Qasper
+
+MField
+
+HotpQA
+
+2Wiki
+
+MuSiQue
+
+GovR
+
+QMSum
+
+MNews
+
+Trivia
+
+SAMSum
+
+LCode
+
+RepoB
+
+Avg.
+
+Dense
+
+7.6
+
+17.3
+
+4.0
+
+9.1
+
+2.3
+
+12.1
+
+15.2
+
+12.5
+
+8.3
+
+11.8
+
+19.1
+
+16.9
+
+11.3
+
+MoBA-512
+
+6.5
+
+14.4
+
+5.8
+
+10.6
+
+3.7
+
+13.7
+
+16.8
+
+13.2
+
+10.8
+
+15.0
+
+16.7
+
+21.1
+
+12.4
+
+MoBA-256
+
+7.3
+
+15.3
+
+6.1
+
+10.3
+
+3.6
+
+13.8
+
+17.6
+
+12.9
+
+11.2
+
+14.9
+
+22.3
+
+22.5
+
+13.2
+
+MoBA-128
+
+6.8
+
+15.2
+
+5.6
+
+10.2
+
+3.7
+
+13.0
+
+16.1
+
+11.2
+
+11.3
+
+16.8
+
+20.8
+
+19.1
+
+12.5
+
++ kconv3
+
+8.3
+
+14.4
+
+6.5
+
+9.5
+
+3.9
+
+14.3
+
+18.3
+
+19.4
+
+11.6
+
+16.3
+
+21.3
+
+20.4
+
+13.7
+
++ kconv5
+
+7.4
+
+14.3
+
+6.3
+
+10.1
+
+4.0
+
+17.8
+
+17.4
+
+18.4
+
+10.5
+
+17.8
+
+15.6
+
+17.6
+
+13.1
+
+Table 6:
+Performance on real-world LongBench tasks for 1B models trained on 100B tokens.
+
+Single-Doc QA
+
+Multi-Doc QA
+
+Summarization
+
+Few-shot
+
+Code
+
+Model
+
+Qasper
+
+MField
+
+HotpQA
+
+2Wiki
+
+MuSiQue
+
+GovR
+
+QMSum
+
+MNews
+
+Trivia
+
+SAMSum
+
+LCode
+
+RepoB
+
+Avg.
+
+Dense
+
+9.2
+
+19.0
+
+6.3
+
+10.7
+
+4.4
+
+22.7
+
+17.1
+
+18.7
+
+12.8
+
+16.7
+
+20.3
+
+18.1
+
+14.6
+
+MoBA-128
+
+8.9
+
+20.2
+
+7.4
+
+9.2
+
+4.1
+
+16.4
+
+18.1
+
+17.4
+
+14.2
+
+19.0
+
+18.1
+
+21.1
+
+14.5
+
++ kconv3
+
+8.2
+
+17.7
+
+7.4
+
+8.9
+
+4.5
+
+22.3
+
+18.4
+
+12.5
+
+13.7
+
+18.1
+
+21.7
+
+21.5
+
+14.6
+
++ kconv5
+
+8.7
+
+18.3
+
+7.0
+
+9.5
+
+4.2
+
+19.5
+
+18.5
+
+18.4
+
+13.2
+
+18.6
+
+21.8
+
+23.4
+
+15.1
+
+5
+Experiments
+
+5.1
+Experimental Setup
+
+We validate our design principles of MoBA through controlled experiments on models pre-trained from scratch.
+
+Model Architecture.
+
+All models use a hybrid 24-layer architecture: odd layers use sliding window attention (window size 256) with RoPE, while even layers use either dense attention (baseline) or MoBA variants without positional encoding. This design, inspired by Command-A
+(
+8
+)
+and SWAN-GPT
+(
+29
+)
+, isolates MoBA’s contribution while maintaining local dependencies.
+We train two model families:
+340M
+(hidden size 1024, 16 heads, intermediate size 2816) and
+1B
+(hidden size 2048, 32 heads, intermediate size 8192). Both model families use a fixed head dimension
+d=64
+. While our SNR model predicts that increasing
+d
+is beneficial, this change is confounded with an increase in model parameters and FLOPs. To conduct a controlled experiment that isolates the effect of the router’s retrieval mechanism (as governed by the
+d/B
+ratio) from changes in model capacity, we fix
+d
+and focus our empirical validation on the effect of block size
+B
+and key convolution. Both use Llama-2 tokenizer (32K vocabulary) and 8K training context.
+
+Configurations.
+
+For 340M models, we systematically vary block sizes while maintaining 7/8 sparsity:
+
+MoBA-512
+(
+B=512
+,
+k=2
+),
+
+MoBA-256
+(
+B=256
+,
+k=4
+), and
+
+MoBA-128
+(
+B=128
+,
+k=8
+).
+For 1B models, we focus on the MoBA-128 configuration.
+Our theory predicts smaller
+B
+improves SNR and retrieval accuracy.
+
+Training and Evaluation.
+
+All models are pre-trained on FineWeb-Edu
+(
+28
+)
+using AdamW optimizer with
+\beta_{1}=0.9
+,
+\beta_{2}=0.95
+, weight decay 0.1, and cosine learning rate schedule.
+We use peak LR
+6\times 10^{-4}
+, batch size 500K tokens.
+All models are trained on 100B tokens.
+All models use gradient clipping at 1.0, and mixed precision training with bfloat16.
+We evaluate on:
+
+(1) Language Modeling:
+WikiText2 perplexity
+(
+24
+)
+and 8 zero-shot tasks: OpenBookQA
+(
+25
+)
+, PIQA
+(
+4
+)
+, HellaSwag
+(
+45
+)
+, WinoGrande
+(
+32
+)
+, ARC-e/c
+(
+7
+)
+, TruthfulQA
+(
+21
+)
+, and LAMBADA
+(
+27
+)
+.
+
+(2) Long-Context Retrieval:
+S-NIAH-1/2/3 from RULER
+(
+14
+)
+at 4K–64K lengths.
+
+(3) LongBench:
+12 tasks
+(
+2
+)
+: single-document QA (Qasper, MField), multi-document QA (HotpotQA, 2WikiMQA, MuSiQue), summarization (GovReport, QMSum, MultiNews), few-shot (TriviaQA, SAMSum), and code (LCC, RepoBench-P).
+
+Implementation.
+
+Models are implemented using PyTorch with FlashAttention-2
+(
+10
+)
+for efficient attention computation.
+For MoBA, we compare our custom CUDA kernels (detailed in Section
+4
+) against the original implementation released by
+(
+23
+)
+.
+Our kernels build upon FlashAttention’s tiling strategy while introducing novel optimizations specifically for block-sparse patterns with small blocks.
+All experiments use 8
+\times
+H100 80GB GPUs with gradient checkpointing and fully-sharded data parallelism for memory efficiency.
+
+5.2
+Quality Results
+
+We evaluate MoBA’s quality across language modeling, long-context retrieval, and real-world tasks. Our experiments confirm that the theoretical improvements translate to consistent gains across diverse benchmarks.
+
+Figure 2:
+Smaller block sizes improve WikiText perplexity and RULER accuracy (340M,
+d=64
+, 100B tokens). Reducing
+B
+from 512 to 128 lowers ppl by 1.2 and increases RULER by 17.2%.
+
+Block Size Impact.
+
+Figure
+2
+shows block size effects on WikiText perplexity and RULER accuracy for 340M models. As predicted by SNR
+\propto 1/\sqrt{B}
+, reducing block size from 512 to 128 improves perplexity from 20.9 to 19.7 and RULER from 38.8% to 56.0%. Smaller blocks help the router identify relevant content more precisely.
+
+The trend holds across all benchmarks and scales. For 340M models, reducing block size 4× from 512 to 128 improves language modeling accuracy from 44.6% to 45.6% (Table
+1
+), RULER from 38.8% to 63.9% (Table
+3
+), and LongBench from 13.2 to 15.3 (Table
+5
+). Small blocks are necessary for MoBA to match dense attention.
+
+Key Convolution Benefits.
+
+Key convolution improves performance with task-specific preferences. For 340M models, kconv3 increases language modeling accuracy from 45.1% to 45.6% (Table
+1
+), while kconv5 achieves 100% retrieval at 64K vs 85% without (Table
+3
+). On LongBench, kconv3 reaches 15.3% (Table
+5
+). At 1B scale, kconv3 improves LM accuracy to 52.7% (Table
+2
+) and RULER to 68.2% (Table
+4
+). These gains confirm convolution amplifies
+\Delta\mu_{\text{eff}}
+by clustering related tokens.
+
+Sparse Matching Dense.
+
+Across multiple benchmarks and scales, MoBA matches or even surpasses dense attention: for example, at the 340M scale, MoBA-128 + kconv3 achieves 15.3% accuracy on LongBench versus dense’s 12.9% (Table
+5
+); on RULER, dense attention fails completely at long contexts (0% at 32K tokens), while MoBA-128 + kconv5 achieves 100% at 64K (Table
+3
+); and at 1B scale, MoBA achieves 52.7% LM accuracy compared to dense’s 50.9% (Table
+2
+), 69.6% vs 61.3% on RULER (Table
+4
+), and 15.1% vs 14.7% on LongBench (Table
+6
+). These results demonstrate the benefit of reducing attention dilution: dense softmax spreads probability mass thinly across all tokens as sequence length grows, making it harder to focus on relevant information, while MoBA’s sparse routing concentrates attention on a small number of targeted blocks, mitigating dilution and allowing the model to more effectively select and aggregate information. This mechanism explains how MoBA is able to consistently match or outperform dense attention across diverse settings.
+
+Figure 3:
+Latency & memory vs. length
+(bsz
+=2
+,
+B{=}128
+,
+k{=}8
+) for MoBA (original), FlashAttention-2, and
+FlashMoBA
+.
+Top: end-to-end latency; bottom: peak memory.
+MoBA/FlashMoBA bars are decomposed (top
+\to
+bottom) into
+backward
+,
+forward
+, and
+Top-
+k
+overheads.
+MoBA is dominated by non-attention overheads and hits
+OOM at 128K
+. By fusing tiled Top-
+k
+with a gather-and-densify kernel,
+FlashMoBA
+makes overhead negligible, cuts memory, and is
+up to 14.7
+\times
+faster
+than FlashAttention at long sequence lengths.
+
+Figure 4:
+Forward-pass timing breakdown
+(
+N{=}64\mathrm{K}
+,
+B{=}128
+,
+k{=}8
+). MoBA (original) is bottlenecked by routing overheads, while FlashMoBA’s fused kernels cut total time to 49 ms, outperforming FlashAttention-2.
+
+5.3
+Efficiency Results
+
+While theory favors small blocks for quality, they were previously impractical due to poor GPU utilization. FlashMoBA makes these configurations efficient.
+
+End-to-End Performance.
+
+Figure
+3
+compares latency and memory consumption across sequence lengths from 8K to 512K tokens. FlashMoBA reduces both latency and memory significantly.
+At
+N{=}64\mathrm{K}
+with
+B{=}128
+, FlashMoBA is 7.4
+\times
+faster than original MoBA and uses 6.1
+\times
+less memory. Original MoBA hits OOM at 128K, while FlashMoBA scales to 512K.
+The advantage grows with longer sequences and smaller blocks because FlashMoBA eliminates global reindexing overhead, achieving up to 14.7
+\times
+speedup over FlashAttention-2 at long sequences.
+
+Breakdown Analysis.
+
+To understand where FlashMoBA’s speedup comes from, Figure
+4
+shows the forward-pass timing breakdown at
+N{=}64\mathrm{K}
+.
+Original MoBA
+(
+23
+)
+uses five stages: (1) compute centroids and top-
+k
+, (2) global reindexing, (3) attention on routed indices, (4) local causal attention, (5) merge results.
+Stages (1), (2), and (5) dominate runtime, accounting for over 70% of execution time due to materialization and reindexing overhead.
+FlashMoBA uses two fused kernels: (i) centroid/gating/top-
+k
+without materialization; (ii) gather-and-densify for attention with high occupancy.
+This reduces forward-pass runtime to 49 ms at
+N{=}64\mathrm{K}
+compared to FlashAttention-2’s 99 ms.
+
+6
+Related Work
+
+Efficient Attention Mechanisms
+
+The quadratic complexity of attention has driven research into efficient alternatives.
+Fixed-pattern methods include Sparse Transformer
+(
+5
+)
+, Longformer
+(
+3
+)
+, and BigBird
+(
+44
+)
+.
+Reformer
+(
+16
+)
+uses LSH, while Linformer
+(
+38
+)
+uses projection.
+Learnable approaches include Routing Transformer
+(
+31
+)
+and Performer
+(
+6
+)
+.
+FlashAttention
+(
+9
+;
+10
+)
+improves implementation via IO-aware algorithms but doesn’t reduce complexity.
+
+Block Sparse Attention
+
+Block-based methods reduce complexity from
+O(N^{2})
+to
+O(N\cdot B\cdot k)
+.
+Blockwise Transformer
+(
+30
+)
+pioneered this approach. Recent methods like Block Sparse Attention
+(
+12
+)
+and XAttention
+(
+40
+)
+refine block selection.
+Native sparse methods like MoBA
+(
+23
+)
+and Native Sparse Attention
+(
+43
+)
+train from scratch with sparsity.
+Post-training methods
+(
+46
+;
+39
+;
+34
+;
+15
+;
+19
+)
+prune existing models.
+Our work provides theoretical analysis of why MoBA works via a signal-to-noise ratio that guides design.
+
+Implementation
+
+Sparse patterns are challenging to implement efficiently due to irregular memory access.
+While Triton
+(
+35
+)
+simplifies kernel development, peak performance requires careful optimization
+(
+13
+;
+18
+;
+22
+;
+42
+)
+.
+FlashMoBA enables practical deployment of small-block configurations.
+
+7
+Conclusion
+
+We presented a statistical framework for understanding Mixture of Block Attention. Our analysis reveals the mechanism behind its success: a signal-to-noise ratio
+\text{SNR}=\Delta\mu_{\text{eff}}\sqrt{\frac{d}{2B}}
+that governs block selection accuracy. This insight yields key design principles validated through controlled experiments: optimizing the
+d/B
+ratio (which we validate by varying
+B
+while controlling for model capacity) and using key convolution to enhance signal clustering. Optimized MoBA matches or exceeds dense attention on real-world tasks while using 12.5% of the computation.
+
+To make small blocks practical, we developed FlashMoBA, achieving up to 14.7× speedup over FlashAttention-2. This enables deployment of theoretically optimal configurations that were previously impractical. For applications requiring million-token contexts, our work shows that theoretical analysis combined with efficient implementation can scale beyond dense attention’s limits.
+
+Appendix A
+Detailed Derivation of Signal-to-Noise Ratio
+
+We provide the complete mathematical derivation of the SNR formula for MoBA’s block selection mechanism.
+
+A.1
+Problem Setup
+
+Consider a query
+\mathbf{q}_{i}
+seeking information from a specific key
+\mathbf{k}^{*}
+(the signal) among
+N
+keys. Let
+j^{*}
+denote the block containing
+\mathbf{k}^{*}
+. MoBA computes similarity scores
+s_{j}=\mathbf{q}_{i}^{\top}\mathbf{\tilde{k}}_{j}
+where
+\mathbf{\tilde{k}}_{j}=\frac{1}{B}\sum_{\mathbf{k}\in\mathbf{K}_{j}}\mathbf{k}
+is the centroid of block
+j
+.
+
+For the signal block
+j^{*}
+:
+
+s_{j^{*}}=\frac{1}{B}\left(\mathbf{q}_{i}^{\top}\mathbf{k}^{*}+\sum_{\mathbf{k}\in\mathbf{K}_{j^{*}}\setminus\{\mathbf{k}^{*}\}}\mathbf{q}_{i}^{\top}\mathbf{k}\right)
+
+We define successful retrieval as
+\text{rank}(s_{j^{*}})\leq k
+.
+
+A.2
+Statistical Modeling
+
+We model the expected dot products as:
+
+\displaystyle\mathbb{E}[\mathbf{q}_{i}^{\top}\mathbf{k}^{*}]
+
+\displaystyle=\mu_{\text{signal}}
+
+(4)
+
+\displaystyle\mathbb{E}[\mathbf{q}_{i}^{\top}\mathbf{k}]
+
+\displaystyle=\mu_{\text{noise}}\quad\text{for }\mathbf{k}\neq\mathbf{k}^{*}
+
+(5)
+
+Define the similarity gap
+\Delta\mu=\mu_{\text{signal}}-\mu_{\text{noise}}>0
+.
+
+To account for semantic clustering, let
+m
+denote the number of keys in the signal block with elevated similarity
+\mu_{\text{cluster}}
+where
+\mu_{\text{noise}}<\mu_{\text{cluster}}\leq\mu_{\text{signal}}
+. The expected scores become:
+
+\displaystyle\mathbb{E}[s_{j^{*}}]
+
+\displaystyle=\frac{1}{B}[\mu_{\text{signal}}+(m-1)\mu_{\text{cluster}}+(B-m)\mu_{\text{noise}}]
+
+(6)
+
+\displaystyle\mathbb{E}[s_{j}]
+
+\displaystyle=\mu_{\text{noise}}\quad\text{for }j\neq j^{*}
+
+(7)
+
+The expected advantage of the signal block is:
+
+\mathbb{E}[s_{j^{*}}]-\mathbb{E}[s_{j}]=\frac{\Delta\mu+(m-1)(\mu_{\text{cluster}}-\mu_{\text{noise}})}{B}=\frac{\Delta\mu_{\text{eff}}}{B}
+
+where
+\Delta\mu_{\text{eff}}=\Delta\mu+(m-1)(\mu_{\text{cluster}}-\mu_{\text{noise}})
+is the effective similarity gap.
+
+A.3
+Variance Analysis
+
+Assuming independent dot products with variance
+\sigma^{2}\approx 1/d
+for normalized vectors in high dimensions, the score difference
+D=s_{j^{*}}-s_{j}
+between signal and noise blocks satisfies:
+
+\displaystyle\mathbb{E}[D]
+
+\displaystyle=\frac{\Delta\mu_{\text{eff}}}{B}
+
+(8)
+
+\displaystyle\text{Var}(D)
+
+\displaystyle=\text{Var}(s_{j^{*}})+\text{Var}(s_{j})=\frac{\sigma^{2}}{B}+\frac{\sigma^{2}}{B}=\frac{2\sigma^{2}}{B}
+
+(9)
+
+A.4
+Retrieval Probability
+
+Under the Central Limit Theorem for large
+B
+,
+D\sim\mathcal{N}(\Delta\mu_{\text{eff}}/B,2\sigma^{2}/B)
+. The probability that a noise block outranks the signal block is:
+
+\displaystyle p=P(D<0)
+
+\displaystyle=\Phi\left(\frac{0-\Delta\mu_{\text{eff}}/B}{\sqrt{2\sigma^{2}/B}}\right)
+
+(10)
+
+\displaystyle=\Phi\left(-\frac{\Delta\mu_{\text{eff}}}{\sigma\sqrt{2B}}\right)
+
+(11)
+
+\displaystyle=\Phi\left(-\Delta\mu_{\text{eff}}\sqrt{\frac{d}{2B}}\right)
+
+(12)
+
+This yields the signal-to-noise ratio:
+
+\text{SNR}=\Delta\mu_{\text{eff}}\sqrt{\frac{d}{2B}}
+
+For reliable top-
+k
+retrieval with
+n
+blocks, we need
+p<k/n
+, which requires
+\text{SNR}>\Phi^{-1}(1-k/n)
+.
+
+Appendix B
+Key Convolution Design
+
+To encourage within-block clustering of semantically related tokens, we apply a short convolution operator to the key representations. This section details the specific design choices.
+
+B.1
+Architecture
+
+We use a
+depthwise causal 1-D convolution
+applied to token-level keys before they are used for routing and attention computation. The key design choices are:
+
+Depthwise convolution.
+
+The convolution is depthwise-separable with
+groups=hidden_size
+, meaning each channel (dimension) of the key vector is filtered independently. This reduces parameters while maintaining expressiveness across all dimensions.
+
+Causal structure.
+
+The convolution is causal (left-padded), ensuring that the representation at position
+t
+only depends on positions
+\{t-W+1,\ldots,t\}
+where
+W
+is the kernel width. This preserves the autoregressive property required for language modeling.
+
+Kernel size.
+
+We experiment with kernel widths
+W\in\{3,5\}
+, denoted as
+kconv3
+and
+kconv5
+respectively in our experiments. These short receptive fields allow local signal diffusion without excessive computational overhead.
+
+Activation and residual.
+
+Following recent work on efficient linear transformers
+(
+41
+)
+, we apply:
+
+•
+
+SiLU activation
+:
+\sigma(x)=x\cdot\text{sigmoid}(x)
+applied element-wise after convolution
+
+•
+
+Residual connection
+: The original key is added back to the convolved output
+
+Formally, for a key vector
+\mathbf{k}_{t}\in\mathbb{R}^{d}
+at position
+t
+, the transformed key is:
+
+\mathbf{k}^{\prime}_{t}=\mathbf{k}_{t}+\text{SiLU}\left(\sum_{\ell=0}^{W-1}\mathbf{W}_{\ell}\odot\mathbf{k}_{t-\ell}\right)
+
+where
+\mathbf{W}_{\ell}\in\mathbb{R}^{d}
+are the learnable kernel weights for each lag
+\ell
+, and
+\odot
+denotes element-wise multiplication (due to depthwise structure).
+
+B.2
+Effect on Routing
+
+The key convolution is applied
+before
+block centroid computation. For block
+j
+, the centroid used for routing becomes:
+
+\mathbf{\tilde{k}}_{j}=\frac{1}{B}\sum_{\mathbf{k}^{\prime}\in\mathbf{K}^{\prime}_{j}}\mathbf{k}^{\prime}
+
+where
+\mathbf{K}^{\prime}_{j}
+contains the convolved keys in block
+j
+.
+
+During training, this design encourages gradient flow between neighboring tokens within a block. When the router learns to select a block containing relevant information, the gradients backpropagate through the convolution, implicitly encouraging nearby tokens to align with the query direction. This increases the number of related tokens
+m
+within selected blocks and raises their average affinity
+\mu_{\text{cluster}}
+, thereby amplifying
+\Delta\mu_{\text{eff}}
+according to our statistical model (Section
+3
+).
+
+Appendix C
+Kernel Implementation Details
+
+C.1
+FlashMoBA Top-K Selection and Index Reformatting
+
+Our algorithm for top-k selection and index reformatting, which we name Flash TopK, is divided into three logical stages, each implemented as a fused kernel to minimize HBM data transfers.
+
+1. Computation of Block Centroids.
+
+We first compute key-block centroids using a fused Triton kernel (Algorithm
+2
+). This step produces a centroid matrix
+\mathbf{\tilde{K}}
+that is
+B
+times smaller than the original key matrix
+\mathbf{K}
+, significantly reducing subsequent HBM accesses.
+
+Algorithm 2
+
+Fused Key-Block Centroid Computation
+
+1:
+
+Key matrix
+\mathbf{K}\in\mathbb{R}^{N\times d}
+, block size
+B
+.
+
+2:
+
+Partition
+\mathbf{K}
+into blocks
+\{\mathbf{K}_{j}\}_{j=0}^{T_{k}-1}
+, where
+T_{k}=\lceil N/B\rceil
+.
+
+3:
+
+Initialize centroid matrix
+\mathbf{\tilde{K}}\in\mathbb{R}^{T_{k}\times d}
+.
+
+4:
+
+for
+
+j\in[0,T_{k}-1]
+
+do
+
+in parallel
+
+5:
+
+\mathbf{\tilde{K}}[j,:]\leftarrow\frac{1}{|\mathbf{K}_{j}|}\sum_{\mathbf{v}\in\mathbf{K}_{j}}\mathbf{v}
+
+\triangleright
+Compute mean of each block
+
+6:
+
+end
+
+for
+
+2. Fused Top-K Selection.
+
+With the block centroids pre-computed, a second fused kernel identifies the top-k blocks for each query, adopting the tiling strategy from FlashAttention-2. For each block of queries loaded into SRAM, the kernel iterates through the centroid matrix
+\mathbf{\tilde{K}}
+in chunks. It computes gating scores and maintains a running list of the top-k indices and their corresponding scores for each query on-chip. This update is performed with a bubble sort
+algorithm which is highly efficient for
+k\ll N
+, as detailed in Algorithm
+3
+. This process avoids materializing the full score matrix to HBM.
+
+Algorithm 3
+
+Fused Top-K Selection
+
+1:
+
+Matrices
+\mathbf{Q}\in\mathbb{R}^{N\times d}
+and
+\mathbf{\tilde{K}}\in\mathbb{R}^{\lceil\frac{N}{B}\rceil\times d}
+in HBM, MoBA key-block size
+B
+, MoBA top-k
+k
+, block sizes
+B_{c},B_{r}
+
+2:
+
+Divide
+\mathbf{Q}
+into
+T_{r}=\lceil\frac{N}{B_{r}}\rceil
+blocks
+\mathbf{Q}_{i}
+of dimensions
+B_{r}\times d
+each, and divide
+\mathbf{\tilde{K}}
+into
+T_{c}=\lceil\frac{T_{k}}{B_{c}}\rceil
+blocks
+\mathbf{\tilde{K}}_{j}
+of dimensions
+B_{c}\times d
+each.
+
+3:
+
+Initialize the top-k indices matrix
+\mathbf{I}\in\mathbb{Z}^{N\times k}
+in HBM.
+
+4:
+
+for
+
+0\leq i<T_{r}
+
+do
+
+in parallel
+
+5:
+
+Load
+\mathbf{Q}_{i}
+from HBM to SRAM.
+
+6:
+
+On chip, initialize
+\mathbf{I}_{i}=(-1)_{B_{r}\times k}
+and
+\mathbf{T}_{i}=(-\infty)_{B_{r}\times k}
+in SRAM for the actual attention scores.
+
+7:
+
+for
+
+0\leq j<T_{c}
+
+do
+
+8:
+
+Load
+\mathbf{\tilde{K}}_{j}
+from HBM to on-chip SRAM.
+
+9:
+
+On-chip, compute scores
+\mathbf{S}=\mathbf{Q}_{i}\mathbf{\tilde{K}}_{j}^{\top}
+and apply the causal mask.
+
+10:
+
+for
+
+0\leq r<B_{r}
+
+do
+
+in parallel
+
+11:
+
+for
+
+0\leq c<B_{c}
+
+do
+
+12:
+
+Update the top-k indices and scores if necessary using bubble sort.
+
+13:
+
+end
+
+for
+
+14:
+
+end
+
+for
+
+15:
+
+end
+
+for
+
+16:
+
+Write the final
+\mathbf{I}_{i}
+to HBM as the
+i
+-th block of
+\mathbf{I}
+.
+
+17:
+
+end
+
+for
+
+3. Reformatting Indices to Varlen Format.
+
+To facilitate efficient densification in the main attention pass, the query-centric top-k indices must be reformatted into a key-block-centric, variable-length (
+varlen
+) layout. This layout stores, for each key-block, a compact list of the queries that attend to it. This transformation is implemented as a two-stage epilogue, detailed in Algorithm
+4
+. The first kernel calculates the memory offsets for each key-block via a prefix sum over the histogram computed in the top-k selection stage. The second kernel then reads the query-centric indices and scatters the corresponding query IDs into their correct positions in the final varlen array.
+
+Algorithm 4
+
+Reformatting Indices to Varlen Key-Block-Major
+
+1:
+
+Query-centric indices
+\mathbf{I}\in\mathbb{Z}^{N\times k}
+, key-block counts
+\mathbf{C}\in\mathbb{Z}^{T_{k}}
+.
+
+2:
+
+Initialize offset array
+\text{Offset}\in\mathbb{Z}^{T_{k}}
+and varlen array
+A\in\mathbb{Z}^{(N\times k)}
+.
+
+3:
+
+\text{Offset}[j]\leftarrow\sum_{i=0}^{j-1}\mathbf{C}[i]
+, for
+j=0,\dots,T_{k}-1
+
+\triangleright
+Stage 1: Compute offsets
+
+4:
+
+Reset temporary counts
+\mathbf{C}
+to zero.
+
+5:
+
+for
+each query
+i
+and its selected block index
+b\in\mathbf{I}[i,:]
+
+do
+
+in parallel
+
+\triangleright
+Stage 2: Scatter indices
+
+6:
+
+p\leftarrow\text{atomicAdd}(\&\mathbf{C}[b],1)
+
+7:
+
+A[\text{Offset}[b]+p]\leftarrow i
+
+8:
+
+end
+
+for
+
+C.2
+FlashMoBA Forward Pass Kernel
+
+The core of our forward pass kernel is the ”gather-and-densify” strategy, which allows us to use the efficient dense computation patterns of FlashAttention-2 in a sparse context. To manage this, we distinguish between two types of processing blocks:
+
+•
+
+Logical Blocks:
+These are the large, contiguous blocks of queries (
+\mathbf{Q_{i}}
+) and keys (
+\mathbf{K_{j}}
+) that the kernel iterates over in its outer loops. Importantly, a logical key block is equivalent to a MoBA key block.
+
+•
+
+Physical Blocks:
+These are the smaller tiles (e.g.,
+64\times 64
+or
+128\times 128
+) that are loaded into SRAM for the actual matrix multiplication. The optimal size of these blocks depends on the specific GPU architecture and model head dimension.
+
+As described in Algorithm
+1
+, our kernel assigns a logical query block
+\mathbf{Q_{i}}
+to each thread block. This thread block then iterates through all logical key blocks
+\mathbf{K_{j}}
+. For each
+(\mathbf{Q_{i}},\mathbf{K_{j}})
+pair, it uses the varlen indices to identify the relevant subset of queries within
+\mathbf{Q_{i}}
+. This sparse subset of queries is then processed in dense physical blocks: one physical block of queries is gathered from HBM into a dense SRAM buffer for computation.
+
+This two-level blocking strategy is the key to our kernel’s performance. By caching a dense physical block of gathered queries in SRAM, it can be reused for matrix multiplication against all the physical tiles that form a logical key block
+\mathbf{K_{j}}
+. This reuse effectively amortizes the cost of irregular gather operations over several highly efficient, dense GEMMs. The dimensions of the logical blocks present a tuning opportunity: increasing the logical key block size enhances the query reuse factor, while increasing the logical query block size results in a larger, more computationally efficient subset of gathered queries, albeit at the cost of higher on-chip memory usage.
+
+C.3
+FlashMoBA Backward Pass Kernel
+
+The backward pass adapts the memory-efficient design of FlashAttention-2 and is implemented as a sequence of three fused kernels.
+First, a preprocessing kernel computes the per-query dot product between the output gradients and the outputs (
+\mathbf{dO}\cdot\mathbf{O}
+), which is required for the softmax gradient calculation.
+The main kernel then parallelizes the computation across the key dimension, where each thread block is responsible for a logical key block
+(\mathbf{K_{j},V_{j}})
+. For its assigned block, a thread block uses the pre-computed varlen indices to gather the corresponding sparse subsets of queries (
+\mathbf{Q}
+), and output gradients (
+\mathbf{dO}
+) from HBM. With this data densified on-chip, the kernel recomputes the attention scores to avoid storing the large attention matrix, and then calculates the gradients
+\mathbf{dK_{j}}
+,
+\mathbf{dV_{j}}
+, and partial
+\mathbf{dQ}
+. The gradients for the current block,
+\mathbf{dK_{j}}
+and
+\mathbf{dV_{j}}
+, are written directly to HBM, while the partial query gradients are atomically added to a high-precision global buffer,
+\mathbf{dQ_{accum}}
+.
+Finally, a post-processing kernel converts the accumulated
+\mathbf{dQ_{accum}}
+buffer into the final data type and writes it to the output gradient tensor
+\mathbf{dQ}
+. Algorithm
+5
+details this process.
+
+Algorithm 5
+
+FlashMoBA Backward Pass
+
+1:
+
+Matrices
+\mathbf{Q,K,V,O,dO}\in\mathbb{R}^{N\times d}
+in HBM, vector
+L\in\mathbb{R}^{N}
+in HBM, MoBA arrays
+C,A,\text{Offset}
+and block sizes
+B_{c},B_{r}
+.
+
+2:
+
+Divide
+\mathbf{K,V}
+into
+T_{c}=\lceil N/B_{c}\rceil
+blocks
+\mathbf{K_{j}}
+and
+\mathbf{V_{j}}
+, of size
+B_{c}\times d
+each.
+
+3:
+
+Initialize
+\mathbf{dQ}=(0)_{N\times d}
+in HBM. Divide
+\mathbf{dK,dV}\in\mathbb{R}^{N\times d}
+into
+T_{c}
+blocks
+\mathbf{dK_{j}}
+and
+\mathbf{dV_{j}}
+, of size
+B_{c}\times d
+each.
+
+4:
+
+Compute
+D=\text{rowsum}(\mathbf{dO\circ O})\in\mathbb{R}^{N}
+(pointwise multiply), write
+D
+to HBM.
+
+5:
+
+for
+
+0\leq j<T_{c}
+
+do
+
+6:
+
+Load
+\mathbf{K_{j},V_{j}}
+from HBM to on-chip SRAM.
+
+7:
+
+Initialize
+\mathbf{dK_{j}}=\mathbf{dV_{j}}=(0)_{B_{c}\times d}
+on SRAM.
+
+8:
+
+Let
+\mathcal{I}_{j}=\{A_{p}\mid\text{Offset}_{j}\leq p<\text{Offset}_{j}+C_{j}\}
+be the set of
+C_{j}
+query indices that attend to block
+j
+.
+
+9:
+
+The processing of these queries is tiled into
+T_{r}=\lceil C_{j}/B_{r}\rceil
+blocks.
+
+10:
+
+for
+
+0\leq i<T_{r}
+
+do
+
+11:
+
+Gather sparse
+\mathbf{Q_{i}^{(j)},O_{i}^{(j)},dO_{i}^{(j)},}L_{i}^{(j)},D_{i}^{(j)}
+from HBM to SRAM in a dense format.
+
+12:
+
+On chip, compute
+\mathbf{S_{ij}=Q_{i}^{(j)}K_{j}^{T}}\in\mathbb{R}^{B_{r}\times B_{c}}
+.
+
+13:
+
+On chip, compute
+\mathbf{P_{ij}}=\exp(\mathbf{S_{ij}}-L_{i}^{(j)})\in\mathbb{R}^{B_{r}\times B_{c}}
+.
+
+14:
+
+On chip, compute
+\mathbf{dV_{j}\leftarrow dV_{j}+(P_{ij})^{T}dO_{i}^{(j)}}\in\mathbb{R}^{B_{c}\times d}
+.
+
+15:
+
+On chip, compute
+\mathbf{dP_{ij}=dO_{i}^{(j)}V_{j}^{T}}\in\mathbb{R}^{B_{r}\times B_{c}}
+.
+
+16:
+
+On chip, compute
+\mathbf{dS_{ij}=P_{ij}\circ(dP_{ij}}-D_{i}^{(j)})\in\mathbb{R}^{B_{r}\times B_{c}}
+.
+
+17:
+
+Atomically add
+\mathbf{dS_{ij}K_{j}}
+to
+\mathbf{dQ_{{accum}_{i}}^{(j)}}
+.
+
+18:
+
+On chip, compute
+\mathbf{dK_{j}\leftarrow dK_{j}+dS_{ij}^{T}Q_{i}^{(j)}}\in\mathbb{R}^{B_{c}\times d}
+.
+
+19:
+
+end
+
+for
+
+20:
+
+Write
+\mathbf{dK_{j},dV_{j}}
+to HBM.
+
+21:
+
+end
+
+for
+
+22:
+
+return
+
+\mathbf{dQ,dK,dV}
+.
+
+Multi-query and grouped-query attention.
+
+Multi-query attention (MQA)
+33
+and grouped-query attention (GQA)
+1
+are attention variants that reduce KV cache size during inference by sharing key and value heads across multiple query heads. Like FlashAttention-2, we support these patterns efficiently by remapping attention heads and correctly aggregating over them. Instead of duplicating key/value heads, we adjust indexing to achieve equivalent computation. During backpropagation, gradients for keys and values (
+\mathbf{dK,dV}
+) are summed across the shared heads.
+

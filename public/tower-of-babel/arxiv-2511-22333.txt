@@ -1,0 +1,1804 @@
+PAT: Accelerating LLM Decoding via P refix- A ware A t tention with Resource Efficient Multi-Tile Kernel
+Jinjun Yi, Zhixin Zhao, Yitao Hu, Ke Yan, Weiwei Sun, Hao Wang, Laiping Zhao, Yuhao Zhang, Wenxin Li, Keqiu Li
+
+Abstract
+. LLM serving is increasingly dominated by decode attention, which is a memory-bound operation due to massive KV cache loading from global memory. Meanwhile, real-world workloads exhibit substantial, hierarchical shared prefixes across requests ( e.g., system prompts, tools/templates, RAG). Existing attention implementations fail to fully exploit prefix sharing: one-query-per-CTA execution repeatedly loads shared prefix KV cache, while one-size-fits-all tiling leaves on-chip resources idle and exacerbates bubbles for uneven KV lengths. These choices amplify memory bandwidth pressure and stall memory-bound decode attention. This paper introduces PAT, a prefix-aware attention kernel implementation for LLM decoding that organizes execution with a pack-forward-merge paradigm. PAT packs queries by shared prefix to reduce repeated memory accesses, runs a customized multi-tile kernel to achieve high resource efficiency. It further applies practical multi-stream forwarding and KV splitting to reduce resource bubbles. The final merge performs online softmax with negligible overhead. We implement PAT as an off-the-shelf plugin for vLLM. Evaluation on both real-world and synthetic workloads shows that PAT reduces attention latency by 67.4% on average and TPOT by 13.6-83.4% under the same configurations against state-of-the-art attention kernels.
+
+
+
+1.
+Introduction
+
+Tranformer-based Large Language Models (LLMs) have rapidly advanced across diverse domains, including conversational assistants
+(
+Dam et al. 2024
+;
+Dong et al. 2023
+)
+, code generation
+(
+Anthropic 2025
+;
+Hui et al. 2024
+)
+, retrieval-augmented generation (RAG)
+(
+Lewis et al. 2020
+;
+Yao et al. 2025
+)
+, and agent/tool workflows
+(
+Microsoft 2025
+;
+Yuan et al. 2024
+)
+. As deployment grows, latency and resource efficiency of online inference have become increasingly critical. While prior work has explored optimizations in memory management
+(
+Kwon et al. 2023
+;
+Xu et al. 2025
+)
+, scheduling
+(
+Zhong et al. 2024
+;
+Sun et al. 2024
+)
+, quantization
+(
+Lin et al. 2024b
+;
+Chee et al. 2023
+)
+, and architecture
+(
+Zhou et al. 2022
+;
+Liu et al. 2024
+)
+, there remain new challenges and opportunities. We highlight two emerging trends below.
+
+Longer contexts and outputs.
+Context length has scaled to millions of tokens
+(
+AI 2025
+)
+, while techniques like Chain-of-Thought (CoT)
+(
+Wei et al. 2022
+)
+demand longer outputs. As a result, decode attention (
+i.e.,
+attention operations in the decoding stage) increasingly dominates end-to-end latency due to repeated loading of growing KV caches from global to on-chip memory, which poses a memory-bound challenge.
+
+Shared prefixes across requests.
+System prompts, RAG documents, and agent templates introduce multi-level shared prefixes across requests, creating an optimization opportunity. Existing systems
+(
+Zheng et al. 2024b
+;
+Kwon et al. 2023
+)
+implement prefix KV cache reuse, which reduces memory footprint by storing and reusing KV cache across requests. However, it can
+not
+reduce global memory accesses, which is the bottleneck for decode attention, thereby leading to higher attention latency.
+
+Recent attention kernel implementations aim to reduce attention latency
+(
+Shah et al. 2024
+;
+Ye et al. 2025
+;
+Ye et al. 2024b
+;
+Pan et al. 2025
+;
+Song et al. 2024
+;
+Zhu et al. 2024
+)
+, but still face redundant KV cache loads from global memory and inefficient resource utilization.
+Query-centric
+kernels
+(
+Dao et al. 2022
+;
+Dao 2023
+;
+Ye et al. 2025
+;
+Song et al. 2024
+)
+follow a one-query-per-CTA strategy to map each query and corresponding KV cache into an independent Cooperative Thread Array (CTA; also known as a thread block) for execution on the GPU, causing redundant global memory loads for shared prefixes.
+KV-centric
+kernels
+(
+Pan et al. 2025
+;
+Zhu et al. 2024
+;
+Yao et al. 2024
+;
+Ye et al. 2024b
+)
+instead pack the KV cache of cross-query shared prefix into one CTA to reduce redundant memory accesses, but adopt a one-size-fits-all design that fixes the tile size of the GPU kernel
+(
+NVIDIA 2025a
+)
+and applies padding to fill the tile, which wastes on-chip memory and limits CTA concurrency.
+
+Based on the analysis, we argue that
+an efficient attention kernel implementation for LLM decoding should be memory-oriented with prefix-aware execution
+, so as to reduce redundant memory accesses and maintain high resource efficiency. However, the dynamicity of workloads makes this design non-trivial. First, the combination of multi-level shared prefixes and the dynamic join-and-leave nature of continuous batching makes the structure of shared KV caches in a decode batch (
+i.e.,
+batched queries in decode stage) variable across decode steps. The attention kernel must pack the decode batch into CTAs effectively, so as to reduce redundant global memory accesses with low runtime overhead. Second, the autoregressive nature of LLMs makes queries have diverse KV lengths, and the number of queries that share the same KV blocks in one CTA varies over time. These features bring dynamic hardware resource requirements per CTA, which in turn affect the memory bandwidth usage and GPU utilization. The attention kernel must adapt to the dynamicity to achieve high resource efficiency.
+
+To address these challenges, we present PAT, an attention kernel implementation for LLM decode stage with a
+pack–forward–merge
+execution paradigm. Specifically, in the
+pack stage
+(§
+5
+), PAT employs a prefix-aware pack scheduler and a lazy update mechanism, which efficiently pack decode batches into CTAs to reduce redundant global memory accesses with negligible overhead. It further designs a multi-tile kernel based on resource-efficiency analysis, so as to adapt to CTA dynamicity and avoid on-chip memory waste. In the
+forward stage
+(§
+6
+), PAT designs a multi-stream forward and long-KV split strategy, which parallelizes the multi-tile kernel across multiple CUDA streams and splits CTAs with excessively long KV lengths. These designs enable PAT to eliminate execution bubbles and achieve high global memory bandwidth utilization. In the
+merge stage
+(§
+7
+), PAT applies a lightweight kernel with online softmax
+(
+Dao et al. 2022
+)
+, which merges partial results across CTAs for each query.
+
+In summary, this paper makes the following contributions:
+
+(1)
+
+We provide an in-depth analysis of the bottlenecks in decode attention (§
+2
+) and the optimization opportunities and challenges introduced by shared prefixes (§
+3
+), from both hardware characteristics and the attention execution pipeline perspectives.
+
+(2)
+
+We design and implement a prefix-aware attention kernel PAT for LLM decoding. It incorporates several novel designs within the pack–forward–merge paradigm to reduce redundant global memory accesses and achieve efficient hardware utilization (§
+4
+-§
+7
+).
+
+(3)
+
+We evaluate PAT on synthetic and real-world workloads, demonstrating that compared with state-of-the-art baselines, it reduces attention latency by 67.4% on average under the same decode batches (§
+8.3
+) and lowers TPOT by 13.6–83.4% under the same request rate (§
+8.4
+).
+
+2.
+Background
+
+2.1.
+LLM Inference and Attention
+
+(a)
+
+(b)
+
+Figure 1
+.
+Latency breakdown of Llama-3-8B and Qwen3-8B across context length on A100, vLLM v0.9.0, batch size 64
+
+Figure 2
+.
+GPU architecture of typical NVIDIA GPUs.
+
+Transformer-based Large Language Models (LLMs) follow an autoregressive inference process with two phases: prefill and decode. In the prefill phase, the model performs a full forward pass over the input sequence to generate the first token. The decode phase then iteratively generates one token at a time until reaching an end-of-sequence token or a preset length. Each decode step involves three major computations: Self-Attention, Query-Key-Value-Output (QKVO) projection, and Multi-Layer Perceptron (MLP). Among these, Self-Attention is central for modeling global dependencies as:
+
+\text{Attention}(Q,K,V)=\text{softmax}\left(\frac{{\color[rgb]{1,0.5,0}\bm{QK^{T}}}}{\sqrt{d_{k}}}\right){\color[rgb]{1,0.5,0}\bm{V}}
+
+During decoding, the query
+Q
+from the current token attends to all previous keys
+K
+and values
+V
+. Since
+K
+and
+V
+do not change across steps, they are stored in global memory using a Key-Value (KV) Cache, reducing redundant computation but increasing memory footprint.
+
+2.2.
+Memory Bottleneck of Attention
+
+Driven by the inference scaling law
+(
+Wu et al. 2025
+)
+, LLMs are trending toward
+longer contexts
+and
+longer outputs
+. For instance, Llama-4 supports up to 10 million input tokens
+(
+AI 2025
+)
+, and Chain-of-Thought prompting
+(
+Wei et al. 2022
+)
+has significantly increased output lengths for complex reasoning.
+
+Although KV Caching avoids repeated computation, it has shifted the bottleneck from compute to memory access: each decode step must fetch a growing amount of cached
+K
+/
+V
+data from global memory to on-chip memory
+(
+Zadouri et al. 2025
+;
+Behnam et al. 2025
+)
+. As input and output lengths grow, this access cost dominates inference latency. For models like Llama-3-8B and Qwen3-8B, decode attention can contribute up to 68% of the total latency, as shown in Figure
+1
+.
+
+2.3.
+GPU Execution Model
+
+To fully understand the decode attention bottleneck, we should examine the GPU’s hardware and software architecture, as well as the execution process of the attention kernel. As shown in Figure
+2
+, the GPU hardware architecture is composed of
+1
+
+global memory
+,
+2
+
+L2 Cache
+, an array of Streaming Multiprocessors (SMs), and a global hardware scheduler (GigaThread Engine). Each SM is a basic computational unit containing various CUDA Cores, Tensor Cores, and its own hierarchical memory structure: a programmer-managed
+3
+
+Shared Memory / L1 Cache
+that enables low-latency data exchange among threads within a Cooperative Thread Array (CTA, aka Thread Block), and a
+4
+
+Register File
+for thread-private storage. As shown in Table
+1
+, the GPU memory hierarchy involves a significant trade-off between size and speed, with global memory access being orders of magnitude slower than on-chip memory access.
+
+Level
+
+Shared By
+
+Size
+
+Latency
+
+Bandwidth
+∗
+
+Type
+
+Register
+
+Thread
+
+256KB/SM
+†
+
+\sim
+2ns
+
+\sim
+20 TB/s
+
+on-chip
+
+Shared Memory
+
+/ L1 Cache
+
+CTA
+
+192KB/SM
+‡
+
+\sim
+20ns
+
+\sim
+19 TB/s
+
+on-chip
+
+L2 Cache
+
+All SMs
+
+40MB
+
+\sim
+140ns
+
+\sim
+2 TB/s
+
+on-chip
+
+Global Memory
+
+All SMs
+
+80GB
+
+\sim
+200ns
+
+\sim
+2 TB/s
+
+off-chip
+
+∗
+Read/write bandwidth from the upper memory level.
+
+†
+Each thread is limited to 255 registers (4*8 bits each).
+
+‡
+Each CTA can address up to 163 KB of shared memory.
+
+Table 1
+.
+Memory hierarchy of A100-SXM4-80GB
+(
+NVIDIA 2020
+;
+Abdelkhalik et al. 2022
+)
+.
+
+Figure 3
+.
+(a) Two General Matrix-Vector multiplications (GEMV) in attention. (b) Tiling execution pipeline.
+
+When executing an attention kernel, the workload is divided into CTAs, scheduled across SMs. During this process, the required KV cache data is transferred from
+slow global memory
+up the hierarchy into
+fast on-chip shared memory
+, where it is finally loaded into registers for computation. State-of-the-art implementations
+(
+Dao et al. 2022
+;
+Dao 2023
+;
+Ye et al. 2025
+)
+are designed to exploit this memory hierarchy. For example, FlashAttention
+(
+Dao et al. 2022
+;
+NVIDIA 2025a
+)
+partitions K/V caches into small tiles along the sequence length (Figure
+3
+a) and processes them in a pipelined fashion: while one tile is computed, the next is prefetched asynchronously (Figure
+3
+b), reducing memory latency.
+
+Nonetheless, decode attention remains bottlenecked by two challenges: limited bandwidth between global and on-chip memory, and low arithmetic intensity due to heavy KV cache loading. Thus, further optimization must follow two principles: (1)
+Reduce KV cache transfer loads from global memory
+, and (2)
+Fully utilize available memory bandwidth
+.
+
+3.
+Motivation
+
+In this section, we first characterize the shared-prefix pattern commonly observed in LLM workloads (§
+3.1
+) and identify two limitations in existing attention implementations under this pattern: redundant global memory accesses (§
+3.2
+) and low hardware utilization (§
+3.3
+). We then introduce the pack–forward–merge paradigm to address these problems (§
+3.4
+) and analysis the corresponding challenges (§
+3.5
+).
+
+3.1.
+Shared Prefixes and Prefix Reuse
+
+Shared prefixes are prevalent in modern LLM workloads
+(
+ope 2025
+;
+Wang et al. 2020
+;
+Jin et al. 2024
+)
+, with studies showing that 40–62% of KV cache prefixes are shared across requests
+(
+Qin et al. 2025
+;
+Wang et al. 2025
+)
+. These prefixes often form multi-level hierarchies
+(
+Zheng et al. 2024b
+;
+Pan et al. 2025
+)
+. For example, a base system prompt shared by all users, followed by task-specific prefixes shared within subgroups.
+
+Systems like SGLang
+(
+Zheng et al. 2024b
+)
+and vLLM
+(
+Kwon et al. 2023
+)
+support
+prefix reuse
+by mapping shared logical prefixes to a single physical copy in GPU global memory. This reduces KV cache memory usage and improves concurrency. However, it can
+not
+reduce global memory access, which remains the decode attention bottleneck. To understand why, we analyze two key inefficiencies in current attention kernels under shared-prefix scenarios: redundant memory access (§
+3.2
+) and underutilized hardware resources (§
+3.3
+) as follows.
+
+3.2.
+Redundant Memory Access
+
+A major inefficiency in current attention kernels stems from redundant memory accesses. To execute a decode batch, attention kernels use a packing strategy that groups queries and their KV caches into CTAs. In the decode batch with 4 queries shown in Figure
+4
+a, existing kernels’ query-centric paradigm adopts a
+one-query-per-CTA
+packing strategy
+(
+Shah et al. 2024
+;
+Ye et al. 2025
+)
+, where each query and its KV blocks are independently assigned to a CTA (Figure
+4
+b). While simple to schedule, this strategy causes shared KV prefixes (
+e.g.,
+KV-0, KV-1) to be repeatedly loaded from slow global memory into on-chip memory. Although L2 cache offers partial reuse, it is limited by size and bandwidth.
+
+Figure 4
+.
+Comparison of packing strategies. (a) A decode batch of 4 queries with shared prefixes. (b) Query-centric packing causes redundant memory access. (c) KV-centric packing causes memory waste. (d) Memory-centric prefix-aware packing avoids redundancy and improves utilization.
+
+(a)
+
+(b)
+
+Figure 5
+.
+Limitations of existing attention kernels. (a) Average KV cache load from global memory per decode step on the
+toolagent
+and
+conversation
+traces, comparing FlashAttention (FA), PAT, and the theoretical optimum. (b) Two-dimensional resource inefficiencies.
+
+To examine the inefficiency of the one-query-per-CTA strategy, we profile FlashAttention
+(
+Shah et al. 2024
+)
+using
+ncu
+
+(
+NVIDIA 2025g
+)
+, comparing its KV cache traffic with the theoretical minimum (where each shared block is loaded once), and with PAT. As shown in Figure
+5(a)
+, FlashAttention incurs 4.3-8.7
+\times
+more KV cache than the theoretical minimum, and 4.1–7.6
+\times
+more than PAT. This result confirms significant overhead from redundant memory access for the one-query-per-CTA paradigm.
+
+Observation #1
+: Existing query-centric attention kernels suffer from substantial memory access redundancy due to their one-query-per-CTA execution paradigm.
+
+3.3.
+Two-Dimension Resource Inefficiencies
+
+Furthermore, existing attention kernels exhibit inefficient hardware utilization. Both query-centric and KV-centric designs use a tiled pipeline (Figure
+3
+) to overlap memory access and computation. In this paradigm, selecting appropriate tile sizes (
+i.e.,
+query tile size
+m
+and KV tile size
+n
+from Figure
+3
+b) is critical for resource efficiency
+(
+Dao et al. 2022
+)
+. However, existing kernels adopt a
+one-size-fits-all
+design, which specifies a single, hard-coded tile size for all CTAs (
+e.g.,
+
+m=64,n=32
+
+(
+Shah et al. 2024
+)
+).
+
+As shown in Figure
+4
+b-c, this static approach ignores the dynamic nature of LLM workloads, leading to significant resource inefficiencies along two dimensions
+1
+1
+
+1
+
+While specific prior works
+(
+Pan et al. 2025
+)
+design one more query tile sizes
+m
+, it is still insufficient for handling highly dynamic query numbers and KV lengths.
+in Figure
+5(b)
+: (1) Memory Waste (
+\mathbb{I}_{mem}
+): When fewer than
+m
+queries share a KV prefix, CTAs must pad inputs, wasting shared memory and registers to store unused data. (2) Execution Bubble (
+\mathbb{I}_{exe}
+): Due to varying KV lengths across CTAs, fixed-size tiling causes imbalanced workloads, leaving SMs underutilized in the tail stages of execution.
+
+Observation #2
+: Existing query-centric and kv-centric attention kernels suffer from two-dimension resource inefficiencies due to their one-size-fits-all execution paradigm.
+
+3.4.
+Insight: Pack-forward-merge Paradigm
+
+Building on the observations above, we identify two design principles for efficient decode attention:
+(1) Intra-CTA KV Cache Sharing: pack queries with shared KV prefixes into the same CTA (Figure
+4
+c) to enable KV reuse in shared memory and avoid redundant global memory access.
+(2) Resource-Efficient Kernel Design: tailor kernel implementations to GPU architecture and CTA configurations to sustain high memory bandwidth and minimize resource inefficiencies.
+
+Following these principles, we propose a
+pack–forward–merge paradigm
+as follows: (1)
+Pack
+: group queries by shared prefix into CTAs to eliminate redundant KV loads; (2)
+Forward
+: execute CTAs using resource-optimized kernels that output partial results in tiles; (3)
+Merge
+: apply online softmax to combine partial results into final outputs.
+
+3.5.
+Challenges
+
+Although the pack–forward–merge paradigm directly targets the objectives of reducing global memory access and improving resource utilization, it faces two major challenges:
+
+Challenge 1: Packing complexity.
+LLM inference often involves deep, multi-level shared prefixes and long contexts, significantly expanding the packing search space. Each prefix level may yield multiple packing candidates with different trade-offs. Additionally, continuous batching introduces dynamic request changes, requiring frequent packing updates. An effective strategy must account for both prefix hierarchy and batch dynamism, generating CTA assignments with minimal latency (§
+5.1
+).
+
+Challenge 2: Workload variability.
+Autoregressive decoding leads to large variation in KV lengths. Grouping queries by shared prefixes further amplifies variation in CTA sizes, ranging from one to dozens of queries. This variability affects resource demands and execution time across CTAs. The forward stage must use a kernel design that adapts to both hardware and workload characteristics (§
+5.2
+) and employs scheduling strategies to minimize time bubbles (§
+6
+).
+
+4.
+Overview
+
+To address these challenges, we design PAT, an attention kernel implementation that follows the pack-forward-merge paradigm. It serves as a backend for the serving system vLLM
+(
+Kwon et al. 2023
+)
+. In the
+pack
+stage, PAT adopts a profit-model-based heuristic packing strategy to aggregate queries that share KV into a CTA, so as to mitigate redundant global memory accesses (§
+5.1
+). It further designs multi-tile kernels and a runtime tile selector to choose an efficient kernel for each CTA (§
+5.2
+). In the
+forward
+stage, PAT adopts multi-stream execution and a long-KV split strategy to enable efficient kernel execution, which reduces execution bubbles (§
+6
+). Finally, in the
+merge
+stage, PAT uses a lightweight kernel based on online softmax to merge each query’s intermediate results across CTAs and produce the final output (§
+7
+).
+
+5.
+Pack Scheduler
+
+Figure 6
+.
+Workflow of the pack scheduler: (a) An input decode batch with 4 queries. (b) Tree structure block table. (c) Packing scheme 1 that splits leaf nodes with the parent node. (d) Packing scheme 2 that merges specific leaf node with the parent node.
+
+We first introduce a pack scheduler that packs a decode batch into CTAs by shared prefixes to reduce redundant global memory accesses (§
+5.1
+), and then present the customized multi-tile kernels that efficiently execute these CTAs (§
+5.2
+).
+
+5.1.
+Pack Scheduler
+
+Insight and Approach.
+As noted in §
+3.2
+, the one-query-per-CTA paradigm repeatedly loads KV blocks for shared prefixes, worsening the memory bottleneck of decode attention. We therefore introduce a heuristic pack scheduler that (i) abstracts a decode batch’s block table into a prefix tree, (ii) scores candidate packing schemes with a memory-centric profit model, and (iii) packs the decode batch into memory-optimized CTAs to cut redundant global accesses.
+
+Problem Formulation
+Since decode attention is memory-bound (§
+2.3
+and §
+3.2
+), the pack stage aims to minimize global memory accesses for a given decode batch (Figure
+6
+a). The
+input
+is a batch of queries plus a block table where each row lists block IDs for a query; a shared prefix appears as identical leading block IDs across rows. The
+output
+is a partition
+\mathcal{P}=\{P_{1},P_{2},\dots\}
+of CTAs, where each
+P_{i}
+packs queries sharing successive identical prefix blocks (queries may be split across CTAs). We seek
+\mathcal{P}^{\ast}
+that minimizes memory accesses, comprised of loaded KV cache size and per-query intermediate reads/writes due to splits/merges. The search space grows exponentially with query count and prefix lengths
+(
+Pan et al. 2025
+)
+, so an exact solver is impractical for online serving, and we turn to a heuristic pack scheduler described next.
+
+Tree Structure Block Table.
+
+For efficient implementation, the pack scheduler first converts the two-dimensional block table (Figure
+6
+a) into a tree structure block table (Figure
+6
+b). Each internal node represents a shared prefix of KV blocks. It has two attributes: (1)
+l
+, the KV-cache length of this shared prefix, and (2)
+s
+, the number of queries that share it. Each leaf corresponds to one query, and the path from the root to that leaf reconstructs the query’s full KV cache blocks.
+
+Intra-node profit.
+We first discuss the profit and overhead of packing the queries within a single non-leaf node
+u
+(with attributes
+l_{u}
+and
+s_{u}>1
+) into one CTA. First, compared with the one-query-per-CTA paradigm, packing
+s_{u}
+queries with shared KV length of
+l_{u}
+into a single CTA could reduce the KV cache loads from
+s_{u}
+times to
+1
+time. Therefore saves
+(s-1)\,l_{u}\,d
+global memory accesses (
+d
+is the head dimension). While packing the shared prefixes of all queries into a CTA produces
+2\,s_{u}
+times (half comes from node
+u
+and the other half from leaf nodes) per-query intermediate writes and reads. Therefore the overhead of memory access
+2
+2
+
+2
+
+To ensure numerical accuracy, intermediate results are stored in FP32, so the overhead is multiplied by 2.
+is
+2\times(2\,s_{u}\,d+2\,s_{u}\,d)\,=\,8\,s_{u}\,d
+. Then, the profit–overhead ratio for packing a non-leaf node to a CTA is:
+
+r=\frac{(s_{u}-1)\,l_{u}\,d}{8\,s_{u}\,d}\ \geq\ \frac{l_{u}}{16}.
+
+In practice, the length of shared KV
+l_{u}\geq 16
+since sharing is performed at the granularity of KV blocks
+(
+Kwon et al. 2023
+;
+Shah et al. 2024
+)
+, whose sizes are typically larger than 16. Therefore,
+packing a node into a CTA yields a positive profit.
+
+Inter-node profit.
+When child nodes are involved, the profit and overhead change. Let
+\{v_{1},v_{2},...v_{i}\}
+be the children of
+u
+, where child
+v_{i}
+has KV length
+l_{i}
+and queries
+s_{i}
+(
+s_{u}=\sum_{i}s_{i}
+). We compare two schemes in Figure
+6
+c-d.
+
+Scheme 1: Split.
+As in Figure
+6
+c, a naive packing scheme is splitting each node into an individual CTA. Following the analysis above, we can derive the overall profit as:
+
+(1)
+
+\underbrace{(s_{u}-1)\,l_{u}\,d}_{\text{profit of $u$}}\,-\,\underbrace{4s_{u}d}_{\text{overhead of $u$}}\,+\,\underbrace{\textstyle\sum_{i}(s_{i}-1)\,l_{i}\,d}_{\text{profit of $\{v_{1},v_{2},...v_{i}\}$}}.
+
+Scheme 2: Merge.
+As shown in Figure
+6
+d, when considering child nodes, we can pack specific child node
+v_{i}
+and parent node
+u
+into a CTA to eliminate their intermediate results. In this case, the number of queries associated with node
+u
+becomes
+s_{u}^{\prime}=s_{u}-s_{i}
+, while the KV length
+l_{u}
+remains unchanged. Then the profit of the unmerged part could also be estimated using Equation
+1
+, and the profit of the merged part
+u\!\sim\!v_{i}
+becomes
+(s_{i}-1)\,(l_{u}+l_{i})\,d
+. Therefore, the overall profit is:
+
+\displaystyle\underbrace{(s_{u}-s_{i}-1)\,l_{u}\,d}_{\text{profit of $u$}}\;-\;\underbrace{4(s_{u}-s_{i})d}_{\text{overhead of $u$}}
+
+(2)
+
+\displaystyle\quad+\ \underbrace{\textstyle\sum_{k\neq i}(s_{k}-1)\,l_{k}\,d}_{\text{profit of $\{v_{1},v_{2},...v_{i-1}\}$}}\ +\ \underbrace{(s_{i}-1)\,(l_{u}+l_{i})\,d}_{\text{profit of $u\!\sim\!v_{i}$}}.
+
+Scheme comparison.
+The incremental profit of Scheme 2 over Scheme 1 is
+4s_{i}d\;-\;l_{u}d
+. Hence Scheme 2 is preferred when
+4s_{j}>l_{u}
+. When the shared prefix at
+u
+is short and the specific child node
+v_{i}
+’s queries are large enough, merging them achieves higher profit by eliminating unnecessary intermediate results. Otherwise, keep
+u
+and
+v_{i}
+separate.
+
+Pack Scheduler.
+We implement a heuristic scheduler guided by the profit analysis to pack the decode batch into CTAs. It first converts the block table into a forest, where each root is a unique first-level prefix and each root–leaf path encodes a query’s multi-level shared prefixes plus its non-shared suffix. Each node stores the shared block IDs and the query IDs. For each tree, the scheduler invokes
+TreeHeuristic
+(Algorithm
+1
+) to produce CTAs and adds them to
+\mathcal{P}
+.
+TreeHeuristic
+packs each leaf as an independent CTA (line 4), scans the children of each internal node, applies the inter-node profit model to choose a scheme, and recursively packs children (lines 5–13). It then packs the node’s remaining queries into a CTA and returns with its children’s CTAs (lines 14–15). This yields memory-efficient CTAs with fewer global-memory accesses and linear complexity
+O(|V|{+}|E|)
+since each node and edge is processed once
+3
+3
+
+3
+
+V
+and
+E
+denote numbers of nodes and edges in tree-structured block table.
+.
+
+Lazy Update.
+Although the pack scheduler is linear, its overhead can grow with batch size and number of KV blocks. We mitigate this with a lazy-update strategy that (1) reuses a scheduling result across continuous-batching iterations until the block table changes (
+e.g.,
+request arrivals/departures or new KV block assignments) and (2) moves the scheduler into the serving system and runs it asynchronously once the block table is available. These reduce scheduler invocations from once per transformer layer to once several continuous-batching iterations and overlap scheduling with pre-attention task (
+e.g.,
+LayerNorm, QKV projection), thereby substantially reducing the exposed scheduling latency (see Appendix
+B
+) without affecting model accuracy.
+
+5.2.
+Multi-tile Kernel
+
+(a)
+
+(b)
+
+(c)
+
+(d)
+
+Figure 7
+.
+Multi-tile kernel design and validation on A100-SXM4-80GB GPU. (a) Global-to-shared memory transfer latency for varying data sizes (averaged over 1,000 reads). (b) Offline-selected tile-size configurations; check marks denote feasible settings, and circled numbers indicate violated constraints. (c) Average bandwidth utilization under different tile sizes. (d) Average kernel latency under different tile sizes.
+
+Insight and Approach.
+Given packed CTAs, PAT must choose per-CTA Q-tile
+m
+and KV-tile
+n
+to maximize resource efficiency. Because query sizes and KV lengths vary widely, single–tile-size kernels with padding (
+e.g.,
+prior works
+(
+Dao 2023
+;
+Ye et al. 2025
+;
+Pan et al. 2025
+;
+Zhu et al. 2024
+)
+) cannot adapt and suffer poor utilization (§
+3.3
+). To better exploit GPU shared memory and registers, we introduce a
+customized tiled attention kernel design
+that consists of: (1) a multi-tile kernel suite, where feasible
+(m,n)
+configurations are derived from offline hardware and CTA-constraint analysis and implemented as resource-efficient kernels; and (2) a tile-size selector, an online decision-tree that selects the per-CTA
+(m,n)
+to balance performance and parallelism.
+
+Input:
+
+Root node
+root
+, corresponding KV
+blocks
+
+Output:
+
+Packs
+\mathcal{P}
+from the tree
+
+\mathcal{P}\leftarrow\emptyset
+;
+
+1
+
+if
+
+\mathrm{IsLeaf}(r)
+
+then
+
+2
+
+// Pack the non-shared KV into a CTA
+
+return
+
+\mathrm{Pack}(root.\mathrm{query},blocks)
+;
+
+3
+
+for
+
+c\in\mathrm{Children}(root)
+
+do
+
+4
+
+// Use profit model to choose the scheme
+
+if
+
+4\times c.size<root.len_{s}
+
+then
+
+5
+
+// Scheme 1: split root and child into separate CTAs
+
+\mathcal{P}\leftarrow\mathcal{P}\cup\mathrm{TreeHeuristic}(c,c.\mathrm{blocks})
+;
+
+6
+
+else
+
+7
+
+// Scheme 2: merge root’s blocks with
+c
+’s blocks
+
+\mathcal{P}\leftarrow\mathcal{P}\cup\mathrm{TreeHeuristic}(c,c.\mathrm{blocks}\cup blocks)
+;
+
+8
+
+root.\mathrm{RemoveQuery}(c.\mathrm{queries})
+;
+
+9
+
+// Pack remaining queries and KV blocks into a CTA
+
+\mathcal{P}\leftarrow\mathcal{P}\cup\mathrm{Pack}(root.\mathrm{queries},blocks)
+;
+
+10
+
+11
+
+return
+
+\mathcal{P}
+;
+
+12
+
+Algorithm 1
+
+TreeHeuristic
+
+Multi-tile kernel.
+Tile sizes (Q tile
+m
+and KV tile
+n
+) critically affect Tensor Core efficiency: they determine a CTA’s shared-memory and register demand, which in turn constrain resident CTA concurrency and active warps. To obtain resource-efficient kernels, we derive three key constraints that significantly reduce the
+(m,n)
+search space.
+
+①Register and shared-memory constraints
+(upper bounds on
+m,n
+). Increasing
+m
+or
+n
+raises CTA shared-memory and register usage and can induce register spilling
+(
+NVIDIA 2025b
+)
+. To keep the kernel within hardware limits, we enforce two bounds: (1)
+Shared-memory constraint.
+One CTA’s shared-memory usage comprises the Q tile, K/V tile, and intermediate results (data type size
+b^{\prime}
+, usually higher precision). It must not exceed per-SM shared memory
+S_{\mathrm{smem}}
+:
+
+m\,h\,b\;+\;n\,h\,b\;+\;m\,h\,b^{\prime}\;\leq\;S_{\mathrm{smem}}.
+
+(2)
+Register constraint.
+We bound per-thread
+4
+4
+
+4
+
+Commonly 255 32-bit registers per thread on recent GPUs.
+and aggregate register use to avoid spilling: per-thread registers
+\leq S_{\mathrm{reg\_thr}}
+; total registers of concurrent CTAs on an SM
+\leq S_{\mathrm{register}}
+. Because compiler effects make analytic estimates unreliable, we obtain per-thread
+R_{\mathrm{thr}}(m,n)
+and per-CTA
+R_{\mathrm{CTA}}(m,n)
+via offline compilation and static analysis, and enforce:
+
+R_{\mathrm{thr}}(m,n)\leq S_{\mathrm{reg\_thr}},\qquad C\cdot R_{\mathrm{CTA}}(m,n)\leq S_{\mathrm{register}}.
+
+②High bandwidth utilization
+(lower bound for
+n
+). To saturate global memory bandwidth, the pipeline must
+keep enough data in flight
+to cover the inherent memory latency. Figure
+7(a)
+shows transfer latency vs. data size: the flat region gives the inherent latency
+L
+(ns) and the linear region the sustainable bandwidth
+B
+(Bytes/ns). Thus the in-flight data
+D_{\text{flight}}
+must satisfy
+D_{\text{flight}}\geq L\!\times\!B
+. In the attention pipeline
+D_{\text{flight}}
+is the total size of all K or V tiles being loaded by concurrently resident CTAs,
+i.e.,
+
+D_{\text{flight}}=S\,C\,n\,h\,b
+where
+S
+is the number of SMs,
+C
+the concurrent CTAs per SM,
+h
+the head dimension, and
+b
+the KV datatype size (bytes). Rearranging gives the lower bound, which complements the CUTLASS-derived constraints and ensures the memory bus remains well utilized:
+
+n\;\geq\;\left\lceil\frac{L\,B}{S\,C\,h\,b}\right\rceil,
+
+③CUTLASS constraint
+(lower bounds for
+m
+and
+n
+): Efficient use of CUTLASS/CuTe MMA requires both tile sizes to be powers of two and at least
+5
+5
+
+5
+
+It depends on data format; e.g., the minimum tile size is 32 for int8.
+16
+(
+NVIDIA 2025c
+)
+:
+
+m,n\in\{2^{k}\mid k\in\mathbb{N},\,2^{n}\geq 16\}
+
+Put it together.
+Based on ① to ③, an offline configuration solver is designed to compute feasible tile size (
+m
+,
+n
+) pairs per hardware target, thereby providing kernels that execute efficiently for dynamic CTAs. Figure
+7(b)
+shows a set of available tile size configuration under A100-80GB.
+
+Tile Selector.
+Given the packed CTAs and feasible multi-tile kernel configurations, the tile selector assigns a tile size configuration pair
+(m,n)
+to each CTA at runtime using a set of rules. These rules are derived offline based on analysis of (1) when different tiles behave equivalently, and (2) how
+m
+and
+n
+affect resource efficiency.
+
+Kernel equivalence.
+
+Per the offline constraint solving above, the candidate
+(m,n)
+configurations sustain high bandwidth utilization, and decode-attention latency is dominated by global memory bandwidth. Thus, for decode batches
+without
+shared prefixes or execution bubbles, these configurations are
+performance-equivalent
+in bandwidth and latency. To validate this, we executed a decode batch without prefixes (KV length
+1024
+) under various configurations and used batch size
+1134
+6
+6
+
+6
+
+1134
+is a common multiple of CTA concurrency across configurations on A100, avoiding execution bubbles.
+. As shown in Figure
+7(c)
+and Figure
+7(d)
+, all candidate configurations (underlined) sustain
+83\text{\textendash}86\%
+bandwidth utilization and exhibit similar end-to-end latency (difference
+<2\%
+). This demonstrates that, in the absence of prefixes and bubbles, varying the tile configuration within the feasible set does not change CTA performance.
+
+Deriving Q tile
+m
+.
+The shared prefixes make the query size per CTA dynamic. To mitigate padding-induced memory waste
+\mathbb{I}_{mem}
+on the
+m
+dimension, the selector uses a
+round-up
+rule: given CTA’s query size
+q
+, choose the smallest
+m
+in feasible q tile sizes with
+m\geq q
+. For instance, when
+q=20
+, it chooses
+m=32
+rather than
+16
+, since
+m=16
+will split the query into two CTAs and result in redundant accesses of the shared KV cache. Larger and performance-equivalent tile sizes such as
+64
+or
+128
+are also avoided to preserve on-chip memory for KV tile size
+n
+selection as follows.
+
+Figure 8
+.
+Execution pipeline of four CTAs under different concurrency. (a) High concurrency with dynamic KV lengths yields low tail efficiency and a large execution bubble
+\mathbb{I}_{exe}
+. (b–d) Lower concurrency cuts per-CTA latency and thus reduces
+\mathbb{I}_{exe}
+across the shown execution orders.
+
+Deriving KV tile
+n
+.
+The choice of
+n
+must adapt to KV length.
+For long KV
+, high CTA concurrency causes severe execution bubbles and poor tail efficiency (Figure
+8
+a), so we prefer larger
+n
+: this raises per-CTA on-chip memory, reduces per-SM concurrency
+C
+, thereby increasing bandwidth available per CTA and shrinking the execution bubble
+\mathbb{I}_{exe}
+across different execution orders (Figure
+8
+b-d).
+For short KV
+, the last tiling iterations can make the compute-only portion significant (right side of Figure
+3
+b), so a smaller
+n
+shortens the final tile and avoids a compute bubble is preferred.
+e.g.,
+at KV length 192,
+n{=}128
+yields
+(192-128)/128\approx 50\%
+compute bubble in the last tile, while
+n{=}64
+removes it and is faster due to kernel equivalence. Guided by these trade-offs, we profile each candidate
+n
+offline by sweeping KV length to derive the largest performance-equivalent tile sizes until the choice stabilizes; the resulting mapping is encoded as a piecewise decision tree. During online serving, tile selector performs a constant-time lookup per CTA to choose the profiled
+n
+.
+
+6.
+Multi Kernel Forward
+
+After §
+5
+packs the batch into CTAs and selects multi-tile kernels, we design two forward-stage strategies to mitigate kernel execution bubble
+\mathbb{I}_{\mathrm{exe}}
+(§
+3.3
+).
+
+Multi-Stream Forward.
+Kernels with different tile size configurations launch and execute sequentially on the GPU, since the GPU requires static kernel launch parameters derived from tile size.
+This serial execution incurs resource inefficiencies due to frequent kernel launches and execution bubbles, with the latter accumulating across consecutive kernels. To address this, we create a separate CUDA stream for each distinct tile size configuration
+(m,n)
+obtained from §
+5.2
+. The scheduler groups CTAs by their
+(m,n)
+pair and enqueues each group into its corresponding stream, so that all CTAs with the same configuration execute sequentially within that stream, while different streams run in parallel.
+This design overlaps the launch overhead of subsequent kernels with the execution of preceding kernels and mitigates execution bubbles by kernel parallelism (§
+8.5
+).
+
+Long KV Split.
+Multi-stream execution alone cannot eliminate execution bubbles in all cases, because some CTAs may have KV lengths that are orders of magnitude larger than others. We therefore adopt a KV-dimension splitting strategy similar to
+(
+Pan et al. 2025
+)
+. Specifically, we split any CTAs with KV length exceeding the mean KV length for all CTAs of the batch into equal parts to keep KV length under the mean value. This shortens the completion time of the last finishing CTAs and improves overall SM utilization of kernel execution.
+
+7.
+Output Merge
+
+We implement a lightweight merge kernel that uses online softmax
+(
+Dao et al. 2022
+)
+to combine partial results at per-query granularity. Each CTA produces three per-query and per-head intermediates: a max score, a log-sum-exp accumulator, and a partial value-weighted sum. The merge kernel loads these intermediates from global memory, reduces them with online softmax, normalizes the accumulated value-weighted sum, concatenates all heads, and writes the final query output back to global memory. The small global read/write overhead for these intermediates is accounted for in the pack scheduler’s overhead analysis when deriving the end-to-end packing scheme (
+5.1
+).
+
+8.
+Evaluation
+
+Figure 9
+.
+Normalized kernel performance (higher is better) of PAT and the baselines for the attention computation across various decode batch configurations. The four panels from top to bottom show head configurations of 32/32, 16/8, 32/8, and 64/8. Missing bars arise because RelayAttention lacks support for multi-level or multiple first-level prefixes, and FastTree does not support the 16/8 and 64/8 head settings.
+
+In this section, we present the implementation of PAT (§
+8.1
+) and the experimental setup (§
+8.2
+). We then conduct a set of experiments to answer three key questions
+7
+7
+
+7
+
+We also provide an overhead analysis in Appendix
+B
+.
+:
+
+(1)
+
+How does PAT ’s efficiency scale across diverse batch sizes, models, and prefix structures? (§
+8.3
+)
+
+(2)
+
+What performance improvement does PAT achieve for online serving under real-world workloads? (§
+8.4
+)
+
+(3)
+
+What is the contribution of each feature of PAT to the overall performance gain? (§
+8.5
+)
+
+8.1.
+Implementation of PAT
+
+We implement PAT as a full attention kernel for the decode stage with about 3k lines of Cutlass/CuTe
+(
+NVIDIA 2025f
+;
+NVIDIA 2025e
+)
+and C++ code. The multi-tile kernel (§
+5.2
+), multi-stream forward (§
+6
+), and merge kernel (§
+7
+) are built with Cutlass/CuTe. The asynchronous pack scheduler (§
+5.1
+) and API wrappers are implemented in C++. To overlap the data transfers with computation, all data movement from the global memory to the shared memory uses the
+cp_async
+primitive, together with double buffering
+(
+NVIDIA 2025b
+)
+. We expose the kernel API to Python via pybind11, and integrate it into vLLM
+(
+Kwon et al. 2023
+)
+(v0.9.0) as an off-the-shelf plugin with about 1.2k lines of Python code. To enable PAT in vLLM, only an environment variable
+VLLM_ATTENTION_BACKEND=PAT
+is required.
+
+8.2.
+Experiment Setup
+
+Models and Testbed.
+For end-to-end online serving (§
+8.4
+), we use two representative open-source models: Qwen3-8B
+(
+Yang et al. 2025
+)
+and Llama3-8B
+(
+AI@Meta 2024
+)
+. All experiments run on the NVIDIA A100-80GB-SXM4 GPU. Hardware info is summarized in Table
+1
+. Software environment is CUDA 12.4 and PyTorch 2.7.0.
+
+Baselines.
+We compare against five attention implementations spanning query-centric and KV-centric designs:
+(1)
+FlashAttention
+
+(
+Dao et al. 2022
+;
+Dao 2023
+)
+(v2.6.2): query-centric; maps each query to a CTA with a fixed tile config
+(64,128)
+.
+(2)
+FlashInfer
+
+(
+Ye et al. 2025
+)
+(v0.2.5): query-centric; improves SM load balance by dynamic CTA partitioning; decoding tile config
+(16,128)
+.
+(3)
+FastTree
+
+(
+Pan et al. 2025
+)
+: KV-centric; uses a compute-oriented cost model to pack and reduce repeated KV loads; two tile configs
+(64,32)
+and
+(16,32)
+.
+(4)
+RelayAttention
+
+(
+Zhu et al. 2024
+)
+: KV-centric; packs single-level shared prefixes across requests into CTAs to cut redundant memory accesses and runs them with FlashAttention’s kernel.
+(5)
+RelayAttention++
+: our extension of RelayAttention to exploit vLLM-style KV-cache reuse; it stores shared KV blocks from non-first-level prefixes in the same physical space so redundant KV loads can benefit from L2 cache, further improving performance (§
+8.3
+).
+
+Kernel-Performance Workloads (§
+8.3
+).
+To compare kernel performance under identical batch and prefix structures, we construct
+synthetic decode batches
+as input, following
+(
+Pan et al. 2025
+)
+. Each decode batch is specified by
+B
+and
+L
+.
+B
+defines the prefix-tree structure and the number of leaves (
+i.e.,
+batch size).
+e.g.,
+
+B=[1,4,16]
+yields two shared-prefix levels with 1 and 4 nodes, and 16 leaves.
+L
+gives KV lengths per level.
+e.g.,
+
+L=[128,256,1024]
+sets level-1 and level-2 shared prefixes to 128 and 256 tokens, with 1024 non-shared tokens per request. We vary
+(B,L)
+combinations to reflect different shared-prefix structures and batch settings as in Figure
+9
+. Besides, we choose
+four head configurations
+(#heads, #kv_heads) common in Llama
+(
+AI@Meta 2024
+)
+, Qwen
+(
+Yang et al. 2025
+)
+, and Gemma
+(
+Team 2025
+)
+models:
+(64,8)
+,
+(32,8)
+,
+(16,8)
+, and
+(32,32)
+. The head dimension and data type are set to the commonly used 128 and FP16.
+
+End-to-end workloads (§
+8.4
+and §
+8.5
+).
+We evaluate PAT under online serving using vLLM
+(
+Kwon et al. 2023
+)
+(v0.9.0) on two real-world traces. (1)
+toolagent
+
+(
+Qin et al. 2025
+)
+: tool/agent workloads with task-specific system prompts (overall cache hit rate 59%). (2)
+conversation
+: combines the Meta-AI system instruction (total lengths 2517/2522 tokens for Llama3/Qwen3 tokenizers) with burstgpt prompts, following prior work
+(
+Pan et al. 2025
+)
+. We randomize language and country fields in the system instruction to create a three-level prefix whose lengths are 46, 348, 2123 (Llama3) or 45, 351, 2126 (Qwen3). We use only the first 30 minutes of each trace due to cost limit.
+
+Metrics.
+For kernel performance, we primarily compare attention latency under varied input configurations. For each configuration, we run 20 repetitions and report the average completion latency. For end-to-end comparison, we focus on three metrics: average request completion latency, time to the first token (TTFT), and time per output token (TPOT).
+
+8.3.
+Kernel Performance
+
+Figure 10
+.
+End-to-end performance of PAT and the baselines under two models and two traces. Note that (1) RelayAttention++ lacks support for multiple first-level prefixes, so its results on
+toolagent
+trace are unavailable; (2) We place the results on Llama-3-8B
+toolagent
+and Qwen3-8B
+conversation
+in Appendix
+A
+due to page limits, and they exhibit similar trends.
+
+Overall results.
+Figure
+9
+reports normalized kernel performance (metric
+\text{latency}^{-1}
+, normalized to PAT) across decode-batch configurations. For configurations with shared prefixes (
+1
+–
+18
+), PAT achieves
+22.7\times
+,
+12.0\times
+,
+2.0\times
+,
+12.9\times
+and
+6.5\times
+speedups over FlashAttention, FlashInfer, FastTree, RelayAttention and RelayAttention++, respectively, across four attention-head settings. These gains arise from three factors: (1) a prefix-aware packing scheduler that cuts redundant global KV accesses (§
+5.1
+); (2) a multi-tile kernel combined with an online tile-size selector that adapts
+(m,n)
+per CTA to better use bandwidth and on-chip memory (§
+5.2
+); and (3) multi-stream forward execution and long-KV splitting that mitigate execution bubbles caused by multi-tile kernels and KV-length dynamics (§
+6
+). Together, these designs make PAT consistently more efficient than the baselines.
+
+Compared with query-centric kernels.
+Against query-centric FlashAttention and FlashInfer, PAT reduces attention latency by
+12.3\%
+–
+95.6\%
+on configurations with prefixes (
+1
+–
+18
+). The gap widens with larger batch size or longer shared prefixes (
+e.g.,
+
+4
+–
+5
+and
+6
+–
+7
+) because the one-query-per-CTA design of query-centric kernels forces repeated global KV loads that grow more costly in those cases. Even without shared prefixes (
+19
+and
+20
+), PAT’s multi-tile kernel combined with multi-stream forward reduces execution bubbles and yields
+1.4\%
+–
+21.2\%
+lower latency.
+
+Compared with KV-centric kernels.
+FastTree, which also targets multi-level shared prefixes, remains the strongest baseline but is still
+5.7\%
+–
+103\%
+slower than PAT for two reasons: (1) its compute-oriented packing cost model is ill-suited to memory-bound decode attention (§
+2.3
+and §
+3.2
+); and (2) its double-tile approach launches two kernels serially as in Figure
+12(b)
+, introducing execution bubbles. By contrast, PAT uses a memory-oriented packing strategy plus multi-stream forward to avoid these inefficiencies. RelayAttention++ cuts latency by
+67.4\%
+versus RelayAttention, confirming that L2 plus KV-cache reuse reduces redundant global loads, yet RelayAttention++ is still
+2.0\times
+slower than PAT, showing that L2 cache alone cannot fully eliminate redundant KV loads.
+
+8.4.
+End-to-End Comparison
+
+Overall trends.
+We compare PAT with three baselines across two models (Llama-3-8B and Qwen3-8B) and two real-world traces (conversation and toolagent) as in §
+8.2
+. Figure
+10
+shows the trend of mean TTFT, TPOT, and request e2e latency as we vary the request rate. Specifically, as in subfigures
+b1
+to
+b2
+, PAT reduces TPOT at the same request rate by 14.9–56.4% over RelayAttention++, 13.6–73.9% over FlashAttention, and 31.6–83.4% over FlashInfer. Furthermore, as shown by the first and the third rows of Figure
+10
+, the TPOT improvement allows PAT to finish incoming requests faster at the same request rate. This yields 8.6–97.2%, 7.9–99.6%, and 47.7–99.7% lower TTFT than the three baselines, and similar reductions in the e2e latency.
+
+Scaling with request rate.
+The performance gap between PAT and the baselines first widens and then slightly contracts as the request rate grows. This is because: (1) Higher request rate forms larger decode batches under continuous batching, which increases the redundant global memory accesses and exposes more opportunity for PAT; (2) When the batch size further increases, the number of CTAs and the overall attention runtime grow, so that the execution bubble becomes smaller; the performance improvement of multi-stream forward and long-KV split therefore shrinks.
+
+Why baselines fail.
+PAT achieves significant gains for its prefix-award pack scheduler, multi-tile kernel, and multi-stream forward. In contrast, RelayAttention++ supports only a single-level system prefix and delegates the forward kernel to FlashAttention, so its curves largely track FlashAttention, which can not mitigate redundant KV loads at all. Model configuration also matters. Llama-3-8B’s 8K context length limit (vs. 32K for Qwen3-8B) requires us to filter ultra-long requests, which reduces the requests with long non-prefix context and leads to lower absolute latency for both RelayAttention++ and PAT on Llama-3-8B compared with that of Qwen3-8B. Besides, FlashInfer improves SM utilization via long-CTA-splitting load balance, which helps at low request rate while adding scheduling overhead that grows with request rate, resulting in the highest TPOT.
+
+8.5.
+Ablation Study
+
+(a)
+
+(b)
+
+Figure 11
+.
+Results of ablation baselines. (a) Average attention latency. (b) Global memory read and write size.
+
+(a)
+
+(b)
+
+Figure 12
+.
+CTA execution pipeline on
+SM_{0}-SM_{5}
+with two tile size configurations (collected by PTX
+(
+NVIDIA 2023
+)
+), where white space represents execution bubbles. (a) Multi-stream execution pipeline. (b) Serial execution pipeline.
+
+To evaluate the contribution of each design in PAT, we build the following ablation baselines:
+(1) PAT-compute, which adopts the cost model from FastTree
+(
+Pan et al. 2025
+)
+for the packing scheduler;
+(2) PAT-naive, which simply packs each node in the tree-structured block table into a CTA;
+(3) PAT-fixed, which disables the multi-tile kernel of PAT and instead uses the fixed tile configuration
+(64,128)
+as in FlashAttention
+(
+Shah et al. 2024
+)
+;
+(4) PAT-serial, which disables the multi-stream forward mechanism of PAT and adopts the serial multi-kernel execution similar to FastTree
+(
+Pan et al. 2025
+)
+.
+We use the same synthetic traces as in §
+8.3
+and adopt the attention head configuration of Llama-3-8B to compare PAT with ablation baselines.
+
+Effectiveness of the pack scheduler.
+
+As shown in Figure
+11(a)
+, the average attention latency of PAT-compute and PAT-naive is higher than PAT by 4.6% and 10.4%, respectively. PAT-compute adopts a compute-oriented cost model that selects the packing scheme with the minimum computation, which contradicts the memory-bound nature of decode attention. Meanwhile, PAT-naive only considers the benefit of packing but ignores the additional intermediate reads and writes, leading to high overhead. As shown in Figure
+11(b)
+, their average memory read/write is higher than PAT by 10.9% and 16.7%, respectively. This confirms the rationality of PAT ’s memory-oriented cost model and heuristic pack scheduler.
+
+Importance of multi-tile kernel.
+
+As shown in Figure
+11(a)
+, enforcing a fixed tile size (PAT-fixed) increases attention latency by 39% compared to PAT. In the ablation workload, CTAs exhibit query sizes from 1 to 64 and KV lengths from 32 to 4096, which makes one-size-fits-all kernels highly inefficient. Prior kernels
+(
+Shah et al. 2024
+;
+Ye et al. 2025
+;
+Zhu et al. 2024
+;
+Yao et al. 2024
+)
+adopt such fixed designs, leading to padding overhead and execution bubbles. In contrast, PAT’s multi-tile kernel enables efficient adaptation to diverse CTA configurations.
+
+Effectiveness of multi-stream forward.
+
+As shown in Figure
+11(a)
+, the average attention latency of PAT-serial is 4.8% higher than PAT. This is because serial execution aggravates execution bubbles. For example, in a two-level prefix decode batch (Figure
+9
+
+6
+), Figure
+12(a)
+and Figure
+12(b)
+show the CTA execution pipelines of PAT and PAT-serial, where PAT-serial suffers from substantial memory waste and execution bubbles. By running multi-tile kernels across multiple CUDA streams in parallel, the multi-stream forward strategy of PAT effectively mitigates execution bubbles caused by workload dynamicity and achieves lower attention latency.
+
+9.
+Discussion
+
+Prospects and Limitations.
+PAT leverages cross-request prefix sharing to improve bandwidth utilization and cut redundant global memory accesses in memory-bound decode attention. Its effectiveness depends on three factors: (1)
+hardware compute-to-bandwidth ratio.
+As GPUs become more compute-dominant (
+e.g.,
+NVIDIA V100 to B200: 139 to 312 FLOP/Byte), the gap between compute and memory widens, so memory-focused designs like PAT become increasingly valuable; (2)
+model architecture.
+PAT yields large gains for common architectures that retain a KV cache (MHA, GQA), but benefits may shrink for architectures that compress or remove KV state (MLA
+(
+Liu et al. 2024
+)
+, linear attention
+(
+Shen et al. 2021
+)
+, MLKV
+(
+Zuhri et al. 2024
+)
+); and (3)
+prefix-sharing ratio in the batch.
+High concurrency with cross-request shared prefixes amplifies PAT ’s advantage, whereas small batches or workloads without shared prefixes limit the improvement (see Figure
+9
+
+1
+,
+19
+–
+20
+).
+
+Gap to Optimal.
+PAT reduces memory waste and execution bubbles, guided by hardware and pipeline analysis. However, GPU scheduling is uncontrollable, leaving residual bubbles (Figure
+12(a)
+) and a gap from the theoretical optimum. Yet PAT consistently outperforms state-of-the-art baselines.
+
+10.
+Related Work
+
+KV Cache Related Optimization.
+
+Prior work reduced KV cache memory and fragmentation: FasterTransformer
+(
+NVIDIA 2025d
+)
+provided an early static-batching implementation, Orca
+(
+Yu et al. 2022
+)
+improved utilization with continuous batching but relied on pre-allocated caches, which leads to memory fragmentation. vLLM introduced a paged KV cache to cut waste by virtual memory management
+(
+Kwon et al. 2023
+)
+. SGLang’s prefix-reuse lets shared prefix KV blocks be reused across requests and is widely used in production
+(
+Zheng et al. 2024b
+)
+. These approaches shrink KV memory costs but do not accelerate attention, which dominates latency as context and output lengths grow.
+
+Attention Kernel Optimization.
+
+Fused, on-chip attention kernel implementations like FlashAttention and FlashInfer reduce global memory traffic by combining attention steps into a single kernel
+(
+Dao et al. 2022
+;
+Shah et al. 2024
+;
+Ye et al. 2025
+)
+, but their query-centric (one-query-per-CTA) design cannot exploit workload-level prefix sharing. Subsequent works
+(
+Zhu et al. 2024
+;
+Ye et al. 2024b
+;
+Lin et al. 2024a
+;
+Zheng et al. 2024a
+)
+pack the single shared system prompt to reduce redundant memory accesses, but can not generalize to workloads with multi-level prefixes. Several recent works
+(
+Ye et al. 2024a
+;
+Yao et al. 2024
+;
+Juravsky et al. 2024
+)
+extend to multi-level prefixes but rely on simple packing strategies that overlook trade-offs between overhead and savings.
+(
+Pan et al. 2025
+)
+also addresses multi-level prefix optimization, but its compute-oriented packing cost model mismatches the memory-bound nature of decode attention, leading to suboptimal results. Furthermore, all these works use one-size-fits-all kernel design, leading to resource inefficiency. In contrast, PAT uses a memory-centric packing strategy with multi-tile kernels and multi-stream execution to reduce redundant memory accesses and improve resource utilization for dynamic workloads.
+
+GPU Scheduling.
+
+GPU scheduling strategies further improve kernel efficiency by balancing compute and memory demands:
+(
+Kamath et al. 2025
+)
+fuses prefill and decode via virtual CTAs to expose resource complementarity, and
+(
+Zhu et al. 2025
+)
+groups SMs so different SMs specialize in specific tasks, raising utilization. These techniques are largely orthogonal to PAT and could be combined to further reduce execution inefficiencies. Work like
+(
+Song et al. 2024
+)
+shows that CTA-style scheduling on alternative accelerators (
+e.g.,
+NPUs) can help eliminate the remaining resource bubbles in PAT ’s execution (§
+9
+). Here, we focus on GPU decode-attention optimizations and leave heterogeneous-scheduler integration to future work.
+
+11.
+Conclusion
+
+In this work, we present PAT, a prefix-aware attention kernel implementation for LLM decoding. PAT reduces redundant global memory access and improves bandwidth utilization through a pack–forward–merge paradigm. The design incorporates a heuristic pack scheduler, a resource-efficient multi-tile kernel, and forward-stage optimizations that mitigate execution bubbles. We implement PAT as an off-the-shelf plugin to vLLM and demonstrate that it reduces the attention latency by 67.4% on average under synthetic workloads and reduces the TPOT by up to 83.4% under real-world workloads compared with existing works.
+
+Appendix A
+Extra End-to-end Results
+
+Figure 13
+.
+End-to-end performance of PAT and the baselines under two workloads: Llama-3-8B with
+toolagent
+and Qwen3-8B with
+conversation
+.
+
+Appendix B
+Overhead Analysis
+
+Figure 14
+.
+Overhead of pack scheduler and preprocess latency of serving system.
+
+The primary overhead introduced by PAT comes from the pack scheduler, which packs decode batches into CTAs at runtime. To mitigate its overhead, as described in §
+5.1
+, we design a lazy update mechanism that reduces the triggering frequency of the scheduler without affecting correctness, and overlaps its execution with the serving system’s preprocessing stage. To evaluate the overhead, we measure both the scheduling latency and the preprocessing latency under the toolagent and conversation traces at a request rate of 8 and 5 req/s. As shown in Figure
+14
+, the average scheduling latency is lower than the preprocessing latency by 81.6% and 88.8%, respectively. Therefore, when running in an asynchronous CPU thread, the pack scheduler will
+not
+introduce additional end-to-end latency, which demonstrates the effectiveness of the lazy update mechanism in PAT.
+

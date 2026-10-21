@@ -1,0 +1,6057 @@
+KV Cache Transform Coding for Compact Storage in LLM Inference
+Konrad Staniszewski & Adrian Łańcucki NVIDIA kstaniszewsk@nvidia.com
+
+Abstract
+Serving large language models (LLMs) at scale necessitates efficient key-value (KV) cache management. KV caches can be reused across conversation turns via shared-prefix prompts that are common in iterative code editing and chat. However, stale caches consume scarce GPU memory, require offloading, or force recomputation. We present kvtc , a lightweight transform coder that compresses KV caches for compact on-GPU and off-GPU storage. Drawing on classical media compression, kvtc combines PCA-based feature decorrelation, adaptive quantization, and entropy coding. It requires only a brief initial calibration and leaves model parameters unchanged. By exploiting redundancies in KV caches, kvtc achieves up to 20 × \times compression while maintaining reasoning and long-context accuracy, and 40 × \times or higher for specific use cases. We test kvtc with Llama 3, Mistral NeMo, and R1-Qwen 2.5 models across benchmarks including AIME25, LiveCodeBench, GSM8K, MMLU, Qasper, RULER, and MATH-500. It consistently outperforms inference-time baselines such as token eviction, quantization, and SVD-based methods, while achieving higher compression ratios. These results support kvtc as a practical building block for memory-efficient LLM serving with reusable KV caches.
+
+
+
+1
+Introduction
+
+Figure 1:
+
+The
+kvtc
+transform-coding pipeline.
+Features are linearly decorrelated via PCA, and the resulting PCA coefficients are quantized using variable bit widths. The PCA basis
+V
+is computed once on a calibration dataset and reused for all caches. Key and value caches are compressed separately.
+
+Figure 2:
+KV cache compression ratios contributed by parts of the
+kvtc
+pipeline for Llama 3.1 8B. DEFLATE’s variability is marked with black stripes.
+
+Chat-based interfaces, commonly used for interacting with large language models (LLMs), enable users to iteratively refine answers across open-domain dialogues and specialized tasks, such as code generation
+(
+Chiang et al. 2024
+;
+Köpf et al. 2023
+)
+. Each conversational turn extends the key–value (KV) cache associated with a conversation, storing hidden activations for every previous token. For modern Transformer models, this cache can easily occupy multiple gigabytes.
+As models scale up in size and reasoning capability, generating increasingly long reasoning chains
+(
+OpenAI et al. 2024
+)
+, the KV cache footprint increases, posing a significant bottleneck for throughput and latency.
+During user turns, stale KV caches left on-chip occupy memory, which is needed for serving other users, yet ensure the fastest responses in the future. Conversely, caches could be discarded, incurring the cost of recomputation, or offloaded to CPU DRAM or local/network storage, leading to transfer overheads. This tension creates a latency–throughput dilemma in production systems and necessitates careful configuration.
+
+Crucially, inference frameworks view the local KV caches as databases. Strategies such as block-level paging and prefix sharing promote reuse of caches whenever prompt prefix matches
+(
+Kwon et al. 2023
+)
+.
+Scaling LLM serving increasingly hinges on KV cache management and reuse
+(
+Liu et al. 2024b
+;
+Cheng et al. 2024
+;
+Yao et al. 2025
+)
+, but current systems struggle to store, move, and refresh these caches efficiently. CacheGen
+(
+Liu et al. 2024b
+)
+compresses caches for transmission,
+offering at most 8.6
+\times
+KV cache reduction in comparison to a 16-bit baseline.
+SVDq
+(
+Yankun et al. 2025
+)
+and xKV
+(
+Chang et al. 2025
+)
+pursue low-rank compression during prefill, but both require calculation of per-prompt SVD. Long and frequently used prompts may justify investing more compute for offline training of corpus-specific caches
+(
+Eyuboglu et al. 2025
+)
+.
+
+Meanwhile, intensively studied KV cache compression methods, aimed at improving the runtime efficiency of autoregressive generation, offer interim measures to the cache retention problem
+
+(
+Yuan et al. 2024
+)
+.
+Prior work hinges on observations that KV cache can be quantized
+(
+Frantar et al. 2023
+)
+
+sparsified
+(
+Liu et al. 2024d
+;
+Hooper et al. 2024
+)
+, average-pooled
+(
+Nawrot et al. 2024
+)
+,
+or shared between layers
+(
+Brandon et al. 2024
+)
+; the cache itself is compressible
+(
+Yuan et al. 2024
+)
+, and dimensions of keys and values for separate heads show a high degree of correlation
+(
+Zhang et al. 2023
+)
+. For long contexts, these methods offer substantial throughput and latency improvements, by lowering KV cache sizes and thus the memory traffic during next token prediction.
+However, due to tight latency constraints, often coupled with refraining from modifying weights of the model, these techniques tend to be brittle
+(
+Tang et al. 2024
+)
+, and accuracy degradation prohibits combining methods for compounded benefits. Finally, these methods seldom exploit the strong low
+-
+rank structure of KV tensors.
+
+In this paper, we introduce
+kvtc
+: a simple yet powerful transform coding scheme, compressing KV caches for storage.
+Inspired by classical image codecs, it applies a learned orthonormal transform followed by channel
+-
+wise scalar quantization, which dynamically allocates bits, and entropy coding. The resulting bitstream is on average 20
+\times
+smaller than the original 16-bit one, while maintaining comparable accuracy. The method also exposes a smooth compression–accuracy trade-off, with 40
+\times
+or higher compression attainable at modest accuracy decrease. Thus,
+kvtc
+largely mitigates the problem of KV cache management: lowering the cost of its on-chip retention and the bandwidth required for offloading, without compromising interactive latency.
+
+(a)
+Keys
+
+(b)
+Values
+
+Figure 3:
+Cosine similarity before and after alignment between key (a) and value (b) heads calculated using Llama 3.1 8B on inputs from Qasper
+(
+Dasigi et al. 2021
+;
+Shaham et al. 2022
+)
+. For each example, we calculate cosine similarity between all keys/values from the same position and then average across the batch. Orthonormal alignment matrices were produced using 20 samples from the RedPajama v2
+(
+Weber et al. 2024
+)
+.
+
+2
+Preliminaries
+
+Table 1:
+KV cache size in 16 bits for 1K tokens of context.
+
+Model
+
+Size
+
+Qwen 2.5 R1 1.5B
+
+28\,
+MiB
+
+Qwen 2.5 R1 7B
+
+56\,
+MiB
+
+Llama 3.1 8B
+
+128\,
+MiB
+
+Llama 3.3 70B Instruct
+
+320\,
+MiB
+
+Mistral NeMo 12B
+
+160\,
+MiB
+
+MN-Minitron 8B
+
+160\,
+MiB
+
+KV Cache Structure
+
+During decoding in autoregressive Transformers with multi-head self-attention, the keys and values produced for each processed token are cached to avoid recomputation. The collection of these tensors is the
+KV cache
+.
+For
+l
+layers,
+h
+heads, head dimension
+d_{\mathrm{head}}
+and sequence length
+t
+, a 16-bit KV cache occupies
+
+(4\,l\,h\,d_{\mathrm{head}}\,t)
+bytes.
+
+Motivated by work on cross-layer KV cache sharing and compression
+(
+Brandon et al. 2024
+;
+Chang et al. 2025
+)
+,
+we ask whether keys from different attention heads, and analogously values, lie in a shared latent space.
+To be more precise, we examine if it is possible to align key or value caches, produced by different attention heads, via linear transformations. Specifically, for each pair of attention heads
+h_{i},h_{j}
+in the model,
+we attempt to align their caches
+K_{i},K_{j}\in\mathbb{R}^{t\times d_{\textit{head}}}
+with an orthogonal map found by solving the Procrustes problem
+(
+Gower & Dijksterhuis 2004
+)
+:
+
+R^{\star}=\text{arg min}_{R}\ \left\lVert K_{i}-K_{j}R\right\rVert_{F}\quad\text{s.t. }R^{\top}R=I.
+
+(1)
+
+We then compute token-wise cosine similarity between
+K_{i}
+and
+K_{j}
+before alignment, and between
+K_{i}
+and
+K_{j}R^{\star}
+after alignment. We repeat the same procedure for values using
+V_{i},V_{j}
+.
+Before alignment, inter-head cosine similarity is typically below 0.2. After orthogonal alignment, similarity increases substantially for keys and moderately for values (
+Figure
+
+3
+). This pattern suggests that key heads largely inhabit a common subspace up to an orthogonal transformation; their dissimilarity before alignment likely stems from random initialization of key and value projection matrices.
+We note that for a data matrix
+A\in\mathbb{R}^{n\times d}
+, if
+k
+directions suffice to explain all of the variance of
+A
+, then
+k
+directions suffice to explain all of the variance of
+B=[A,AR]\in\mathbb{R}^{n\times(d+d^{\prime})}
+, for
+R\in\mathbb{R}^{d\times d^{\prime}}
+. This motivates our choice of PCA as a dimensionality reduction method.
+
+Another motivation comes from the work on efficient attention kernels
+(
+Jiang et al. 2024
+)
+.
+To be more precise, from the observation that different attention heads can show similar attention patterns.
+In a simplified setting without RoPE
+(
+Su et al. 2024
+)
+, where keys are equal to queries and we assume the exact equality of dot products that create the attention patterns, the key spaces are equal up to an orthogonal transform by the uniqueness of Gram realizations
+(
+Horn & Johnson 2013
+)
+.
+
+Sliding Windows and Sink Tokens
+
+We avoid compressing both the
+w
+most recent tokens and
+s
+oldest tokens (attention sinks) due to their disproportionately high contribution to typical attention patterns
+(
+Jiang et al. 2024
+)
+.
+In transform coding for vision and audio, bits are allocated to transform coefficients so that quantization induces minimal perceptual distortion. By loose analogy, the attention mass allocated to a token can be viewed as a proxy for its importance.
+In addition, when PCA is used to reduce the dimensionality of keys and values, the sink tokens yield higher reconstruction errors, as shown in Figure
+6
+.
+
+Foreshadowing the experiments described in
+Section
+
+4
+, we have chosen
+w=128
+and
+s=4
+for evaluation. To illustrate their influence on accuracy, we ablate on their compression by setting either
+w=0
+or
+s=0
+, as shown in
+Figure
+
+4
+.
+These experiments show that compressing these tokens can significantly lower, or even entirely collapse the accuracy at high compression ratios.
+
+(a)
+Attention sink compression ablation
+
+(b)
+Sliding window compression ablation
+
+Figure 4:
+
+Ablation of
+kvtc
+with compression ratio 64
+\times
+on Llama 3.1 8B: (a) compression disabled for attention sink tokens; (b) compression disabled for the final 128 tokens. All other settings are fixed. Additional ablations are provided in
+Sections
+
+B.3
+and
+B.7
+.
+
+Multi-Turn Conversations
+
+Let a conversation be an ordered sequence
+
+\mathcal{C}=((x_{0},\,y_{0}),\,(x_{1},\,y_{1}),\dots),
+
+where
+x_{t}
+denotes the user (or system) input at turn
+t
+and
+y_{t}
+the generated reply. Generation of
+y_{t}
+consists of a prefill pass, which produces the KV cache for all preceding tokens
+(x_{0},y_{0},\dots,x_{t})
+, followed by iterative decoding, which generates the tokens of
+y_{t}
+one at a time.
+
+When a new user prompt
+x_{i}
+is received,
+the existing KV cache can be re-used and only newly added tokens have to be forwarded through the model, reducing computation and time-to-first-token (TTFT). However, if the cache has been deleted, the model must reprocess the entire conversation as a prompt, resulting in quadratic recomputation of attention across the input.
+
+Figure 5:
+A high-level architecture of KV-cache-aware LLM serving environment.
+
+KV Cache Management while Serving
+
+Efficient LLM deployments often split prefill and decode across separate nodes due to their distinct performance profiles
+(
+Zhong et al. 2024
+)
+, as shown in
+Figure
+
+5
+. The prefill node produces the KV cache and transmits it to the decode node over a high-speed fabric, typically RDMA-capable such as InfiniBand or RoCE, minimizing latency and CPU overhead on the host. Both nodes may maintain tiered KV caches: GPU HBM (hot), CPU DRAM (warm), and NVMe/SSD (cold), managed with a retention policy.
+Long-term storage might require sending caches to a remote location.
+Crucially, the decision to select a node for either prefill or decode of a certain input can be dictated by the already-held KV cache with a matching prefix. In such setups, KV cache transfers are typically the dominant cross-node traffic.
+
+Why compress KV caches after the prefill or decode phase?
+Compression can: (i) extend the effective capacity of a KV cache database, and thus the lifetimes of caches, roughly in proportion to the compression ratio, and (ii) reduce network traffic. We discuss both angles below.
+
+(i)
+
+Extending KV cache lifetimes increases cache hit rates in higher tiers (HBM/DRAM), often avoiding or substantially reducing prefill time for prompts with long, recently processed prefixes. For example, during a session with a coding assistant, a single 1,000-line file tokenized at
+\sim\!10
+tokens per line and processed by Llama 3.3 70B yields about 1.6 GiB of 8-bit KV cache. Subsequent conversation turns, or a few parallel conversations about this file, might reuse the corresponding cache. However, on a node which serves multiple clients, the volume of generated KV cache might shorten its hot/warm residency even at moderate batch sizes. A 20
+\times
+lifetime extension via compression might determine whether a KV cache remains hot/warm until it becomes useful, or needs to be recomputed from scratch.
+
+(ii)
+
+Prefill time scales as
+\mathcal{O}(n^{2})
+with prompt length and typically dominates transfer time. In addition, KV caches can be streamed by layer during prefill in order to further reduce TTFT
+(
+Qin et al. 2025
+)
+. However, KV cache compression reduces memory traffic proportionally to the compression ratio, which might be critical when the network bandwidth is saturated and becomes the bottleneck.
+
+Figure 6:
+Calibration of Llama 3.1 8B with
+kvtc
+.
+Left:
+Reconstruction error as a function of the size of calibration set. The arrow
+A\rightarrow B
+denotes fitting PCA on dataset A and calculating the error on B.
+
+Middle:
+The reconstruction error as a function of position in the context. The error is higher for the sink tokens.
+Right:
+Bit assignment computed via dynamic programming, counting in the per-group scaling factors.
+
+3
+Method
+
+Our Key-Value Transform Coder (
+kvtc
+), shown in
+Figure
+
+2
+, builds upon the transform-coding framework
+(
+Ahmed et al. 1974
+;
+Goyal 2001
+)
+, a widely adopted methodology for designing image and video compression algorithms such as JPEG
+(
+Joint Photographic Experts Group 1994
+)
+. It applies
+feature decorrelation by projecting onto an orthonormal basis matrix
+V
+obtained via the singular value decomposition (SVD) of centered calibration data (i.e., principal component analysis, PCA). Quantization parameters are selected using a dynamic programming algorithm, and the resulting symbols are entropy-coded with DEFLATE
+(
+Wu 2017
+)
+.
+The three modes of operation of
+kvtc
+are:
+
+•
+
+Calibration
+
+This step is performed only once for every model and compression ratio.
+During calibration, we obtain the key and value caches for the calibration dataset, calculate
+\mathrm{SVD}(C-\mu)=U\Sigma V^{\top}
+where
+\mu
+is the mean of the data, and store the projection matrices
+V^{\top}
+(for key and value caches separately). Next, we run a dynamic programming algorithm that produces the optimal bit allocation for each of the principal components.
+This step is fast; for instance, calibration for a 12B model can be completed within 10 minutes on an H100 GPU (Appendix
+B.5
+). In Appendix
+B.12
+we show that the additional amount of data stored per model is relatively small (
+2.4
+% of model parameters for Llama 3.3 70B). In Appendix
+B.10
+we perform an ablation study on the number of layers over which we concatenate the KV caches.
+
+•
+
+Compression
+
+Keys and values are compressed independently using the
+(V,\mu)
+parameters and bit allocation obtained during calibration. Compression is performed between inference phases (e.g., after decoding or between prefill and decoding) and can be executed on either GPU (affecting TTFT) or CPU (if the cache is already in storage). Importantly, during decoding, the model operates on decompressed KV caches; compression is used only for storage or transfer.
+
+•
+
+Decompression
+
+Decompression reverses the compression steps. The most computationally intensive operation—the inverse projection using
+V^{\top}
+—can be performed layer-by-layer using sub-matrices of
+V^{\top}
+, allowing generation to begin early.
+
+In the following sections we describe in detail the components of
+kvtc
+during calibration, compression and decompression.
+
+3.1
+Feature decorrelation
+
+Unlike prior SVD-based methods that calculate a separate decomposition for each prompt
+(
+Yankun et al. 2025
+;
+Chang et al. 2025
+)
+, we compute the KV cache projection matrices
+once
+
+using a calibration dataset
+\mathcal{C}
+, and reuse them across all requests at inference time.
+Preparing a single, generalizable
+V
+rests on three observations.
+First, SVD must be computed on a large, representative sample; sampling token positions from a diverse calibration set suffices for generalization and is computationally tractable. Second, excluding keys and values corresponding to the most recent tokens and attention sinks improves the achievable compression ratio (see
+Tables
+
+6
+and
+12
+in
+Appendix
+
+B
+).
+Third, positional embeddings distort the apparent low-rank structure of keys and should be removed before compression
+(
+Sun et al. 2025
+)
+.
+
+During calibration,
+we forward all sequences from
+\mathcal{C}
+through the model and collect their KV caches. For each sequence, cache entries are concatenated along the time dimension to form a global pool of positions. We then sample
+n
+token positions from this pool, excluding attention sinks.
+For each sampled position, we take the corresponding keys (and, equivalently, values) from
+l
+layers and
+h
+heads, undo positional rotations, and concatenate them along the hidden dimension
+d_{\text{head}}
+. This yields a data matrix
+C\in\mathbb{R}^{n\times p}
+with
+p=l\,h\,d_{\text{head}}
+, whose rows index sampled token positions.
+Let
+\mu\in\mathbb{R}^{p}
+be the per-feature mean of
+C
+. We compute the SVD of the centered matrix,
+
+C-\mu=U\,\Sigma\,V^{\top},
+
+(2)
+
+with singular values on
+\mathrm{diag}(\Sigma)
+sorted in descending order (equivalently, PCA of
+C
+).
+For any
+X\in\mathbb{R}^{m\times p}
+, the decorrelated representation and its inverse are
+
+D=(X-\mu)\,V,\qquad X=D\,V^{\top}+\mu,
+
+(3)
+
+where the equality holds when all
+p
+components are used. When
+r<p
+and the basis is truncated to
+V\in\mathbb{R}^{p\times r}
+, then
+X\approx D\,V^{\top}+\mu
+.
+For scalability, we use randomized SVD
+(
+Halko et al. 2011
+)
+calculated on a GPU with target rank
+r<p
+, substantially reducing runtime and memory.
+Results for this variant are shown in Figure
+6
+, with additional details and ablations in Appendix
+B.1
+.
+
+3.2
+Quantization
+
+PCA orders principal components by explained variance. We exploit this ordering to allocate a fixed bit budget across PCA coordinates so that high-variance components receive more bits. The allocation is computed once on a calibration set and reused at inference.
+We quantize
+D
+coordinate-wise to obtain
+D^{q_{1},\ldots,q_{d}}
+, where
+q_{i}\in\mathbb{Z}_{\geq 0}
+is the bit width assigned to the
+i
+-th principal component. Under a global bit budget, we minimize the Frobenius reconstruction error
+
+\left\lVert DV^{\top}-D^{q_{1},\ldots,q_{k}}V^{\top}\right\rVert_{F}^{2}\ .
+
+(4)
+
+Because right-multiplication by an orthonormal matrix preserves the Frobenius norm, we have
+
+\left\lVert DV^{\top}-D^{q_{1},\ldots,q_{k}}V^{\top}\right\rVert_{F}^{2}=\left\lVert(D-D^{q_{1},\ldots,q_{k}})V^{\top}\right\rVert_{F}^{2}=\left\lVert D-D^{q_{1},\ldots,q_{k}}\right\rVert_{F}^{2}\ .
+
+(5)
+
+Thus, optimal bit allocation can be found directly in the decorrelated domain.
+
+We solve the constrained allocation with a simple dynamic programming (DP) algorithm that keeps two tables:
+(1) the minimum reconstruction error achievable using the first
+i
+principal components under a payload of
+b
+bits; and
+(2) a backpointer storing the optimal local decision.
+Pseudocode and a proof sketch of optimality under these constraints are in
+Section
+
+B.13
+.
+Furthermore, inspired by the Microscaling data formats
+(
+Rouhani et al. 2023
+)
+, we quantize groups of
+subsequent
+PCA coordinates together, each group with shared 16-bit shift and scaling factors. The DP optimizes both the per-group bit width and group size, restricted to
+\{1,16,64,256,1024\}
+components per group. The total budget equals the sum of payload bits across all coordinates plus per-group shift and scaling factors.
+
+An example allocation is shown in
+Figure
+
+6
+. As expected, the learned bit widths decrease monotonically for subsequent principal components. Crucially, the DP assigns zero bits to a substantial number of trailing principal components. This observation motivates reducing the dimensionality early during the calculation of PCA, lowering the cost of calibration, and trimming
+V
+to the dimensions with nonzero bit widths for faster compression/decompression during inference. We show the benefits of DP guided quantization over pure PCA in
+Section
+
+B.9
+.
+
+3.3
+Entropy coding
+
+Finally, the quantized values are packed into a single byte array and further compressed using the DEFLATE algorithm
+(
+Wu 2017
+)
+. Crucially, we leverage nvCOMP
+(
+NVIDIA 2020
+)
+, which enables parallel operation directly on a GPU. This step is lossless, but the added compression ratio is content-dependent. We ablate the choice of the lossless compression algorithm and the influence on final compression in Appendix
+B.8
+.
+
+4
+Experiments
+
+Models
+
+We use models from three families: Llama 3
+(
+Grattafiori et al. 2024
+)
+, Mistral NeMo
+(
+Mistral AI team 2024
+;
+Sreenivas et al. 2024
+)
+, and R1-distilled Qwen 2.5
+(
+DeepSeek-AI et al. 2025
+)
+.
+The selection includes models ranging from 1.5B to 70B parameters of base, instruct, and reasoning kind.
+Table
+1
+lists the models along with their KV cache sizes.
+Notably, MN-Minitron 8B has been pruned from the Mistral NeMo 12B base, retaining the original KV cache size.
+
+Methods
+
+We compare our method against KIVI
+(
+Liu et al. 2024d
+)
+, GEAR
+(
+Kang et al. 2024
+)
+and an FP8 quantization of KV cache to the E4M3 format
+(
+Micikevicius et al. 2022
+)
+. For eviction baselines, we compare with TOVA
+(
+Oren et al. 2024
+)
+and H
+2
+O
+(
+Zhang et al. 2023
+)
+. For SVD baselines, we compare our method with xKV
+(
+Chang et al. 2025
+)
+.
+Finally, we compare
+kvtc
+with DMS
+
+(
+Łańcucki et al. 2025
+)
+,
+a trained token eviction method, on reasoning tasks.
+
+For all methods, we follow their original intended protocols, performing prefill in the vanilla mode and compressing the KV cache only after the self-attention has been calculated. For every method except xKV, we simulate a sequence of short conversations by running compression/eviction on the cache every
+c
+tokens, where
+c
+depends on the method’s original sliding window policy. For
+kvtc
+which is run with a sliding window
+w=128
+, we compress/decompress every
+c=16
+tokens, leaving the window in the 112–128 token range. In the case of xKV, we compress only the prefill tokens, providing it with an advantage, since xKV is specifically designed for prefill optimization, and re-computing SVD matrices for newly decoded tokens would be prohibitively time-consuming. For a fair comparison, we only report the prefill compression ratios for non-Qwen models.
+
+Notation-wise,
+kvtc
+CR×
+denotes
+kvtc
+in the default setting, where
+
+\mathrm{CR}
+is the target compression for the DP.
+For all methods, we calculate CR only on the compressed tokens, not counting the sliding window tokens.
+
+Tasks
+
+We evaluate compression effects on Llama 3.1 8B, MN-Minitron 8B and Mistral NeMo 12B across the following task categories, with results presented in Table
+2
+:
+
+•
+
+Math & Knowledge
+: 8-shot Chain of Thought (CoT) GSM8K
+(
+Cobbe et al. 2021
+)
+, 4-shot CoT MMLU
+(
+Hendrycks et al. 2021a
+)
+
+•
+
+Long Context Performance
+: 0-shot key-value retrieval task from
+(
+Liu et al. 2024a
+)
+(denoted LITM), 1-shot RULER
+(
+Hsieh et al. 2024
+)
+Variable Tracking (denoted RULER-VT), and 2-shot Qasper
+(
+Shaham et al. 2022
+)
+
+We evaluate R1-distilled models on challenging mathematical competitions AIME 2024-2025
+(
+Art of Problem Solving 2025
+)
+and coding tasks from LiveCodeBench
+(
+Jain et al. 2025
+)
+, with results presented in Table
+3
+.
+We additionally evaluate
+kvtc
+with Llama 3.3 70B Instruct on MATH-500
+(
+Hendrycks et al. 2021b
+;
+Lightman et al. 2023
+)
+, the key-value retrieval task from
+(
+Liu et al. 2024a
+)
+and Needle In A Haystack (NIAH)
+(
+Kamradt 2023
+;
+Hsieh et al. 2024
+)
+, with results presented in Table
+5
+.
+Detailed evaluation protocols can be found in Appendix
+A
+,
+and ablations and details about parameter choices for
+kvtc
+
+in Appendix
+B
+.
+
+Calibration Data
+
+We sample a 1:1 mixture of short and long documents, with lengths in the 1–8K and 8–32K ranges, respectively. Rotary positional embeddings are removed for calibration; further details are provided in Appendix
+B.1
+. Ablations showing
+kvtc
+stability and generalization across domains of the calibration data are provided in Appendices
+B.5
+and
+B.6
+.
+
+4.1
+Results
+
+Table 2:
+Accuracy of KV cache compression methods. Results within
+1
+score point of vanilla are in
+bold
+. See Appendix
+B.11
+for standard error analysis.
+kvtc
+CR×
+denotes
+kvtc
+set for
+\mathrm{CR}\times
+compression before applying DEFLATE.
+
+Vanilla
+
+GEAR
+{}_{\text{2-bit}}
+
+KIVI
+{}_{\text{2-bit}}
+
+H
+2
+O
+
+TOVA
+
+xKV
+
+FP8
+
+kvtc
+8×
+
+kvtc
+16×
+
+kvtc
+32×
+
+kvtc
+64×
+
+Llama 3.1 8B
+
+CR
+
+1
+
+5
+
+5
+
+8
+
+8
+
+{1}
+-
+{5}
+
+2
+
+{9}
+-
+{10}
+
+{18}
+-
+{22}
+
+{34}
+-
+{44}
+
+{60}
+-
+{88}
+
+GSM8K
+
+56.8
+
+52.8
+
+52.8
+
+54.3
+
+54.5
+
+56.6
+
+55.2
+
+57.0
+
+56.9
+
+57.8
+
+57.2
+
+MMLU
+
+60.5
+
+59.6
+
+59.6
+
+44.3
+
+44.8
+
+59.5
+
+60.1
+
+59.8
+
+60.1
+
+60.6
+
+60.7
+
+QASPER
+
+40.4
+
+40.4
+
+39.1
+
+34.3
+
+38.6
+
+35.6
+
+40.8
+
+40.1
+
+40.7
+
+39.4
+
+37.8
+
+LITM
+
+99.4
+
+96.9
+
+88.8
+
+20.2
+
+1.2
+
+99.9
+
+99.4
+
+99.3
+
+99.3
+
+99.1
+
+90.2
+
+RULER-VT
+
+99.8
+
+99.8
+
+98.9
+
+50.4
+
+99.7
+
+99.8
+
+99.9
+
+99.1
+
+99.1
+
+98.9
+
+95.9
+
+MN
+-
+Minitron 8B
+
+CR
+
+1
+
+5
+
+5
+
+8
+
+8
+
+{1}
+-
+{5}
+
+2
+
+{10}
+-
+{11}
+
+{17}
+-
+{21}
+
+{32}
+-
+{46}
+
+{53}
+-
+{95}
+
+GSM8K
+
+59.1
+
+57.9
+
+58.0
+
+55.3
+
+59.2
+
+59.3
+
+60.1
+
+60.6
+
+60.3
+
+59.1
+
+57.8
+
+MMLU
+
+64.3
+
+63.6
+
+63.2
+
+43.5
+
+48.1
+
+63.1
+
+64.3
+
+64.2
+
+64.1
+
+63.7
+
+62.1
+
+QASPER
+
+38.2
+
+38.2
+
+38.2
+
+30.0
+
+33.9
+
+34.5
+
+38.3
+
+39.1
+
+38.6
+
+37.7
+
+38.1
+
+LITM
+
+99.8
+
+96.0
+
+86.3
+
+16.6
+
+0.3
+
+99.6
+
+99.8
+
+99.4
+
+99.3
+
+86.9
+
+59.5
+
+RULER-VT
+
+99.4
+
+98.3
+
+96.8
+
+39.2
+
+99.3
+
+99.1
+
+99.2
+
+98.8
+
+98.8
+
+96.0
+
+93.4
+
+Mistral NeMo 12B
+
+CR
+
+1
+
+5
+
+5
+
+8
+
+8
+
+{1}
+-
+{5}
+
+2
+
+{10}
+-
+{11}
+
+{17}
+-
+{20}
+
+{31}
+-
+{43}
+
+{51}
+-
+{87}
+
+GSM8K
+
+61.9
+
+59.8
+
+59.7
+
+57.0
+
+60.3
+
+61.9
+
+61.7
+
+62.5
+
+62.0
+
+62.2
+
+61.9
+
+MMLU
+
+64.5
+
+64.0
+
+64.3
+
+45.4
+
+49.0
+
+63.9
+
+64.5
+
+64.6
+
+64.4
+
+63.8
+
+61.4
+
+QASPER
+
+38.4
+
+38.6
+
+38.2
+
+29.5
+
+36.0
+
+33.5
+
+37.9
+
+37.6
+
+37.6
+
+37.5
+
+38.0
+
+LITM
+
+99.5
+
+96.9
+
+91.9
+
+16.2
+
+8.7
+
+97.9
+
+99.0
+
+99.9
+
+99.8
+
+99.6
+
+95.3
+
+RULER-VT
+
+99.8
+
+99.4
+
+98.3
+
+35.2
+
+99.6
+
+99.4
+
+99.8
+
+99.5
+
+99.5
+
+98.9
+
+98.0
+
+In all experiments,
+kvtc
+applies the same compression ratio to both the key and value caches. An ablation of their individual compressibility is presented in Table
+7
+(Appendix
+B
+), suggesting that further adjustments could yield additional gains.
+
+General-Purpose Base Models
+
+We evaluate
+kvtc
+on general-purpose models at the 8–12B scale, featuring three GQA-enabled models (Table
+2
+). The compression ratio of
+kvtc
+varies due to the data-dependent nature of the DEFLATE algorithm, which, on average, achieves a compression ratio of approximately
+1.23\times
+
+on top
+of quantization. Crucially,
+kvtc
+maintains high accuracy across tested tasks, even at substantial compression ratios of
+32\times
+and
+64\times
+. Conversely, quantization methods—GEAR and KIVI—exhibit signs of performance degradation on GSM8K and Lost in the Middle tasks only at
+5\times
+CR; cache eviction methods such as H
+2
+O and TOVA perform poorly as generic KV cache compressors. We also note that xKV performs well across most tasks, except for Qasper. Interestingly, in certain cases,
+kvtc
+at very high compression ratios even surpasses the performance of the vanilla models, likely due to inherent variability in the CoT setup. Crucially,
+kvtc
+at
+16\times
+compression (approximately
+20\times
+after DEFLATE) consistently maintains results within
+<1
+score point (accuracy or F1, depending on the task) of the vanilla models.
+The standard errors for these results are reported in Table
+16
+(Appendix
+B.11
+).
+
+Table 3:
+Reasoning quality (sampling temp
+0.6
+, top-p
+95\%
+) of DeepSeek-R1-distilled Qwen2.5.
+DMS results taken from
+(
+Łańcucki et al. 2025
+)
+.
+
+Method
+
+CR
+
+AIME24
+
+AIME25
+
+LCB
+
+Competition Math
+
+Coding
+
+Qwen 2.5 R1 1.5B
+
+Vanilla
+
+1
+
+26.2_{\pm 4.8}
+
+21.7_{\pm 2.9}
+
+16.4
+
+kvtc
+8×
+
+9
+
+25.4_{\pm 5.7}
+
+24.2_{\pm 4.0}
+
+16.1
+
+kvtc
+16×
+
+18
+
+27.9_{\pm 6.7}
+
+22.5_{\pm 5.2}
+
+13.3
+
+DMS
+8×
+
+-
+
+23.3
+
+N/A
+
+16.1
+
+Qwen 2.5 R1 7B
+
+Vanilla
+
+1
+
+50.9_{\pm 4.9}
+
+40.8_{\pm 4.3}
+
+36.7
+
+kvtc
+8×
+
+{9}
+-
+{11}
+
+52.5_{\pm 3.6}
+
+40.8_{\pm 5.2}
+
+36.5
+
+kvtc
+16×
+
+{18}
+-
+{21}
+
+50.9_{\pm 6.8}
+
+38.3_{\pm 5.5}
+
+31.6
+
+DMS
+8×
+
+-
+
+50.0
+
+N/A
+
+33.4
+
+Reasoning Models
+
+In order to test
+kvtc
+under more challenging conditions where context plays a critical role, we use complex math and coding tasks (Table
+3
+). Due to high variability, AIME results are averaged over eight independent runs with results reported as
+{\mathrm{score}}_{\pm\mathrm{std}}
+. On coding tasks,
+kvtc
+8×
+shows minor accuracy drops of
+0.3
+pp for the 1.5B model and
+0.2
+pp for the 7B model.
+Notably, the KV cache size of the 1.5B model is already small at
+29\,
+KiB/token, compared to
+131\,
+KiB/token for Llama 3.1 8B, and a 9
+\times
+compression shrinks it to only
+3.2\,
+KiB/token. We also compare our method against DMS, a state-of-the-art autoregressive KV cache token eviction method. DMS achieves competitive results, and since it employs token eviction, it could potentially be combined with
+kvtc
+for even lower KV cache footprint.
+
+Table 4:
+Compression applied to a model which is split across four GPUs (pipeline parallel), with KV cache chunks being compressed separately with
+kvtc
+.
+In certain scenarios, like offloading to CPU RAM, these chunks could be compressed jointly for higher accuracy.
+
+Method
+
+MATH-500
+
+NIAH
+
+LITM
+
+Llama 3.3 70B Instruct
+
+Vanilla
+
+75.6_{1.92}
+
+100.0
+
+100.0
+
+kvtc
+8×
+
+73.2_{1.98}
+
+100.0
+
+100.0
+
+kvtc
+10×
+
+74.4_{1.95}
+
+100.0
+
+100.0
+
+kvtc
+16×
+
+73.2_{1.98}
+
+100.0
+
+100.0
+
+kvtc
+20×
+
+72.6_{1.99}
+
+100.0
+
+100.0
+
+Table 5:
+Latency of a simple implementation based on the Transformers library
+(
+Hugging Face 2025b
+)
+, measured on an NVIDIA H100 GPU using Mistral NeMo 12B in bfloat16. In addition, we compare TTFT during recomputation of KV caches with decompression of compressed caches. BF denotes batch size, CTX context length.
+
+Module
+
+BS=8 CTX=8K
+
+BS=2 CTX=16K
+
+Comp
+
+Decomp
+
+Comp
+
+Decomp
+
+Project
+
+153\,
+ms
+
+156\,
+ms
+
+78\,
+ms
+
+75\,
+ms
+
+Quantize
+
+67\,
+ms
+
+37\,
+ms
+
+39\,
+ms
+
+27\,
+ms
+
+Deflate
+
+137\,
+ms
+
+64\,
+ms
+
+66\,
+ms
+
+36\,
+ms
+
+Total
+
+379  ms
+
+267  ms
+
+194  ms
+
+143  ms
+
+Vanilla recompute TTFT
+
+3098 ms
+
+1780 ms
+
+kvtc
+decomp TTFT
+
+380 ms
+
+208 ms
+
+Multi-GPU Inference
+
+To investigate attainable compression ratios for models distributed across multiple GPUs, we evaluate
+kvtc
+using Llama 3.3 70B (Table
+5
+). The model runs in a pipeline-parallel setting
+(
+Hu et al. 2021
+)
+on four GPUs, each handling 20 layers. We maintain a local KV cache on each GPU, applying
+kvtc
+separately. Accuracy drops on the MATH-500 task are within
+1.5\times\mathrm{stderr}
+, with accuracy decreasing by
+1.2
+pp at
+10\times
+compression and
+3.0
+pp at
+20\times
+.
+
+Latency
+
+We calculate the latency of elements of the compression pipeline and provide the results in Table
+5
+. In contrast to full re-computation of KV cache for 8K context length,
+kvtc
+16×
+can reduce time-to-first-token (TTFT) up to 8
+\times
+.
+
+5
+Limitations and future work
+
+Online Compression and Composability with Other Methods
+
+kvtc
+was designed for efficient storage and reducing time-to-first-token. However, the advantage of having a single, generalizable PCA matrix for initial compression of cache renders it suitable for further exploration of inference directly in the principal component space.
+We leave this as future work.
+
+Notably,
+kvtc
+does not alter the structure of KV cache and does not change how the attention is calculated. Consequently, it is directly compatible with token eviction methods, including but not limited to these used in the experimental section, such as TOVA, H
+2
+O, and DMS. Finally,
+kvtc
+could be used to compress the latent state in Multi-head Latent Attention
+(
+DeepSeek-AI et al. 2024
+)
+.
+
+Scalability and Generalization Limits
+
+We approximate deployment by evaluating
+kvtc
+on benchmark tasks in simulated multi-turn settings, which may not fully reflect real content distributions or interaction patterns. Our experiments cover dense decoder-only models from 1.5B to 70B parameters; evaluating larger models under conditions that more accurately mirror production is left for future work. For calibration, we process approximately 200K tokens on a single NVIDIA H100 SXM 80GB GPU. Under these settings, computing the PCA basis with the randomized algorithm of
+Halko et al. 2011
+completes within minutes. As shown in
+Figures
+
+6
+,
+7
+and
+8
+, increasing the calibration set size consistently reduces the Frobenius-norm reconstruction error. Scaling
+kvtc
+beyond 200K tokens, primarily a matter of scaling the computation of PCA, is left for future work. Finally, we report Frobenius-norm reconstruction error as a proxy for downstream task accuracy. While convenient, this metric does not guarantee task-level gains and its predictive power may be task-dependent. We provide an initial correlation analysis in
+Section
+
+B.5
+and defer a systematic study of alternative proxies to future work.
+
+Finally, the compression and decompression times of
+kvtc
+can be substantially reduced via kernel fusion and hierarchical PCA: first at the level of individual layers, then across groups of layers. Nevertheless, even a simple implementation yields substantial benefits and, in many cases, incurs only marginal overhead.
+
+6
+Related work
+
+The challenge of KV cache compression has garnered significant attention, with approaches broadly categorized into the following domains:
+
+Tuning-Free Quantization
+
+Quantization-based methods that avoid model fine-tuning offer a straightforward path to KV cache compression
+(
+Zhao et al. 2024
+;
+Sheng et al. 2023
+)
+. Works such as KIVI
+(
+Liu et al. 2024d
+)
+and KVQuant
+(
+Hooper et al. 2024
+)
+have advanced this direction by developing separate quantization strategies for key and value embeddings. These methods leverage the observation that keys benefit from per-channel quantization, while values are better suited to per-token quantization.
+Our approach diverges from these methods by first projecting concatenated embeddings from attention layers using SVD matrices derived from a calibration set. Quantization is then applied in this transformed space, with the precision dynamically optimized via dynamic programming bit allocation. While we adopt KIVI’s uniform quantization scheme, our application occurs in the SVD-transformed domain. Similar to KVQuant, we apply compression before RoPE
+(
+Su et al. 2024
+)
+to preserve model quality.
+
+Tuning-Based Quantization
+
+A complementary approach to post-training quantization involves fine-tuning models to adapt to quantized activations. LLM-QAT
+(
+Liu et al. 2024c
+)
+leverages generations from the pre-quantized model for fine-tuning, while BitDistiller
+(
+Du et al. 2024
+)
+merges Quantization Aware Training
+(
+Jacob et al. 2018
+)
+with Knowledge Distillation
+(
+Hinton et al. 2015
+)
+
+In contrast, our method eliminates the need for parameter modifications.
+
+Singular Value Decomposition Approaches
+
+SVD has emerged as a straightforward method for removing the redundancy in KV caches and exploiting its low-rank structure.
+GEAR
+(
+Kang et al. 2024
+)
+improves quantization through low-rank correction mechanisms, whereas LoRC
+(
+Zhang et al. 2024
+)
+minimizes computational overhead by directly reducing the rank of key and value matrices.
+Eigen Attention
+(
+Saxena et al. 2024
+)
+restructures attention computation by projecting into a truncated subspace defined by SVD, enabling efficient operations. A similar mechanism could be devised for value vectors in
+kvtc
+, and key vectors for layers that do not employ positional embeddings.
+GEAR
+(
+Kang et al. 2024
+)
+improves KIVI quantization through low-rank correction mechanisms.
+Building on ShadowKV
+(
+Sun et al. 2025
+)
+, SVDq
+(
+Yankun et al. 2025
+)
+integrates SVD with quantization, leveraging singular value magnitudes for a simple precision allocation; xKV
+(
+Chang et al. 2025
+)
+aggregates KV caches across multiple layers before decomposition.
+This work differs in three respects: (i) it models rotational relationships between non-adjacent layers to enable cross-layer concatenation before decomposition; (ii) it selects ranks and bitwidths via a dynamic program under a compression budget; and (iii) it applies entropy coding to the quantized factors. Empirical comparisons and ablations (e.g., treatment of early sink tokens) are reported in Appendix
+B
+.
+
+Sparse Attention Strategies
+
+Sparse attention mechanisms provide a complementary paradigm for managing sequence length dimensions by selectively discarding non-essential keys/values during inference. Techniques such as H
+2
+O
+(
+Zhang et al. 2023
+)
+and TOVA
+(
+Oren et al. 2024
+)
+employ prioritization strategies to dynamically prune less informative elements from the KV cache. In contrast, chunk-based approaches like Quest
+(
+Tang et al. 2024
+)
+, Landmark Attention
+(
+Mohtashami & Jaggi 2023
+)
+, and Native Sparse Attention
+(
+Yuan et al. 2025
+)
+construct compressed representations of the KV cache by partitioning sequences into chunks. These methods retrieve only the most critical chunks during attention computation, significantly reducing the number of memory transfers.
+Concurrently, dynamic compression techniques such as Dynamic Memory Compression
+(
+Nawrot et al. 2024
+)
+and Dynamic Memory Sparsification
+(
+Łańcucki et al. 2025
+)
+optimize KV cache memory usage through pooling/eviction of keys/values. These strategies can be potentially integrated with quantization and SVD methods to achieve higher compression ratios and improved inference latency
+(
+Yankun et al. 2025
+)
+.
+
+Cache Management Systems
+
+Finally, cache management systems address the operational challenges of KV cache handling in production environments. Paged Attention
+(
+Kwon et al. 2023
+)
+mitigates memory overhead by introducing chunked memory allocation for KV caches. Continuous batching techniques, as implemented in systems like vLLM
+(
+Kwon et al. 2023
+)
+and FasterTransformer
+(
+NVIDIA 2021
+)
+, optimize device utilization by enabling parallel processing of multiple sequences. CacheGen
+(
+Liu et al. 2024b
+)
+advanced the field with a distributed framework for long-term KV cache management, incorporating compression, streaming, and cross-node coordination. Our approach extends these systems by integrating fine-grained compression capabilities, enabling token-level compression without compromising distributed architecture advantages.
+
+7
+Conclusion
+
+We introduce
+kvtc
+, a method for compressing KV cache up to 20
+\times
+with negligible quality degradation, and higher compression ratios of 40
+\times
+or more available for specific use cases. We empirically show that key and value caches exhibit substantial redundancy, which
+
+kvtc
+exploits through a simple, transform coding pipeline. It is built around linear dimensionality reduction and a dynamic programming algorithm, which assigns variable numbers of bits to principal components.
+We demonstrate the effectiveness of
+kvtc
+across both regular and thinking model families, evaluating models from 1.5B to 70B. We believe that
+kvtc
+paves the way towards more efficient LLM deployments, lowering the cost of LLM-assisted iterative workflows.
+
+Reproducibility
+
+To foster reproducibility of our results, we provide extensive details about the calibration of PCA matrices in Appendix
+B.1
+along with ablations regarding
+kvtc
+parameters in Appendices
+B.3
+(sink tokens),
+B.4
+(key vs value compressibility),
+B.5
+(amount of calibration data),
+B.6
+(effect of calibration data domain) and
+B.7
+(sliding window).
+In Appendix
+A
+, we present the details about the evaluation setup — tasks, used prompts, and baseline configuration. We note that we utilize LM Eval Harness
+(
+Gao et al. 2024
+)
+and RULER
+(
+Hsieh et al. 2024
+)
+for evaluation, which are publicly available. In Appendix
+B.13
+we provide the pseudocode for the dynamic programming precision assignment algorithm along with the sketch of the optimality proof and complexity analysis.
+
+Ethical statement
+
+As a method that aims to improve aspects regarding LLM usage,
+kvtc
+does not introduce new risks. However, we note that it can amplify existing ones. Therefore, we refer to the existing body of knowledge on the ethical risks of LLM development, such as Ethics Threats in LLM-Based Agents
+(
+Gan et al. 2024
+)
+, potential reversal of safety alignment
+(
+Xu et al. 2024
+)
+, and more general risks regarding LLMs
+(
+Li & Fung 2025
+)
+.
+
+Appendix
+
+Appendix A
+Evaluation details
+
+A.1
+Tasks
+
+For evaluation, we utilize Language Model Evaluation Harness
+(
+Gao et al. 2024
+)
+and RULER
+(
+Hsieh et al. 2024
+)
+with the Transformers library
+(
+Hugging Face 2025b
+)
+serving as an inference backend.
+
+A.1.1
+GSM8K
+
+GSM8K
+(
+Cobbe et al. 2021
+)
+is an established task for the evaluation of the reasoning of non-reasoning models (models without thinking phase (
+<think>...</think>
+) before answer)
+(
+Yang et al. 2025
+)
+.
+We evaluate it in an 8-shot CoT setting with few-shot examples from
+(
+Wei et al. 2022
+)
+. Following
+(
+Meta 2024
+)
+we allow for the generation of up to
+1024
+tokens. Task name in LM Eval Harness is
+gsm8k_cot
+.
+
+GSM8K 8-shot prompt example
+
+Q: There are 15 trees in the grove. Grove workers will plant trees in the grove today. After they are done, there will be 21 trees. How many trees did the grove workers plant today?
+
+A: There are 15 trees originally. Then there were 21 trees after some more were planted. So there must have been 21 - 15 = 6. The answer is 6.
+
+Q: If there are 3 cars in the parking lot and 2 more cars arrive, how many cars are in the parking lot?
+
+A: There are originally 3 cars. 2 more cars arrive. 3 + 2 = 5. The answer is 5.
+
+Q: Leah had 32 chocolates and her sister had 42. If they ate 35, how many pieces do they have left in total?
+
+A: Originally, Leah had 32 chocolates. Her sister had 42. So in total they had 32 + 42 = 74. After eating 35, they had 74 - 35 = 39. The answer is 39.
+
+Q: Jason had 20 lollipops. He gave Denny some lollipops. Now Jason has 12 lollipops. How many lollipops did Jason give to Denny?
+
+A: Jason started with 20 lollipops. Then he had 12 after giving some to Denny. So he gave Denny 20 - 12 = 8. The answer is 8.
+
+Q: Shawn has five toys. For Christmas, he got two toys each from his mom and dad. How many toys does he have now?
+
+A: Shawn started with 5 toys. If he got 2 toys each from his mom and dad, then that is 4 more toys. 5 + 4 = 9. The answer is 9.
+
+Q: There were nine computers in the server room. Five more computers were installed each day, from monday to thursday. How many computers are now in the server room?
+
+A: There were originally 9 computers. For each of 4 days, 5 more computers were added. So 5 * 4 = 20 computers were added. 9 + 20 is 29. The answer is 29.
+
+Q: Michael had 58 golf balls. On tuesday, he lost 23 golf balls. On wednesday, he lost 2 more. How many golf balls did he have at the end of wednesday?
+
+A: Michael started with 58 golf balls. After losing 23 on tuesday, he had 58 - 23 = 35. After losing 2 more, he had 35 - 2 = 33 golf balls. The answer is 33.
+
+Q: Olivia has $23. She bought five bagels for $3 each. How much money does she have left?
+
+A: Olivia had 23 dollars. 5 bagels for 3 dollars each will be 5 x 3 = 15 dollars. So she has 23 - 15 dollars left. 23 - 15 is 8. The answer is 8.
+
+Q: {QUESTION}
+
+A:
+
+A.1.2
+MMLU
+
+MMLU
+(
+Hendrycks et al. 2021a
+)
+is a collection of multiple-choice questions spanning
+57
+subjects.
+For MMLU evaluation, we use 4-shot
+mmlu_flan_cot_fewshot
+from LM Eval Harness, allowing for generation of up to
+256
+tokens. We pick this setup instead of the perplexity-based forward-pass evaluation of MMLU, because our baselines perform a prefill using full precision KV cache. Therefore, for a fair evaluation, we need to make the model generate a non-zero number of tokens before providing the answer, as otherwise the performance would be identical to vanilla.
+
+MMLU 4-shot prompt example
+
+The following are multiple choice questions (with answers) about abstract algebra.Q: Statement 1 | Every element of a group generates a cyclic subgroup of the group. Statement 2 | The symmetric group S_10 has 10 elements.
+
+(A) True, True (B) False, False (C) True, False (D) False, True
+
+A: Let’s think step by step. A cyclic group is a group that is generated by a single element. Hence a subgroup generated by a single element of a group is cyclic and Statement 1 is True. The answer is (C).
+
+Q: The symmetric group $S_n$ has $
+
+actorial{n}$ elements, hence it is not true that $S_{10}$ has 10 elements.
+
+Find the characteristic of the ring 2Z.
+
+(A) 0 (B) 3 (C) 12 (D) 30
+
+A: Let’s think step by step. A characteristic of a ring is R is $n$ if the statement $ka = 0$ for all $a\in 2Z$ implies that $k$ is a multiple of $n$. Assume that $ka = 0$ for all $a\in 2Z$ for some $k$. In particular $2k = 0$. Hence $k=0$ and $n=0$. The answer is (A).
+
+Q: Statement 1| Every function from a finite set onto itself must be one to one. Statement 2 | Every subgroup of an abelian group is abelian.
+
+(A) True, True (B) False, False (C) True, False (D) False, True
+
+A: Let’s think step by step. Statement 1 is true. Let $S$ be a finite set. If $f:S
+
+ightarrow S$ is a onto function, then $|S| = |f(S)|$. If $f$ was not one to one, then for finite domain $S$ the image would have less than $S$ elements, a contradiction.
+
+Statement 2 is true. Let $G$ be an abelian group and $H$ be a subgroup of $G$. We need to show that $H$ is abelian. Let $a,b \in H$. Then $a,b \in G$ and $ab=ba$. Since $G$ is abelian, $ab=ba$. Since $H$ is a subgroup of $G$, $ab \in H$. Therefore, $ab=ba$ and $H$ is abelian. The answer is (A).
+
+Q: Statement 1 | If aH is an element of a factor group, then |aH| divides |a|. Statement 2 | If H and K are subgroups of G then HK is a subgroup of G.
+
+(A) True, True (B) False, False (C) True, False (D) False, True
+
+A: Let’s think step by step. Statement 2 is false. Let $H$ be a subgroup of $S_3$ generated by the cycle $(1,2)$ and $K$ be a subgroup of $S_3$ generated by the cycle $(1,3)$. Both $H$ and $K$ have two elements, the generators and the identity. However $HK$ contains cycles (1,2), (1,3) and (2,3,1), but the inverse of (2,3,1) is (2,1,3) and it does not belong to HK, hence HK is not a subgroup. The answer is (B).
+
+Q: {QUESTION}
+
+A: Let’s think step by step.
+
+A.1.3
+Lost in the Middle
+
+Lost in the Middle
+(
+Liu et al. 2024a
+)
+is evaluated in a 0-shot 100-keys (300 keys for Llama 3.3 70B) setup, allowing generation of 64 tokens using the prompt presented below. We implement the evaluation using the LM Eval Harness framework and utilize the UUID strings and code from
+(
+Liu et al. 2024a
+)
+. This benchmark allows for methodical testing of the model’s ability to access the input context. As an evaluation metric, we utilize the exact match between the UUID returned by the model and the gold answer.
+
+Lost in the Middle question example (base models)
+
+Extract the value corresponding to the specified key in the JSON object below.
+
+JSON data:
+
+{"1afcec1f-1acd-42e3-b833-e7882d5daada": "25f1a78d-a2f6-4c7d-8bd6-51226b263cbe",
+
+"94071d67-86df-455c-8ee9-691e492ff740": "0d7ba717-e034-410e-88ab-c13d37cc6499",
+
+"88b322bb-571c-4e55-9934-aa8df11b3349": "c54095cf-9931-460b-8a6b-e1f09afb2f72",
+
+...
+
+"5a729e1f-6956-4c1d-b024-10b317ed5657": "cea37ae5-84e1-4deb-b4c6-19d04134d664",
+
+"aaed65fc-f80c-4090-a0a9-90592140b9de": "ffc2e314-2d0f-4b20-be32-916ba96d1ea9",
+
+"90b7fe08-8708-451a-badf-34cabe7930a4": "7bebff53-05c7-4ca3-9314-bca68bd65c04"}
+
+"1afcec1f-1acd-42e3-b833-e7882d5daada":
+
+Lost in the Middle question example (Llama 3.3 70B instruct)
+
+<|begin_of_text|><|start_header_id|>system<|end_header_id|>
+
+Cutting Knowledge Date: December 2023
+
+Today Date: 26 Jul 2024
+
+<|eot_id|><|start_header_id|>user<|end_header_id|>
+
+Extract the value corresponding to the specified key in the JSON object below.
+
+JSON data:
+
+{"2a85047d-fe61-4c53-8844-1d85668d6a7d": "a4852ee7-d94f-40ce-8c2f-f14e95377e79",
+
+"1698320e-2ba6-499f-b119-b8ffd74d53db": "e212083b-22f5-4d27-87d3-5c3cfcf9542f",
+
+...
+
+"90ef90b0-7972-46d0-9a73-4b07be2f5aae": "ebb84b27-9156-4d23-8a7d-a34aef606f28",
+
+"c1736979-584d-4b93-8e25-a206770fcdae": "dcb5aace-7fb2-4288-bfc2-c5faacf89469"}
+
+What is the value associated with the key "2a85047d-fe61-4c53-8844-1d85668d6a7d"? Answer using the following format:
+
+`The value associated with the key "2a85047d-fe61-4c53-8844-1d85668d6a7d" is ANSWER_HERE.`
+
+Where ANSWER_HERE is the value associated with the key "2a85047d-fe61-4c53-8844-1d85668d6a7d".<|eot_id|><|start_header_id|>assistant<|end_header_id|>
+
+A.1.4
+Variable Tracking
+
+Variable Tracking is evaluated in 1-shot (with a relatively short example shown below) using RULER
+(
+Hsieh et al. 2024
+)
+with context length 8K, limiting the generation to
+128
+tokens. The benchmark tests the model’s ability to track variable assignments across unrelated contexts.
+
+Variable Tracking prompt and question example
+
+Memorize and track the chain(s) of variable assignment hidden in the following text.
+
+The grass is green. The sky is blue. The sun is yellow. Here we go. There and back again.
+
+The grass is green. The sky is blue. The sun is yellow. Here we go. There and back again.
+
+The grass is green. The sky is blue. The sun is yellow. Here we go. There and back again.
+
+The grass is green. The sky is blue. The sun is yellow. Here we go. There and back again.
+
+The grass is green. The sky is blue. The sun is yellow. Here we go. There and back again.
+
+The grass is green. The sky is blue. The sun is yellow. Here we go. There and back again.
+
+VAR JUP = 97498 The grass is green. The sky is blue. The sun is yellow. Here we go. There and back again.
+
+The grass is green. The sky is blue. The sun is yellow. Here we go. There and back again.
+
+The grass is green. The sky is blue. The sun is yellow. Here we go. There and back again.
+
+The grass is green. The sky is blue. The sun is yellow. Here we go. There and back again.
+
+The grass is green. The sky is blue. The sun is yellow. Here we go. There and back again.
+
+The grass is green. The sky is blue. The sun is yellow. Here we go. There and back again.
+
+The grass is green. The sky is blue. The sun is yellow. Here we go. There and back again.
+
+VAR AGD = VAR JUP The grass is green. The sky is blue. The sun is yellow. Here we go. There and back again.
+
+The grass is green. The sky is blue. The sun is yellow. Here we go. There and back again.
+
+The grass is green. The sky is blue. The sun is yellow. Here we go. There and back again.
+
+The grass is green. The sky is blue. The sun is yellow. Here we go. There and back again.
+
+The grass is green. The sky is blue. The sun is yellow. Here we go. There and back again.
+
+The grass is green. The sky is blue. The sun is yellow. Here we go. There and back again.
+
+VAR KCB = VAR AGD The grass is green. The sky is blue. The sun is yellow. Here we go. There and back again.
+
+The grass is green. The sky is blue. The sun is yellow. Here we go. There and back again.
+
+The grass is green. The sky is blue. The sun is yellow. Here we go. There and back again.
+
+The grass is green. The sky is blue. The sun is yellow. Here we go. There and back again.
+
+The grass is green. The sky is blue. The sun is yellow. Here we go. There and back again.
+
+The grass is green. The sky is blue. The sun is yellow. Here we go. There and back again.
+
+The grass is green. The sky is blue. The sun is yellow. Here we go. There and back again.
+
+The grass is green. The sky is blue. The sun is yellow. Here we go. There and back again.
+
+VAR LJP = VAR KCB The grass is green. The sky is blue. The sun is yellow. Here we go. There and back again.
+
+The grass is green. The sky is blue. The sun is yellow. Here we go. There and back again.
+
+VAR LFP = VAR LJP The grass is green. The sky is blue. The sun is yellow. Here we go. There and back again.
+
+Question: Find all variables that are assigned the value 97498 in the text above. Answer: According to the chain(s) of variable assignment in the text above, 5 variables are assgined the value 97498, they are: JUP AGD KCB LJP LFP
+
+Memorize and track the chain(s) of variable assignment hidden in the following text.
+
+...
+
+Question: Find all variables that are assigned the value 79092 in the text above. Answer: According to the chain(s) of variable assignment in the text above, 5 variables are assgined the value 79092, they are:
+
+A.1.5
+Needle In A Haystack
+
+Needle In A Haystack (NIAH)
+(
+Kamradt 2023
+)
+is evaluated 0-shot using RULER
+(
+Hsieh et al. 2024
+)
+with context length 100K, limiting the generation to
+128
+tokens. The benchmark tests the model’s ability to retrieve information hidden in long text. The name of the task in the RULER is
+niah_single_2
+.
+
+NIAH prompt example
+
+<|begin_of_text|><|start_header_id|>system<|end_header_id|>
+
+Cutting Knowledge Date: December 2023\nToday Date: 26 Jul 2024
+
+<|eot_id|><|start_header_id|>user<|end_header_id|>
+
+A special magic number is hidden within the following text. Make sure to memorize it. I will quiz you about the number afterwards.
+
+<essay text prefix>
+
+<needle>
+
+<essay text suffix>
+
+What is the special magic number for abrasive-pathology mentioned in th
+
+e provided text? The special magic number for abrasive-pathology mentioned in the provided text is<|eot_id|><|start_header_id|>assistant<|end_header_id|>
+
+A.1.6
+Qasper
+
+Qasper
+(
+Dasigi et al. 2021
+;
+Shaham et al. 2022
+)
+is evaluated in 2-shot using LM Eval Harness task
+scrolls_qasper
+with full autoregressive generation and F1 score (same reasons as with MMLU evaluation). We limit the generation to
+128
+tokens.
+This benchmark evaluates the model’s ability to answer questions about a paper presented as part of the input.
+
+A.1.7
+AIME 2024-2025
+
+We implement AIME evaluation using LM Eval Harness. Following
+(
+Łańcucki et al. 2025
+)
+we utilize prompts adopted from the Open-R1 repository
+(
+Hugging Face 2025a
+)
+and limit the generation to
+30
+K tokens.
+AIME competitions are popular for the evaluation of reasoning models such as DeepSeek R1
+(
+DeepSeek-AI et al. 2025
+)
+.
+To check the correctness of an answer, we utilize the following code with Math-Verify
+(
+Hugging Face 2024
+)
+:
+
+AIME 2024-2025 evaluation code
+
+from math_verify.metric import math_metric
+
+from math_verify.parser import LatexExtractionConfig, ExprExtractionConfig
+
+def grade_answer(problem, model_answer):
+
+gold_is_latex = False
+
+verify_func = math_metric(
+
+gold_extraction_target=(
+
+LatexExtractionConfig() if gold_is_latex else ExprExtractionConfig(),
+
+),
+
+pred_extraction_target=(ExprExtractionConfig(), LatexExtractionConfig()),
+
+aggregation_function=max,
+
+precision=6,
+
+)
+
+gold_answer = problem["answer"]
+
+try:
+
+with timeout(seconds=30): # custom class to throw and exception if code does not complete under 30 seconds
+
+grade, extracted_answers = verify_func([gold_answer], [model_answer])
+
+return grade == 1
+
+except:
+
+return False
+
+AIME 2024-2025 prompt
+
+<|begin_of_sentence|><|User|>Solve the following math problem efficiently and clearly:
+
+- For simple problems (2 steps or fewer):
+
+Provide a concise solution with minimal explanation.
+
+- For complex problems (3 steps or more):
+
+Use this step-by-step format:
+
+## Step 1: [Concise description]
+
+[Brief explanation and calculations]
+
+## Step 2: [Concise description]
+
+[Brief explanation and calculations]
+
+...
+
+Regardless of the approach, always conclude with:
+
+Therefore, the final answer is: $\boxed{answer}$. I hope it is correct.
+
+Where [answer] is just the final number or expression that solves the problem.
+
+Problem: {PROBLEM}
+
+<|Assistant|><think>
+
+A.1.8
+LiveCodeBench
+
+For LiveCodeBench
+(
+Jain et al. 2025
+)
+evaluation, we utilize the official repository and, following
+(
+Łańcucki et al. 2025
+)
+, limit the generation to
+16
+K tokens and data range from 2024-08-01 to 2025-01-31.
+The benchmark consists of problems from sites like leetcode.com and codeforces.com.
+
+A.1.9
+MATH-500
+
+For evaluation on MATH-500
+(
+Lightman et al. 2023
+)
+, a subset of MATH
+(
+Hendrycks et al. 2021b
+)
+introduced by
+Lightman et al. 2023
+, we limit the generation to
+5120
+tokens following
+(
+Meta 2024
+)
+. We also change the sliding window size to
+w=256
+. We utilize the following prompt adopted from MATH-500 evaluation, and the following code optimized for reproduction of Llama 3.3 70B results without the LLM judge:
+
+MATH-500 eval code
+
+from math_verify import parse, verify
+
+def answer_normalize(answer: str) -> str:
+
+answer = answer.split(r"\boxed{")[-1].split("}$")[0].strip()
+
+answer = answer.replace(r"\left", "")
+
+answer = answer.replace(r"\right", "")
+
+answer = answer.replace(r"\begin{align}", "")
+
+answer = answer.replace(r"\end{align}", "")
+
+answer = answer.replace(r"\begin{equation}", "")
+
+answer = answer.replace(r"\end{equation}", "")
+
+answer = answer.replace(" ", "")
+
+answer = answer.replace(r"\$", "")
+
+if answer.startswith(r"\text"):
+
+answer = answer.replace(r"\text{", "")
+
+answer = answer.replace(r"}", "")
+
+if answer.startswith(r"x\in"):
+
+answer = answer.replace(r"x\in", "")
+
+if answer.startswith(r"y="):
+
+answer = answer.replace(r"y=", "")
+
+return answer
+
+def compare_answers(answer: str, model_answer: str) -> bool:
+
+gold = parse(answer)
+
+model = parse(model_answer)
+
+res = verify(gold, model)
+
+if not res:
+
+answer = answer_normalize(answer)
+
+model_answer = answer_normalize(model_answer)
+
+print(answer, model_answer)
+
+gold = parse(answer)
+
+model = parse(model_answer)
+
+if not verify(gold, model): # sometimes fails for improper expressions
+
+res = verify(answer, model_answer)
+
+gold = answer
+
+model = model_answer
+
+if res:
+
+return True
+
+else:
+
+return False
+
+else:
+
+return res
+
+MATH-500 prompt
+
+<|begin_of_text|><|start_header_id|>system<|end_header_id|>
+
+Cutting Knowledge Date: December 2023
+
+Today Date: 26 Jul 2024
+
+<|eot_id|><|start_header_id|>user<|end_header_id|>
+
+Solve the following math problem efficiently and clearly:
+
+- For simple problems (2 steps or fewer):
+
+Provide a concise solution with minimal explanation.
+
+- For complex problems (3 steps or more):
+
+Use this step-by-step format:
+
+## Step 1: [Concise description]
+
+[Brief explanation and calculations]
+
+## Step 2: [Concise description]
+
+[Brief explanation and calculations]
+
+...
+
+Regardless of the approach, always conclude with:
+
+Therefore, the final answer is: $\boxed{answer}$. I hope it is correct.
+
+Where [answer] is just the final number or expression that solves the problem.
+
+Problem: {PROBLEM}<|eot_id|><|start_header_id|>assistant<|end_header_id|>
+
+A.2
+Baselines configuration
+
+A.2.1
+KIVI
+
+We follow
+(
+Liu et al. 2024d
+, Section 4.1)
+and use
+group size
+=
+32
+and
+residual length
+=
+128
+, with
+2
+-bits per key and
+2
+-bits per value.
+We utilize the official implementation.
+
+A.2.2
+GEAR
+
+We follow
+(
+Kang et al. 2024
+)
+github repository and set underlying quantization to KIVI with
+group size
+=
+64
+,
+streaming gap
+=
+64
+,
+2
+-bit keys and values.
+Additionally, we set the rank of key/value correction to
+4
+for prefill and
+2
+for generation.
+We utilize the official implementation.
+
+A.2.3
+xKV
+
+We follow
+(
+Chang et al. 2025
+)
+.
+For Llama 3.1
+8
+B we group layers by
+4
+and set the pre-RoPE key rank to
+512
+(compression ratio
+8
+) and value rank to
+768
+(compression rank
+5\frac{1}{3}
+).
+For Mistral NeMo and MN-Minitron, we group layers by
+5
+(those models have
+1.25
+more layers than Llama 3.1
+8
+B) and set the pre-RoPE key rank to
+640
+(compression ratio
+8
+) and value rank to
+960
+(compression rank
+5\frac{1}{3}
+).
+We utilize the official implementation.
+
+A.2.4
+H2O
+
+We utilize the official implementation of
+(
+Zhang et al. 2023
+)
+and set the recent and heavy hitter fractions to
+\frac{1}{16}
+of (input + max possible output size). This results in up to an 8x compression ratio. Lower compression ratios occur when the model produces shorter outputs than the maximal specified value. We note that this can give an advantage to H2O over other methods.
+
+A.2.5
+TOVA
+
+We utilize the official implementation of
+(
+Oren et al. 2024
+)
+and set the max cache size to
+\frac{1}{8}
+of (input + possible output size). This results in up to an 8x compression ratio. Lower compression ratios occur when the model produces shorter outputs than the maximal specified value. We note that this can give an advantage to TOVA over other methods.
+
+A.2.6
+DMS
+
+We copy the results from the Inference-Time Hyper-Scaling
+(
+Łańcucki et al. 2025
+)
+.
+
+A.3
+Hardware
+
+Experiments were run on a node with 8
+\times
+NVIDIA H100 GPUs (80 GB each). All jobs finished within 4 h, except MMLU and Llama-3.3-70B (
+\leq
+8 h) and xKV (
+\leq
+12 h). For baselines (KIVI, GEAR, xKV, TOVA, H2O) we used the authors’ public code. All runs used batch size 1 (except Qwen evaluations) to prevent padding that could bias some of the baselines.
+
+Appendix B
+Ablations and additional details
+
+We present additional details and ablations regarding
+kvtc
+in the following appendices:
+
+•
+
+Appendix
+B.1
+— additional details about the hyperparameters of
+kvtc
+, along with justifications and references to relevant ablation studies.
+
+•
+
+Appendix,
+B.2
+— properties of key and value channels.
+
+•
+
+Appendix
+B.3
+— omitting sink tokens for KV cache compression can result in significant gains at higher compression ratios.
+
+•
+
+Appendix
+B.4
+— the difference in compressibility between keys and values suggests that long-context retrieval tasks may benefit from using higher precision for keys.
+
+•
+
+Appendix
+B.5
+— increasing the amount of calibration data helps preserve performance at higher compression ratios, while smaller amounts remain competitive for lower compression.
+
+•
+
+Appendix
+B.6
+— influence of the calibration data domain on downstream performance.
+
+•
+
+Appendix
+B.7
+— influence of the sliding window size on downstream performance.
+
+•
+
+Appendix
+B.8
+— ablation of lossless compression algorithms.
+
+•
+
+Appendix
+B.9
+— benefits of DP quantization over pure PCA.
+
+•
+
+Appendix
+B.10
+— benefits of cross layer PCA.
+
+•
+
+Appendix
+B.11
+— results from Table
+2
+, with standard errors computed by LM Eval Harness
+(
+Gao et al. 2024
+)
+.
+
+•
+
+Appendix
+B.12
+— sizes of PCA projection matrices (stored per model), with an emphasis on the fact that their size is only a small fraction of the model parameters.
+
+•
+
+Appendix
+B.13
+— pseudocode for the Dynamic Programming (DP) precision assignment algorithm, along with complexity analysis and a sketch of the optimality proof.
+
+B.1
+PCA calculation parameters
+
+As mentioned in the main text, we utilize
+8
+iterations of the randomized algorithm from
+(
+Halko et al. 2011
+)
+for PCA. We utilize 160K calibration tokens for Llama 3.1 8B, Llama 3.3 70B instruct, Mistral NeMo 12B, and MN-Minitron 8B with a dimensionality cut-off of
+10
+K.
+This choice is motivated by memory efficiency and the results presented in Figures
+6
+,
+7
+and
+8
+, where the initial boost from the increase in the number of calibration tokens from
+10
+K to
+100
+K is relatively large compared to the boost attained when increasing from
+100
+K to
+160
+K. We leave the exploration of larger calibration sets for future work. In Appendix
+B.5
+we ablate the influence of the amount of the calibration data on downstream results. In Appendix
+B.12
+we provide the sizes of the projection matrices, noting that they are relatively small when compared to the model size (
+2.4
+% of model parameters for Llama 3.3 70B) .
+
+For Qwen models, due to their smaller number of KV heads, we utilize
+200
+K calibration tokens and dimensionality reduction of
+8
+K. For all models, we utilize a 50/50 mixture of FineWeb
+(
+Penedo et al. 2024
+)
+and OpenR1Math traces
+(
+R1 2025
+)
+due to the duality of our benchmarks (reasoning and general purpose; see Appendix
+B.6
+for an ablation on calibration data source). We take samples from both datasets with the only filters being minimum and maximum length (1K and 32K, respectively) for both datasets and quality score (
+\geq
+0.95) for FineWeb (the quality score is attached to the dataset). Additionally, we ensure that the number of tokens from documents below 8000 and above 8000 tokens is roughly the same (except in the MN-Minitron case, as this model supports up to
+8
+K context length). Token counts and cutoffs are chosen so that a single calculation of PCA fits on a single H100 GPU with
+80
+GB of memory and completes within 10 minutes (for details see Appendix
+B.5
+).
+
+We emphasize that for a given model, we use the same PCA matrix for all compression ratios. The only change between compression ratios is the precision assignment, which is done automatically via a dynamic programming algorithm. Additionally, we note that the manual adjustment needed by a practitioner to adapt
+kvtc
+to a new model is limited to choosing the initial PCA dimensionality cutoff (if the practitioner decides to use the efficient algorithm by
+(
+Halko et al. 2011
+)
+), the number of samples that the chosen PCA implementation can handle (based on GPU/CPU memory) and the calibration sample choice if special scenarios are desired for increased compression. In this paper, we note that across a wide range of tasks, the choice of a 50/50 mixture of both short and long context FineWeb
+(
+Penedo et al. 2024
+)
+(for generic text) and OpenR1Math
+(
+R1 2025
+)
+(for thinking traces) data is sufficient for Llama, Mistral, and R1-distilled Qwen models for a variety of applications. In particular, we note that our method is not harder to adjust than xKV or SVDq, due to automatic precision assignment via dynamic programming. In particular, instead of aiming for the best reconstruction error for a specific compression ratio, the user can easily alter the algorithm to aim for the highest compression ratio within a given reconstruction error constraint.
+
+(a)
+
+(b)
+
+(c)
+
+(d)
+
+Figure 7:
+Relative reconstruction error when calibrating
+kvtc
+decorrelation step - ablation of the number of algorithm
+(
+Halko et al. 2011
+)
+iterations. Figures (a)-(b) show key reconstruction error, whereas (c)-(d) show value reconstruction error. Other parameters as in Figure
+6
+. We note that the larger number of iterations provides slight improvements.
+
+(a)
+
+(b)
+
+Figure 8:
+Relative reconstruction error when calibrating
+kvtc
+decorrelation step on OpenR1Math
+(
+R1 2025
+)
+traces with the error calculation on FineWeb
+(
+Penedo et al. 2024
+)
+. Parameters as in Figure
+6
+. We note that OpenR1Math traces were published after the release of Llama 3.1
+8
+B and Mistral NeMo
+12
+B, and possibly due to their specificity result in higher generalization error.
+
+B.2
+Additional Details About KV Cache Properties
+
+We study the relative channel activation patterns of Llama 3.1 8B, Mistral-Nemo 12B and Qwen 2.5 R1 (Figures
+9
+and
+10
+). The relative activation results are computed on a 50/50 mixture of FineWeb
+(
+Penedo et al. 2024
+)
+and OpenR1Math
+(
+R1 2025
+)
+, with document lengths between 1K and 8K tokens. We observe that keys and values of all models show potential for dimensionality reduction and quantization (low absolute activations and variance).
+
+(a)
+Relative (within head) Absolute Activations
+
+(b)
+Relative (within head) Variance of Activations
+
+(c)
+Relative (within head) Absolute Activations
+
+(d)
+Relative (within head) Variance of Activations
+
+Figure 9:
+For key/value head
+i
+and channel
+j
+, we define per-channel mean absolute activation
+\mathrm{a}_{i,j}=\frac{1}{n}\sum_{t=1}^{n}{|\mathrm{channel}_{t,i,j}|}
+and plot the relative activation
+\mathrm{heatmap}_{i,j}=\mathrm{a}_{i,j}/\max_{b}{\{\mathrm{a}_{i,b}\}}
+— Panels (a),(c)(e).
+Panels (b),(d),(f) show
+\frac{\mathrm{varc}_{i,j}}{\max_{c}{\{\mathrm{varc}_{i,c}\}}}
+where
+\mathrm{varc}_{i,j}
+is the variance of
+\mathrm{channel}_{t,i,j}
+over
+t
+.
+
+(a)
+Relative (within head) Absolute Activations
+
+(b)
+Relative (within head) Variance of Activations
+
+(c)
+Relative (within head) Absolute Activations
+
+(d)
+Relative (within head) Variance of Activations
+
+Figure 10:
+For key/value head
+i
+and channel
+j
+, we define per-channel mean absolute activation
+\mathrm{a}_{i,j}=\frac{1}{n}\sum_{t=1}^{n}{|\mathrm{channel}_{t,i,j}|}
+and plot the relative activation
+\mathrm{heatmap}_{i,j}=\mathrm{a}_{i,j}/\max_{b}{\{\mathrm{a}_{i,b}\}}
+— Panels (a),(c)(e).
+Panels (b),(d),(f) show
+\frac{\mathrm{varc}_{i,j}}{\max_{c}{\{\mathrm{varc}_{i,c}\}}}
+where
+\mathrm{varc}_{i,j}
+is the variance of
+\mathrm{channel}_{t,i,j}
+over
+t
+.
+
+B.3
+Excluding sink tokens from compression
+
+We consider the first four tokens of key and value caches (i.e., tokens at positions 0, 1, 2, and 3) to be sink tokens, motivated by the experimental results reported by
+(
+Xia et al. 2024
+)
+.
+Reducing the dimensionality of key and value caches with PCA causes larger information loss of the sink tokens than the remaining ones, as shown in Figure
+6
+. In order to assess the influence, we compare two setups: one that excludes first four tokens from compression (denoted
+kvtc
+▶4
+) and one that compresses them along with other tokens (denoted
+kvtc
+▶0
+).
+The results are shown in Table
+6
+. High compression ratio of
+64\times
+drastically reduces downstream task scores for the Llama 3.1 8B in the
+kvtc
+▶0
+case; for MN-Minitron 8B and Mistral NeMo 12B it causes regression on the long context tasks (Lost in the Middle and Variable Tracking) when compared with
+kvtc
+▶4
+.
+
+Table 6:
+Ablation on the skipping compression of the first four tokens. We note that the difference starts to be visible with larger compression ratios, and that it is in favor of skipping compression of potential attention sinks
+(
+Xiao et al. 2024
+)
+. Results are presented as
+\mathrm{score}_{\mathrm{stderr}}
+where
+{\mathrm{stderr}}
+is bootstraped by LM Evaluation Harness (where available)
+(
+Gao et al. 2024
+)
+. The differences in compression ratios, are due to the fact that we count the skipped tokens into compression ratio.
+
+Model
+
+Method
+
+CR
+
+GSM8K
+
+MMLU
+
+QASPER
+
+LITM 100
+
+RULER-VT
+
+Math & Knowledge
+
+Long Context
+
+Llama 3.1 8B
+
+kvtc
+{}^{\blacktriangleright{}0}_{{16}\times}
+
+{19}
+-
+{22}
+
+56.8_{1.4}
+
+60.3_{0.4}
+
+40.2
+
+99.2_{0.1}
+
+98.2_{0.4}
+
+kvtc
+{}^{\blacktriangleright{}4}_{{16}\times}
+
+{18}
+-
+{22}
+
+56.9_{1.4}
+
+60.1_{0.4}
+
+40.7
+
+99.3_{0.1}
+
+99.1_{0.3}
+
+kvtc
+{}^{\blacktriangleright{}0}_{{64}\times}
+
+{76}
+-
+{90}
+
+1.6_{0.3}
+
+9.9_{0.2}
+
+27.6
+
+0.0_{0.0}
+
+61.8_{1.5}
+
+kvtc
+{}^{\blacktriangleright{}4}_{{64}\times}
+
+{60}
+-
+{88}
+
+57.2_{1.4}
+
+60.7_{0.4}
+
+37.8
+
+90.2_{0.4}
+
+95.9_{0.6}
+
+MN-Minitron 8B
+
+kvtc
+{}^{\blacktriangleright{}0}_{{64}\times}
+
+{79}
+-
+{97}
+
+59.5_{1.4}
+
+61.9_{0.4}
+
+37.9
+
+55.1_{0.6}
+
+91.5_{0.9}
+
+kvtc
+{}^{\blacktriangleright{}4}_{{64}\times}
+
+{53}
+-
+{95}
+
+57.8_{1.4}
+
+62.1_{0.4}
+
+38.1
+
+59.5_{0.6}
+
+93.4_{0.8}
+
+Mistral NeMo 12B
+
+kvtc
+{}^{\blacktriangleright{}0}_{{64}\times}
+
+{77}
+-
+{89}
+
+61.9_{1.3}
+
+62.4_{0.4}
+
+37.5
+
+84.8_{0.4}
+
+95.8_{0.6}
+
+kvtc
+{}^{\blacktriangleright{}4}_{{64}\times}
+
+{51}
+-
+{87}
+
+61.9_{1.3}
+
+61.4_{0.4}
+
+38.0
+
+95.3_{0.3}
+
+98.0_{0.4}
+
+B.4
+Separate adjustment of compression ratios for key and value caches
+
+All experimental results of
+kvtc
+(unless stated otherwise) have been obtained with 1:1 compression of keys and values. We present additional results of manually adjusting the compression ratio separately for keys and values (Table
+7
+).
+The results suggest that for long-context retrieval tasks, the value cache could be compressed more than the key cache. We attribute this phenomenon to the necessity to precisely attend to selected tokens in the cache, which hinges on the high accuracy of key vectors. On the other hand, stronger compression of values shows a noticeable degradation on the GSM8K and MMLU tasks.
+
+Table 7:
+Ablation of key/value compressibility with
+kvtc
+. We use the same
+kvtc
+configuration as in Table
+2
+, but independently change key and value lossy compression rates. To denote that value compression ratio was set to
+32
+and key was set to
+64
+we use
+kvtc
+{}^{\blacktriangleright{}0}_{\frac{\mathbf{{\mathrm{k}}:{64}\times}}{{\mathrm{v}}:{32}\times}}
+
+Method
+
+CR
+
+GSM8K
+
+MMLU
+
+QASPER
+
+LITM
+
+RULER-VT
+
+Llama 3.1 8B
+
+kvtc
+{}^{\blacktriangleright{}4}_{\frac{\mathbf{{\mathrm{k}}:{256}\times}}{{\mathrm{v}}:{32}\times}}
+
+{55}
+-
+{80}
+
+57.1_{1.4}
+
+57.4
+
+36.6
+
+48.6_{1.6}
+
+91.9_{0.9}
+
+kvtc
+{}^{\blacktriangleright{}4}_{\frac{{\mathrm{k}}:{32}\times}{\mathbf{{\mathrm{v}}:{256}\times}}}
+
+{55}
+-
+{77}
+
+56.8_{1.4}
+
+57.5
+
+36.3
+
+71.9_{1.4}
+
+95.9_{0.6}
+
+Mistral NeMo 12B
+
+kvtc
+{}^{\blacktriangleright{}0}_{\frac{\mathbf{{\mathrm{k}}:{256}\times}}{{\mathrm{v}}:{32}\times}}
+
+{69}
+-
+{79}
+
+62.2_{1.3}
+
+61.7
+
+34.6
+
+73.2_{1.4}
+
+90.4_{0.9}
+
+kvtc
+{}^{\blacktriangleright{}0}_{\frac{{\mathrm{k}}:{32}\times}{\mathbf{{\mathrm{v}}:{256}\times}}}
+
+{69}
+-
+{77}
+
+57.1_{1.4}
+
+59.8
+
+35.2
+
+77.5_{1.3}
+
+89.5_{1.0}
+
+B.5
+Calibration data tokens vs downstream performance
+
+We test how the amount of calibration data affects calibration times and the downstream performance.
+From Figures
+7
+and
+8
+we already know that increasing the amount of the calibration data can bring down the reconstruction error. The question that remains is how such an increase correlates with the downstream performance. In Table
+8
+we show that an increase in calibration data clearly benefits a high compression ratio of
+256\times
+, with more moderate returns for smaller (
+64\times
+,
+32\times
+) compression ratios. This is a positive result, as it allows for trading calibration stage complexity for improved downstream performance, with 40K token budget bringing already competitive results for
+64\times
+ratio. We additionally note that PCA calibration can be completed within 1.5 minutes for 160K tokens using
+(
+Halko et al. 2011
+)
+algorithm, and that the DP calculation time (performed once per model and compression ratio) can be finalized within 8 minutes.
+
+Table 8:
+Ablation of the number of tokens used for
+kvtc
+calibration, along with respective PCA and DP calibration times. PCA calibration was performed using single H100
+80
+GB GPU, calculation of DP tables (except simulation of quantization) was offloaded to the node cpu. We additionally limit DP calibration data to first 32K tokens, therefore we do not see increase in dp time after 40k calibration tokens. All calibration datapieces come from a 50/50 mixture of FineWeb
+(
+Penedo et al. 2024
+)
+and OpenMathR1
+(
+R1 2025
+)
+traces between 1K and 8K tokens.
+
+Method
+
+Data
+
+PCA Calib
+
+DP Calib
+
+CR
+
+GSM8K
+
+MMLU
+
+QASPER
+
+LITM
+
+RULER-VT
+
+Mistral NeMo 12B
+
+kvtc
+32×
+
+20K
+
+41.3s
+
+6.5 min
+
+{31}
+-
+{42}
+
+63.0_{1.3}
+
+63.9_{0.4}
+
+34.8
+
+97.3_{0.2}
+
+98.9_{0.3}
+
+kvtc
+64×
+
+5.4 min
+
+{63}
+-
+{87}
+
+63.9_{1.3}
+
+61.7_{0.4}
+
+31.8
+
+88.8_{0.4}
+
+96.9_{0.5}
+
+kvtc
+256×
+
+3.9 min
+
+{148}
+-
+{340}
+
+59.6_{1.4}
+
+51.5_{0.4}
+
+23.3
+
+10.4_{0.4}
+
+66.8_{1.5}
+
+kvtc
+32×
+
+40K
+
+47.8s
+
+7.2 min
+
+{31}
+-
+{43}
+
+64.2_{1.3}
+
+63.0_{0.4}
+
+35.3
+
+98.7_{0.1}
+
+99.5_{0.2}
+
+kvtc
+64×
+
+6.1 min
+
+{63}
+-
+{88}
+
+63.7_{1.3}
+
+61.9_{0.4}
+
+32.4
+
+95.7_{0.3}
+
+97.8_{0.5}
+
+kvtc
+256×
+
+4.6 min
+
+{148}
+-
+{344}
+
+58.3_{1.4}
+
+50.1_{0.4}
+
+23.7
+
+9.2_{0.4}
+
+70.6_{1.4}
+
+kvtc
+32×
+
+80K
+
+60.4s
+
+7.2 min
+
+{31}
+-
+{43}
+
+63.6_{1.3}
+
+63.9_{0.4}
+
+36.0
+
+98.0_{0.2}
+
+99.3_{0.3}
+
+kvtc
+64×
+
+6.1 min
+
+{63}
+-
+{88}
+
+63.3_{1.3}
+
+62.0_{0.4}
+
+32.2
+
+94.5_{0.3}
+
+97.8_{0.5}
+
+kvtc
+256×
+
+4.6 min
+
+{148}
+-
+{339}
+
+60.5_{1.3}
+
+51.7_{0.4}
+
+23.3
+
+13.6_{0.4}
+
+83.7_{1.2}
+
+kvtc
+32×
+
+160K
+
+85.6s
+
+7.2 min
+
+{31}
+-
+{43}
+
+63.2_{1.3}
+
+64.3_{0.4}
+
+36.6
+
+99.5_{0.1}
+
+99.4_{0.3}
+
+kvtc
+64×
+
+6.1 min
+
+{63.2}
+-
+{87}
+
+64.6_{1.3}
+
+62.2_{0.4}
+
+32.8
+
+96.9_{0.2}
+
+97.7_{0.5}
+
+kvtc
+256×
+
+4.6 min
+
+{148}
+-
+{341}
+
+61.4_{1.3}
+
+55.5_{0.4}
+
+24.3
+
+34.2_{0.6}
+
+79.5_{1.3}
+
+B.6
+Calibration data domain vs downstream performance
+
+To examine how the calibration data domain influences downstream performance, we prepare two additional versions of
+kvtc
+for Mistral NeMo
+12
+B: one using only FineWeb data and the other using only OpenR1Math data. Table
+9
+shows that using OpenR1Math calibration data better maintains MMLU and key-value retrieval scores than FineWeb at higher compression rates. This improvement is likely related to the question-think-answer structure of OpenR1Math, which may be more aligned with the evaluation tasks, compared to the more general web collection nature of FineWeb. However, for
+32\times
+compression, both choices remain competitive. We note that for
+256\times
+compression, the 50/50 mixture of FineWeb and OpenR1Math results in the best scores. For reconstruction errors, regarding calibrating on OpenR1Math/FineWeb and testing on FineWeb/OpenR1Math, see Figures
+7
+and
+8
+.
+
+We additionally check the standard deviation of task scores when sampling different calibration sets (see Table
+10
+). We observe that
+kvtc
+is relatively stable when sampling 160K tokens — a 50/50 mixture of FineWeb and OpenR1Math data — as a calibration set.
+
+In Table
+11
+, we test
+kvtc
+calibration under strong domain shifts. We observe that using Python, C, or Assembly from StarCoder
+(
+Li et al. 2023
+)
+instead of a 50/50 mixture of FineWeb and OpenR1Math data results in performance degradation on GSM8K. However, we note that despite a strong domain shift (code vs natural language), the model retains in-context retrieval abilities (LITM, RULER-VT) and for cr
+16\times
+obtains scores that are either on par or better than KIVI/GEAR 2-bit (except the case when we calibrate on C).
+We note that files contained in StarCoder consist of both code and comments, which can potentially explain retention of lingual abilities.
+
+Table 9:
+Ablation of the source of data. We consider
+kvtc
+calibrated fully on FineWeb
+(
+Penedo et al. 2024
+)
+, fully on OpenMathR1
+(
+R1 2025
+)
+and a 50/50 mixture. For all cases we utilize a 50/50 mix of documents between 1K and 8K tokens along with documents between 8K and 32K tokens. We calibrate using 160K tokens.
+
+Method
+
+Data
+
+CR
+
+GSM8K
+
+MMLU
+
+QASPER
+
+LITM
+
+RULER-VT
+
+Mistral NeMo 12B
+
+kvtc
+32×
+
+FineWeb + OpenR1Math
+
+{31}
+-
+{43}
+
+62.2_{1.3}
+
+63.8_{0.4}
+
+37.5
+
+99.6_{0.1}
+
+98.7_{0.4}
+
+FineWeb
+
+{31}
+-
+{43}
+
+63.5_{1.3}
+
+63.5_{0.4}
+
+37.5
+
+98.5_{0.2}
+
+98.9_{0.3}
+
+OpenR1Math
+
+{31}
+-
+{43}
+
+63.5_{1.3}
+
+64.8_{0.4}
+
+37.8
+
+99.7_{0.1}
+
+99.3_{0.3}
+
+kvtc
+64×
+
+FineWeb + OpenR1Math
+
+{51}
+-
+{87}
+
+61.9_{1.3}
+
+61.4_{0.4}
+
+38.0
+
+95.3_{0.3}
+
+98.0_{0.4}
+
+FineWeb
+
+{63}
+-
+{87}
+
+63.2_{1.3}
+
+59.9_{0.4}
+
+36.5
+
+92.0_{0.3}
+
+97.4_{0.5}
+
+OpenR1Math
+
+{63}
+-
+{86}
+
+62.2_{1.3}
+
+63.7_{0.4}
+
+38.2
+
+98.5_{0.2}
+
+96.5_{0.6}
+
+kvtc
+256×
+
+FineWeb + OpenR1Math
+
+{148}
+-
+{340}
+
+60.0_{1.3}
+
+52.2_{0.4}
+
+31.6
+
+40.0_{0.6}
+
+84.3_{1.1}
+
+FineWeb
+
+{148}
+-
+{343}
+
+57.9_{1.4}
+
+51.5_{0.4}
+
+31.0
+
+14.1_{0.4}
+
+74.5_{1.4}
+
+OpenR1Math
+
+{156}
+-
+{342}
+
+56.6_{1.4}
+
+54.0_{0.4}
+
+29.4
+
+21.0_{0.5}
+
+81.3_{1.2}
+
+Table 10:
+Mean and standard deviation of downstream performance measured on 5 different calibrations sets (50/50 mixture of OpenR1Math
+(
+R1 2025
+)
+and FineWeb
+(
+Penedo et al. 2024
+)
+, 160K tokens, documents between 1K and 8K tokens). Results presented as
+\mathrm{mean}_{\pm\mathrm{std}}
+
+Method
+
+CR
+
+GSM8K
+
+MMLU
+
+QASPER
+
+LITM
+
+RULER-VT
+
+Mistral NeMo 12B
+
+Vanilla
+
+1
+
+61.9_{1.3}
+
+64.5_{0.4}
+
+38.4
+
+99.5_{0.1}
+
+99.8_{0.2}
+
+kvtc
+16×
+
+{17}
+-
+{20}
+
+63.5_{\pm 0.9}
+
+64.7_{\pm 0.3}
+
+37.2_{\pm 0.4}
+
+99.6_{\pm 0.3}
+
+99.7_{\pm 0.0}
+
+kvtc
+32×
+
+{31}
+-
+{43}
+
+63.1_{\pm 0.5}
+
+64.4_{\pm 0.6}
+
+36.1_{\pm 0.7}
+
+98.1_{\pm 2.0}
+
+99.2_{\pm 0.3}
+
+kvtc
+64×
+
+{50}
+-
+{88}
+
+63.1_{\pm 1.3}
+
+63.3_{\pm 0.9}
+
+32.9_{\pm 0.7}
+
+93.1_{\pm 3.6}
+
+98.1_{\pm 0.4}
+
+Table 11:
+Ablation of out of distribution source of data. We consider
+kvtc
+calibrated on a 50/50 mixture of FineWeb
+(
+Penedo et al. 2024
+)
+and OpenMathR1
+(
+R1 2025
+)
+along with calibration on Python/C/Assembly from the StarCoder dataset
+(
+Li et al. 2023
+)
+. In all cases we utilize files between 1K and 8K tokens and calibrate on 160K tokens. For configurations that were tested using several seeds we report
+\mathrm{score}_{\pm\mathrm{std}}
+, whereas for others we report
+\mathrm{score}_{\mathrm{stderr}}
+
+Method
+
+Calibration Data
+
+CR
+
+GSM
+
+MMLU
+
+QASPER
+
+LITM
+
+RULER-VT
+
+Mistral NeMo 12B
+
+Vanilla
+
+-
+
+1
+
+61.9_{1.3}
+
+64.5_{0.4}
+
+38.4
+
+99.5_{0.1}
+
+99.8_{0.2}
+
+GEAR 2bit
+
+5
+
+59.8_{1.4}
+
+64.0_{0.4}
+
+38.6
+
+96.9_{0.2}
+
+99.4_{0.3}
+
+KIVI 2bit
+
+5
+
+59.7_{1.4}
+
+64.3_{0.4}
+
+38.2
+
+91.9_{0.3}
+
+98.3_{0.4}
+
+kvtc
+16×
+
+FineWeb + OpenR1Math
+
+{17}
+-
+{20}
+
+63.5_{\pm 0.9}
+
+64.7_{\pm 0.3}
+
+37.2_{\pm 0.4}
+
+99.6_{\pm 0.3}
+
+99.7_{\pm 0.0}
+
+Python
+
+{17}
+-
+{20}
+
+59.4_{1.4}
+
+65.2_{0.4}
+
+37.4
+
+99.9_{0.0}
+
+99.7_{0.2}
+
+C
+
+{17}
+-
+{20}
+
+55.0_{1.4}
+
+65.4_{0.4}
+
+38.0
+
+99.2_{0.1}
+
+99.3_{0.3}
+
+Assembly
+
+{17}
+-
+{20}
+
+58.9_{1.4}
+
+65.2_{0.4}
+
+37.0
+
+99.9_{0.0}
+
+99.7_{0.2}
+
+kvtc
+32×
+
+FineWeb + OpenR1Math
+
+{31}
+-
+{43}
+
+63.1_{\pm 0.5}
+
+64.4_{\pm 0.6}
+
+36.1_{\pm 0.7}
+
+98.1_{\pm 2.0}
+
+99.2_{\pm 0.3}
+
+Python
+
+{35}
+-
+{43}
+
+59.0_{1.4}
+
+64.3_{0.4}
+
+36.3
+
+99.7_{0.1}
+
+99.2_{0.3}
+
+C
+
+{31}
+-
+{43}
+
+50.2_{1.4}
+
+64.7_{0.4}
+
+36.8
+
+96.2_{0.2}
+
+99.3_{0.3}
+
+Assembly
+
+{31}
+-
+{43}
+
+55.2_{1.4}
+
+64.2_{0.4}
+
+36.7
+
+99.6_{0.1}
+
+99.4_{0.3}
+
+kvtc
+64×
+
+FineWeb + OpenR1Math
+
+{50}
+-
+{88}
+
+63.1_{\pm 1.3}
+
+63.3_{\pm 0.9}
+
+32.9_{\pm 0.7}
+
+93.1_{\pm 3.6}
+
+98.1_{\pm 0.4}
+
+Python
+
+{63}
+-
+{87}
+
+56.3_{1.4}
+
+62.0_{0.4}
+
+33.9
+
+98.0_{0.2}
+
+97.4_{0.5}
+
+C
+
+{63}
+-
+{87}
+
+54.4_{1.4}
+
+63.3_{0.4}
+
+34.5
+
+95.4_{0.3}
+
+97.8_{0.5}
+
+Assembly
+
+{50}
+-
+{86}
+
+60.9_{1.3}
+
+62.2_{0.4}
+
+33.0
+
+99.1_{0.1}
+
+98.3_{0.4}
+
+B.7
+Sliding window size vs downstream performance
+
+We ablate the influence of sliding window of recent not-compressed tokens on downstream performance in Table
+12
+. We observe that increasing the length of sliding window improves downstream performance of the model, with most noticeable difference between sliding windows
+\leq 16
+and sliding windows
+\geq 64
+.
+
+Table 12:
+Ablation of the sliding window size of recent tokens that are not compressed. For a fair compression in this table we simulate a sequence of short conversations by running compressing/eviction on the cache every
+s=1
+instead every
+s=16
+tokens. Therefore, the
+w=16
+token window is left int the range
+15
+-
+16
+instead of
+0
+-
+16
+.
+
+Method
+
+Window Size
+
+CR
+
+GSM8K
+
+MMLU
+
+QASPER
+
+LITM
+
+RULER-VT
+
+Llama 3.1 8B
+
+kvtc
+64×
+
+1
+
+{59}
+-
+{88}
+
+41.2_{1.4}
+
+53.8_{0.4}
+
+36.5
+
+68.3_{0.6}
+
+87.7_{1.0}
+
+16
+
+{58}
+-
+{88}
+
+53.0_{1.4}
+
+56.0_{0.4}
+
+38.1
+
+80.0_{0.5}
+
+88.0_{1.0}
+
+64
+
+{57}
+-
+{88}
+
+55.8_{1.4}
+
+59.2_{0.4}
+
+37.7
+
+89.8_{0.4}
+
+95.8_{0.6}
+
+128
+
+{60}
+-
+{88}
+
+56.8_{1.4}
+
+60.5_{0.4}
+
+40.4
+
+99.4_{0.1}
+
+99.8_{0.2}
+
+Mistral NeMo 12B
+
+kvtc
+64×
+
+1
+
+{61}
+-
+{87}
+
+53.0_{1.4}
+
+54.9_{0.4}
+
+36.4
+
+88.6_{0.4}
+
+90.7_{0.9}
+
+16
+
+{60}
+-
+{87}
+
+60.1_{1.3}
+
+56.4_{0.4}
+
+37.7
+
+88.9_{0.4}
+
+95.8_{0.6}
+
+64
+
+{59}
+-
+{87}
+
+62.2_{1.3}
+
+59.0_{0.4}
+
+37.8
+
+93.0_{0.3}
+
+98.0_{0.4}
+
+128
+
+{51}
+-
+{87}
+
+61.9_{1.3}
+
+61.4_{0.4}
+
+38.0
+
+95.3_{0.3}
+
+98.0_{0.4}
+
+B.8
+Ablations of lossless compression
+
+We ablate the differences between:
+
+•
+
+ANS
+(
+Duda 2014
+)
+
+•
+
+Bitcomp with default nvCOMP settings
+(
+NVIDIA 2020
+)
+
+•
+
+DEFLATE
+(
+Wu 2017
+)
+(Huffman
+(
+Huffman 1952
+)
++ LZ77
+(
+RASIP working group 1997
+)
+)
+
+•
+
+GDeflate
+(
+NVIDIA 2022
+)
+
+•
+
+LZ4
+(
+Collet 2011
+)
+
+•
+
+Snappy
+(
+Google 2011
+)
+
+•
+
+Zstandard
+(
+Facebook 2015
+)
+
+•
+
+Identity — no additional lossless compression
+
+We present the results in Table
+13
+. We note that DEFLATE can be easily substituted by a faster GDeflate optimized for GPUs, as the highest measured difference in compression ratio is
+\leq 0.1
+. We observe that the cache generated for RULER Variable Tracking is significantly more compressible than the cache generated for other tasks. We hypothesize that it may be an effect of repeated noise used as context filler by the authors (see Appendix
+A
+). We observe that ANS, DEFLATE, GDeflate, and Zstandard improve significantly over Identity in all studied cases. For a detailed study of throughput vs compression ratio of tested algorithms, we refer to
+(
+NVIDIA 2024
+)
+.
+
+Table 13:
+Ablation of the lossless compression algorithms, performed using Mistral Nemo 12B with
+kvtc
+32×
+. Identity stands for no additional lossless compression (just PCA + DP Quantization; note that we count the omitted sinks into compression ratio, what is notable for tasks with shorter contexts). We mark results that have compression ratio advantage over Identity smaller than 1 in red.
+
+Algorithm
+
+Compression Ratio
+
+Min-Max
+
+GSM8K
+
+QASPER
+
+LITM
+
+RULER-VT
+
+ANS
+
+{32.8}
+-
+{37.6}
+
+32.8
+
+37.6
+
+36.8
+
+37.0
+
+Bitcomp
+
+{29.6}
+-
+{32.3}
+
+29.6
+
+32.3
+
+32.2
+
+32.2
+
+DEFLATE
+
+{34.7}
+-
+{42.9}
+
+34.7
+
+39.5
+
+39.7
+
+42.9
+
+GDeflate
+
+{34.6}
+-
+{42.8}
+
+34.6
+
+39.4
+
+39.6
+
+42.8
+
+Identity
+
+{29.6}
+-
+{32.4}
+
+29.6
+
+32.4
+
+32.2
+
+32.3
+
+LZ4
+
+{29.5}
+-
+{35.5}
+
+29.5
+
+32.4
+
+32.7
+
+35.5
+
+Snappy
+
+{29.4}
+-
+{34.5}
+
+29.4
+
+32.2
+
+32.4
+
+34.5
+
+zStandard
+
+{34.6}
+-
+{46.3}
+
+34.6
+
+39.4
+
+39.9
+
+46.3
+
+B.9
+Benefits of DP quantization
+
+We compare
+kvtc
+to a variant that does not use DP quantization, but instead removes a fraction of the least important principal components (denoted -DPQ). The results are presented in Table
+14
+. We observe that removing PCA components, rather than applying DP quantization, leads to significant performance degradation on long context tasks. Additionally, the performance of DPQ on short context tasks deteriorates further as the length of the sliding window of uncompressed elements is reduced. We also note that DEFLATE can be much more efficient on quantized data. In general, our findings demonstrate that quantization is a crucial component of
+kvtc
+, and omitting it hinders scaling to larger compression ratios.
+
+Table 14:
+Ablation of the importance of DP quantization over pure PCA. For alteration of sliding window size we follow the protocol from Appendix
+B.7
+.
+
+Window Size
+
+Method
+
+Modification
+
+CR
+
+GSM8K
+
+MMLU
+
+QASPER
+
+LITM
+
+RULER-VT
+
+Llama 3.1 8B
+
+16
+
+kvtc
+8×
+
+-
+
+{9}
+-
+{10}
+
+57.5_{1.4}
+
+59.4_{0.4}
+
+40.1
+
+99.1_{0.1}
+
+98.2_{0.4}
+
+-DPQ
+
+{8}
+-
+{9}
+
+56.9_{1.4}
+
+57.5_{0.4}
+
+40.1
+
+98.6_{0.1}
+
+93.0_{0.8}
+
+kvtc
+16×
+
+-
+
+{18}
+-
+{22}
+
+57.2_{1.4}
+
+59.5_{0.4}
+
+40.6
+
+99.4_{0.1}
+
+98.3_{0.4}
+
+-DPQ
+
+{16}
+-
+{17}
+
+52.0_{1.4}
+
+53.8_{0.4}
+
+36.9
+
+69.2_{0.6}
+
+87.0_{1.1}
+
+kvtc
+32×
+
+-
+
+{34}
+-
+{44}
+
+55.5_{1.4}
+
+58.2_{0.4}
+
+39.6
+
+98.8_{0.1}
+
+94.8_{0.7}
+
+-DPQ
+
+{31}
+-
+{34}
+
+42.9_{1.4}
+
+36.8_{0.4}
+
+34.2
+
+44.4_{0.6}
+
+83.0_{1.2}
+
+kvtc
+64×
+
+-
+
+{58}
+-
+{88}
+
+53.0_{1.4}
+
+56.0_{0.4}
+
+38.1
+
+80.0_{0.5}
+
+88.0_{1.0}
+
+-DPQ
+
+{52}
+-
+{68}
+
+21.8_{1.1}
+
+6.5_{0.2}
+
+26.7
+
+5.1_{0.3}
+
+55.5_{1.6}
+
+128
+
+kvtc
+8×
+
+-
+
+{9}
+-
+{10}
+
+56.7_{1.4}
+
+59.9_{0.4}
+
+40.0
+
+99.3_{0.1}
+
+99.1_{0.3}
+
+-DPQ
+
+{8}
+-
+{9}
+
+57.0_{1.4}
+
+60.7_{0.4}
+
+40.2
+
+99.5_{0.1}
+
+98.5_{0.4}
+
+kvtc
+16×
+
+-
+
+{17}
+-
+{22}
+
+57.1_{1.4}
+
+60.1_{0.4}
+
+40.7
+
+99.3_{0.1}
+
+99.0_{0.3}
+
+-DPQ
+
+{16}
+-
+{17}
+
+55.7_{1.4}
+
+59.7_{0.4}
+
+37.1
+
+85.0_{0.4}
+
+95.5_{0.7}
+
+kvtc
+32×
+
+-
+
+{33}
+-
+{44}
+
+58.4_{1.4}
+
+60.8_{0.4}
+
+39.3
+
+99.1_{0.1}
+
+98.9_{0.3}
+
+-DPQ
+
+{31}
+-
+{34}
+
+55.1_{1.4}
+
+56.9_{0.4}
+
+35.3
+
+64.5_{0.6}
+
+89.6_{1.0}
+
+kvtc
+64×
+
+-
+
+{60}
+-
+{88}
+
+56.8_{1.4}
+
+60.5_{0.4}
+
+40.4
+
+99.4_{0.1}
+
+99.8_{0.2}
+
+-DPQ
+
+{47}
+-
+{68}
+
+57.2_{1.4}
+
+49.3_{0.4}
+
+28.1
+
+13.1_{0.4}
+
+58.7_{1.5}
+
+B.10
+PCA feature concat size vs performance
+
+We study how the number of layers over which we concatenate key/value heads influences the performance of
+kvtc
+. We present the results in Table
+15
+. To better isolate the influence of the number of concatenated key/value heads, we run
+kvtc
+without dynamic programming quantization (that is, we run
+kvtc
+-DPQ introduced in Appendix
+B.9
+) and with a sliding window
+w=16
+. We note that results support our hypothesis about cross-layer similarity between key/value heads from Section
+2
+, as the more layers we concatenate for calibration (PCA), the better the downstream performance.
+
+Table 15:
+Ablation of the number of layers used for PCA. To better isolate the influence of the number of concatenated key/value heads, we run
+kvtc
+without dynamic programming quantization (that is, we run
+kvtc
+-DPQ introduced in Appendix
+B.9
+) and with a sliding window
+w=16
+.
+
+Method
+
+PCA Layers
+
+GSM8K
+
+MMLU
+
+QASPER
+
+LITM
+
+RULER-VT
+
+Llama 3.1 8B
+
+kvtc
+8×
+-DPQ
+
+1
+
+27.5_{1.2}
+
+24.3_{0.3}
+
+28.2
+
+49.1_{0.6}
+
+70.8_{1.4}
+
+2
+
+44.8_{1.4}
+
+41.1_{0.4}
+
+34.2
+
+77.6_{0.5}
+
+84.9_{1.1}
+
+4
+
+53.3_{1.4}
+
+51.9_{0.4}
+
+37.5
+
+95.9_{0.2}
+
+93.0_{0.8}
+
+8
+
+55.9_{1.4}
+
+55.3_{0.4}
+
+39.7
+
+99.2_{0.1}
+
+90.7_{0.9}
+
+16
+
+56.0_{1.4}
+
+57.1_{0.4}
+
+38.8
+
+98.8_{0.1}
+
+92.8_{0.8}
+
+32
+
+56.9_{1.4}
+
+57.5_{0.4}
+
+40.1
+
+98.6_{0.1}
+
+93.0_{0.8}
+
+kvtc
+16×
+-DPQ
+
+1
+
+2.5_{0.4}
+
+0.2_{0.0}
+
+18.4
+
+0.0_{0.0}
+
+0.5_{0.2}
+
+2
+
+13.9_{1.0}
+
+2.3_{0.1}
+
+22.1
+
+0.7_{0.1}
+
+12.9_{1.0}
+
+4
+
+33.3_{1.3}
+
+19.3_{0.3}
+
+29.1
+
+32.0_{0.6}
+
+62.7_{1.5}
+
+8
+
+49.6_{1.4}
+
+43.4_{0.4}
+
+34.4
+
+60.7_{0.6}
+
+85.8_{1.1}
+
+16
+
+51.6_{1.4}
+
+49.1_{0.4}
+
+36.0
+
+72.7_{0.6}
+
+89.0_{1.0}
+
+32
+
+52.0_{1.4}
+
+53.8_{0.4}
+
+36.9
+
+69.2_{0.6}
+
+87.0_{1.1}
+
+kvtc
+32×
+-DPQ
+
+1
+
+1.1_{0.3}
+
+0.1_{0.0}
+
+17.8
+
+0.0_{0.0}
+
+0.1_{0.1}
+
+2
+
+1.5_{0.3}
+
+0.2_{0.0}
+
+18.1
+
+0.0_{0.0}
+
+0.2_{0.1}
+
+4
+
+3.9_{0.5}
+
+0.9_{0.1}
+
+20.0
+
+0.0_{0.0}
+
+1.6_{0.4}
+
+8
+
+28.0_{1.2}
+
+6.4_{0.2}
+
+24.7
+
+2.6_{0.2}
+
+33.0_{1.5}
+
+16
+
+40.1_{1.4}
+
+26.0_{0.4}
+
+31.2
+
+24.6_{0.5}
+
+60.4_{1.5}
+
+32
+
+42.9_{1.4}
+
+36.8_{0.4}
+
+34.2
+
+44.4_{0.6}
+
+83.0_{1.2}
+
+kvtc
+64×
+-DPQ
+
+1
+
+0.9_{0.3}
+
+0.3_{0.0}
+
+18.0
+
+0.0_{0.0}
+
+0.1_{0.1}
+
+2
+
+1.4_{0.3}
+
+0.1_{0.0}
+
+17.7
+
+0.0_{0.0}
+
+0.1_{0.1}
+
+4
+
+1.5_{0.3}
+
+0.1_{0.0}
+
+18.1
+
+0.0_{0.0}
+
+0.1_{0.1}
+
+8
+
+2.4_{0.4}
+
+0.6_{0.1}
+
+19.4
+
+0.0_{0.0}
+
+0.2_{0.1}
+
+16
+
+13.9_{1.0}
+
+1.9_{0.1}
+
+22.1
+
+0.0_{0.0}
+
+10.0_{0.9}
+
+32
+
+21.8_{1.1}
+
+6.5_{0.2}
+
+26.7
+
+5.1_{0.3}
+
+55.5_{1.6}
+
+B.11
+Standard error of the main results
+
+In Table
+16
+we attach the results from Table
+2
+with their standard error, as bootstrapped by LM Evaluation Harness (where available)
+(
+Gao et al. 2024
+)
+. We note that downstream evaluation runs, except the Qwen models, were performed using
+1
+seed and greedy evaluation.
+
+Table 16:
+Downstream task results, presented also in Table
+2
+, here shown with standard error as reported by LM Evaluation Harness (where available).
+
+Method
+
+GSM8K
+
+MMLU
+
+QASPER
+
+LITM 100
+
+RULER-VT
+
+Math & Knowledge
+
+Long Context
+
+Llama 3.1 8B
+
+vanilla
+
+56.8_{1.4}
+
+60.5_{0.4}
+
+40.4
+
+99.4_{0.1}
+
+99.8_{0.2}
+
+GEAR 2bit
+
+52.8_{1.4}
+
+59.6_{0.4}
+
+40.4
+
+96.9_{0.2}
+
+99.8_{0.2}
+
+KIVI 2bit
+
+52.8_{1.4}
+
+59.6_{0.4}
+
+39.1
+
+88.8_{0.4}
+
+98.9_{0.3}
+
+xKV
+{}^{2/16\;4\mathrm{key}}_{3/16\;4\mathrm{value}}
+
+56.6_{1.4}
+
+59.5_{0.4}
+
+35.6
+
+99.9_{0.0}
+
+99.8_{0.2}
+
+FP8
+
+55.2_{1.4}
+
+60.1_{0.4}
+
+40.8
+
+99.4_{0.1}
+
+99.9_{0.1}
+
+kvtc
+8×
+
+57.0_{1.4}
+
+59.8_{0.4}
+
+40.1
+
+99.3_{0.1}
+
+99.1_{0.3}
+
+kvtc
+16×
+
+56.9_{1.4}
+
+60.1_{0.4}
+
+40.7
+
+99.3_{0.1}
+
+99.1_{0.3}
+
+kvtc
+32×
+
+57.8_{1.4}
+
+60.6_{0.4}
+
+39.4
+
+99.1_{0.1}
+
+98.9_{0.3}
+
+kvtc
+64×
+
+57.2_{1.4}
+
+60.7_{0.4}
+
+37.8
+
+90.2_{0.4}
+
+95.9_{0.6}
+
+H
+2
+O
+{}_{{1/16}\;\mathrm{past}}^{{1/16}\;\mathrm{recent}}
+
+54.3_{1.4}
+
+44.3_{0.4}
+
+34.3
+
+20.2_{0.5}
+
+50.4_{1.6}
+
+TOVA
+\frac{1}{8}
+
+54.5_{1.4}
+
+44.8_{0.4}
+
+38.6
+
+1.2_{0.1}
+
+99.7_{0.2}
+
+MN-Minitron 8B
+
+Vanilla
+
+59.1_{1.4}
+
+64.3_{0.4}
+
+38.2
+
+99.8_{0.0}
+
+99.4_{0.3}
+
+GEAR 2bit
+
+57.9_{1.4}
+
+63.6_{0.4}
+
+38.2
+
+96.0_{0.2}
+
+98.3_{0.4}
+
+KIVI 2bit
+
+58.0_{1.4}
+
+63.2_{0.4}
+
+38.2
+
+86.3_{0.4}
+
+96.8_{0.6}
+
+xKV
+{}^{2/16\;5\mathrm{key}}_{3/16\;5\mathrm{value}}
+
+59.3_{1.4}
+
+63.1_{0.4}
+
+34.5
+
+99.6_{0.1}
+
+99.1_{0.3}
+
+FP8
+
+60.1_{1.3}
+
+64.3_{0.4}
+
+38.3
+
+99.8_{0.1}
+
+99.2_{0.3}
+
+kvtc
+8×
+
+60.6_{1.3}
+
+64.2_{0.4}
+
+39.1
+
+99.4_{0.1}
+
+98.8_{0.3}
+
+kvtc
+16×
+
+60.3_{1.3}
+
+64.1_{0.4}
+
+38.6
+
+99.3_{0.1}
+
+98.8_{0.3}
+
+kvtc
+32×
+
+59.1_{1.4}
+
+63.7_{0.4}
+
+37.7
+
+86.9_{0.4}
+
+96.0_{0.6}
+
+kvtc
+64×
+
+57.8_{1.4}
+
+62.1_{0.4}
+
+38.1
+
+59.5_{0.6}
+
+93.4_{0.8}
+
+H
+2
+O
+{}_{{1/16}\;\mathrm{past}}^{{1/16}\;\mathrm{recent}}
+
+55.3_{1.4}
+
+43.5_{0.4}
+
+30.0
+
+16.6_{0.5}
+
+39.2_{1.5}
+
+TOVA
+\frac{1}{8}
+
+59.2_{1.4}
+
+48.1_{0.4}
+
+33.9
+
+0.3_{0.1}
+
+99.3_{0.3}
+
+Mistral NeMo 12B
+
+Vanilla
+
+61.9_{1.3}
+
+64.5_{0.4}
+
+38.4
+
+99.5_{0.1}
+
+99.8_{0.2}
+
+GEAR 2bit
+
+59.8_{1.4}
+
+64.0_{0.4}
+
+38.6
+
+96.9_{0.2}
+
+99.4_{0.3}
+
+KIVI 2bit
+
+59.7_{1.4}
+
+64.3_{0.4}
+
+38.2
+
+91.9_{0.3}
+
+98.3_{0.4}
+
+xKV
+{}^{2/16\;5\mathrm{key}}_{3/16\;5\mathrm{value}}
+
+61.9_{1.3}
+
+63.9_{0.4}
+
+33.5
+
+97.9_{0.2}
+
+99.4_{0.3}
+
+FP8
+
+61.7_{1.3}
+
+64.5_{0.4}
+
+37.9
+
+99.0_{0.1}
+
+99.8_{0.2}
+
+kvtc
+8×
+
+62.5_{1.3}
+
+64.6_{0.4}
+
+37.6
+
+99.9_{0.0}
+
+99.5_{0.2}
+
+kvtc
+16×
+
+62.0_{1.3}
+
+64.4_{0.4}
+
+37.6
+
+99.8_{0.0}
+
+99.5_{0.2}
+
+kvtc
+32×
+
+62.2_{1.3}
+
+63.8_{0.4}
+
+37.5
+
+99.6_{0.1}
+
+98.7_{0.4}
+
+kvtc
+64×
+
+61.9_{1.3}
+
+61.4_{0.4}
+
+38.0
+
+95.3_{0.3}
+
+98.0_{0.4}
+
+H
+2
+O
+{}_{{1/16}\;\mathrm{past}}^{{1/16}\;\mathrm{recent}}
+
+57.0_{1.4}
+
+45.4_{0.4}
+
+29.5
+
+16.2_{0.5}
+
+35.2_{1.5}
+
+TOVA
+\frac{1}{8}
+
+60.3_{1.3}
+
+49.0_{0.4}
+
+36.0
+
+8.7_{0.4}
+
+99.6_{0.2}
+
+B.12
+PCA matrix sizes
+
+In Table
+17
+we present the sizes of PCA projection matrices (
+V
+from
+U\Sigma V^{\top}
+) after being computed via
+(
+Halko et al. 2011
+)
+algorithm.
+We note that the sizes are only a relatively small fraction of the model parameters, and that they can be further reduced by the DP algorithm depending on the desired compression ratio.
+
+Table 17:
+Number of parameters used by PCA matrices, before DP, for the tested models. We note that despite treating keys and values separately, while using feature capacity for the efficient
+(
+Halko et al. 2011
+)
+PCA calculation algorithm. For example, Llama 3.1 8B has 32 layers, each with 8 key/value heads, each head of size 128. Therefore, after cross-head concatenation, each key/value has
+32\times 8\times 128=32768
+features. The PCA projection
+V
+is cut to the first
+10
+K principal components by
+(
+Halko et al. 2011
+)
+algorithm for efficiency, resulting in
+32768\times 10000\simeq 328M
+parameters. Further DP bit allocation can remove additional principal directions depending on the desired compression ratio. Both models and PCA projection matrices are stored in 16bit precision.
+
+Model
+
+#Params
+
+Key/Value
+
+Features
+
+Key/Value
+
+PCA Cap
+
+Key/Value
+
+PCA Params
+
+\frac{\mathrm{TotalPCAParams}}{\mathrm{ModelParams}}
+
+Qwen 2.5 R1 1.5B
+
+1.5
+B
+
+28\times 2\times 128=7168
+
+8K
+
+51M
+
+6.8
+%
+
+Qwen 2.5 R1 7B
+
+7.1
+B
+
+28\times 4\times 128=14336
+
+115M
+
+3.2
+%
+
+Llama 3.1 8B
+
+7.5
+B
+
+32\times 8\times 128=32768
+
+10K
+
+328M
+
+8.7
+%
+
+Llama 3.3 70B
+
+69.5
+B
+
+80\times 8\times 128=81920
+
+819M
+
+2.4
+%
+
+Mistral NeMo 12B
+
+11.6
+B
+
+40\times 8\times 128=40960
+
+410M
+
+7.1
+%
+
+B.13
+Dynamic programming algorithm
+
+Below, we present the pseudocode for the dynamic programming precision assignment along with a proof sketch.
+
+Dynamic Programming Precision Assignment Pseudocode
+
+D # calibration data matrix of shape (batch, num_features)
+
+m = D.mean(dim=0, keepdim=True) # of each feature across the batch dimension
+
+U, S, V = svd(D - m) # D - m = U @ S @ V.T
+
+P = U@S # assume columns sorted by singular values
+
+batch, num_considered_features = P.shape
+
+# initial_reconstruction_error corresponds to quantizing everything with zero bits
+
+initial_reconstruction_error = (P*P).sum() # squared Frobenius norm
+
+# set to initial_reconstruction_error as we assume that the data is initially quantized with 0 bits
+
+# and we progressively consider non-zero quantization of more and more features
+
+best_error = tensor(shape=(num_considered_features + 1, max_bit_budget + 1), values=initial_reconstruction_error)
+
+best_error_type = array(shape=(num_considered_features + 1, max_bit_budget + 1), values=0)
+
+best_error_block_size = tensor(shape=(num_considered_features + 1, max_bit_budget + 1), values=0)
+
+best_error_bit_cost = tensor(shape=(num_considered_features + 1, max_bit_budget + 1), values=0)
+
+# we assume that block sizes are > 0
+
+allowed_block_sizes = [1, 16, 64, 256, 1024]
+
+# We assume the presence of a None type that quantizes data to the array of zeros.
+
+# We count bit usage of this type as 0,
+
+# because it directly corresponds to the removal of principal components.
+
+types = [None, int2, int4, fp8]
+
+for i in range(1, num_considered_features + 1):
+
+for block_size in allowed_block_sizes:
+
+if block_size <= i:
+
+assert block_size > 0
+
+# the loop below can be parallelized
+
+for budget in range(1, max_bit_budget + 1):
+
+if best_error[i, budget] > best_error[i, budget - 1]:
+
+best_error[i, budget] = best_error[i, budget - 1]
+
+best_error_type[i, budget] = best_error_type[i, budget - 1]
+
+best_error_block_size[i, budget] = best_error_block_size[i, budget - 1]
+
+best_error_bit_cost[i, budget] = best_error_bit_cost[i, budget - 1]
+
+for t in types:
+
+block_to_quantize = P[:, i - block_size:i]
+
+quantized_data, used_bits = simulate_quantization(block_to_quantize, t)
+
+if used_bits <= budget:
+
+zero_bit_quantize_error = (block_to_quantize * block_to_quantize).sum()
+
+quantization_error = block_to_quantize - quantized_data
+
+quantization_error = (quantization_error * quantization_error).sum()
+
+error_change = -zero_bit_quantize_error + quantization_error
+
+if best_error[i, budget] > error_change + best_error[i - block_size, budget - used_bits]:
+
+best_error[i, budget] = error_change + best_error[i - block_size, budget - used_bits]
+
+best_error_type[i, budget] = t
+
+best_error_block_size[i, budget] = block_size
+
+best_error_bit_cost[i, budget] = used_bits
+
+# we can use best_error, best_error_type, best_error_block_size and best_error_bit_cost tables to get the quantization for a given budget
+
+The proof of the optimality follows by simple induction on
+i
+and
+budget
+.
+To be more precise we want to prove that
+best_error[j, q]
+is the smallest reconstruction error (squared Frobenius norm) one can achieve when considering first j features of P (setting other features to 0 – 0-bit quantization) and quantization restricted to types from
+types
+that can only be used to quantize blocks of contiguous features of sizes in
+allowed_block_sizes
+sizes, while utilizing no more than
+budget
+bits. For simplicity we assume that the smallest reconstruction error (squared Frobenius norm) for
+q=0
+budget cases is
+initial_reconstruction_error = (P*P).sum()
+.
+Then the proof by induction can be conducted as follows:
+
+•
+
+For
+i=0
+or
+budget=0
+we have that if we consider quantization of the first
+0
+features and leave other features as zeros or budget of size
+0
+, then the reconstruction error is indeed
+(P*P).sum()
+.
+
+•
+
+Then to prove for
+i>0
+and
+budget>0
+we assume the optimality of
+best_error[j, q]
+for
+j<i
+, and for
+j=i
+and
+q<budget
+. Then we note that the algorithm enumerates all possible quantization blocks that the quantization of the first
+i
+features can end with within the budget
+budget
+.
+
+Computational complexity can be directly inferred from the pseudo-code:
+
+\displaystyle\mathcal{O}(\mathrm{num\_considered\_features}\times
+
+\displaystyle\mathrm{|allowed\_block\_sizes|}\times
+
+\displaystyle\mathrm{max\_bit\_budget}\times
+
+\displaystyle\mathrm{|types|}\times
+
+\displaystyle q_{\mathrm{sim}}(\mathrm{max}\{\mathrm{allowed\_block\_sizes}\},\mathrm{batch}))
+
+where
+
+q_{\mathrm{sim}}(\mathrm{max}\{\mathrm{allowed\_block\_sizes}\},\mathrm{batch})
+
+is the time taken to simulate quantization.
+Assuming that
+\mathrm{|allowed\_block\_sizes|}
+and
+\mathrm{|types|}
+are constant and
+quantization simulation can be performed in
+
+\mathcal{O}(\mathrm{\mathrm{max}\{allowed\_block\_sizes}\}\times\mathrm{batch})
+
+we can write the asymptotic bound on the algorithm runtime as:
+
+\displaystyle\mathcal{O}(\mathrm{num\_considered\_features}\times\mathrm{max\_bit\_budget}\times\mathrm{batch})
+
+We additionally provide the runtime of the algorithm in Table
+8
+in Appendix
+B.5
+.
+
