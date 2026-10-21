@@ -1,0 +1,1957 @@
+GraphMend: Code Transformations for Fixing Graph Breaks in PyTorch 2
+Savini Kashmira, Jayanaka Dantanarayana, Thamirawaran Sathiyalogeswaran, Yichao Yuan, Nishil Talati, Krisztian Flautner, Lingjia Tang, Jason Mars
+
+Abstract
+This paper presents GraphMend, a high-level compiler that eliminates FX graph breaks in PyTorch 2 programs. Although PyTorch 2 introduced TorchDynamo and TorchInductor to enable just-in-time graph compilation, unresolved dynamic control flow and unsupported Python constructs often fragment models into multiple FX graphs. These fragments force frequent fallbacks to eager mode, incur costly CPU-to-GPU synchronizations, and reduce optimization opportunities. GraphMend addresses this limitation by analyzing and transforming source code before execution. Built on the Jac compilation framework, GraphMend introduces two code transformations that remove graph breaks due to dynamic control flow and Python I/O functions. This design allows PyTorch’s compilation pipeline to capture larger, uninterrupted FX graphs without requiring manual refactoring by developers. Evaluation across eight Hugging Face models shows that GraphMend removes all fixable graph breaks due to dynamic control flow and Python I/O functions, driving the break count to 0 in 6 models and reducing it from 5 to 2 in another model. On NVIDIA RTX 3090 and A40 GPUs, GraphMend achieves up to 75% latency reductions and up to 8% higher end-to-end throughput. These results demonstrate that high-level code transformation is an effective complement to PyTorch’s dynamic JIT compilation pipeline, substantially improving both usability and performance.
+
+
+
+I
+Introduction
+
+PyTorch has emerged as one of the most widely adopted deep learning frameworks in both academia and industry, primarily due to its ease of use and flexibility
+[
+1
+]
+. However, its general-purpose design incurs efficiency overheads, leaving PyTorch workloads less optimized than handcrafted GPU implementations.
+To bridge this gap, PyTorch 2
+[
+2
+]
+introduced a Python Just-in-Time (JIT) compilation pipeline that translates model operations into optimized GPU code, achieving performance close to handcrafted implementations.
+
+One of the central intermediate representations (IR) in this pipeline is the FX graph
+[
+3
+]
+. TorchDynamo intercepts and symbolically evaluates Python bytecode to create an FX graph. The FX graph is then passed as the IR to a backend compiler, by default TorchInductor
+[
+2
+]
+, which applies a series of graph-level and kernel-level optimizations before lowering the computation to efficient kernels for GPU execution.
+
+A key component in the PyTorch compilation pipeline is the capture of code into an FX graph through symbolic evaluation. It is important to avoid splitting the forward function into smaller graphs, since unsupported code triggers execution to fall back to eager mode, fragmenting the computation. For example, TorchDynamo often encounters difficulties when resolving conditional jumps, as control flow depending on dynamic values cannot be statically determined
+[
+4
+]
+. In such cases like dynamic control flow or calls to certain Python built-ins, TorchDynamo cannot capture the affected code into the FX graph. Instead, it inserts a graph break, which splits the computation into multiple fragments
+[
+2
+]
+. As a result, a single forward function may be compiled into several disjoint FX graphs rather than one unified graph.
+
+The compiled FX graphs run on the optimized backend, while the regions between them execute in standard PyTorch eager mode
+[
+1
+]
+. Each fallback to eager execution requires GPU kernels to synchronize with the CPU to fetch and schedule subsequent operations. These repeated host-device synchronizations introduce substantial overhead, since control is repeatedly transferred between CPU and GPU instead of executing long fused kernels entirely on the device. Moreover, graph breaks reduce optimization opportunities, as each FX graph is compiled in isolation, preventing cross-graph fusion and global optimization
+[
+5
+,
+2
+]
+.
+
+Avoiding graph breaks is essential for realizing the full performance potential of PyTorch 2. The current PyTorch compilation pipeline begins at the bytecode level and does not exploit source-level information. As a result, when high-level constructs such as conditional branches are lowered into jump instructions at the bytecode level, TorchDynamo often cannot statically resolve them, causing graph breaks. Our key insight is that
+compilers should not limit transformations to the bytecode level. Instead, more holistic compilation strategies that analyze and transform higher-level program representations closer to the source code can expose additional optimization opportunities.
+By incorporating source-level analysis and transformation, high-level code regions can be systematically rewritten into forms that enable more effective optimization and unified graph generation within the PyTorch 2 pipeline.
+
+Building on this insight, we introduce
+GraphMend
+, a high-level compiler technique for PyTorch 2 models that eliminates two common types of graph breaks those caused by dynamic control flow and Python I/O operations through program analysis and transformation. Unlike standard PyTorch 2, which captures execution at runtime to construct graphs for JIT compilation,
+GraphMend
+restructures Python code before execution. We implement
+GraphMend
+within the Jac framework
+[
+6
+,
+7
+,
+8
+]
+, a language infrastructure that provides compiler and runtime support for Python programs. The Jac compiler constructs an abstract syntax tree (AST) to capture program structure and a control-flow graph (CFG) to represent execution paths, merging them into a unified IR
+[
+9
+]
+. Multiple compiler passes operate on this IR to analyze and transform the program, and
+GraphMend
+extends this pipeline with additional passes that detect code patterns likely to cause graph breaks. Specifically,
+GraphMend
+introduces compiler passes that apply two key transformations:
+Predicated Dynamic Control Flow
+and
+Graph-Epilogue Deferred Side Effects
+, which systematically eliminate graph breaks. The transformed program is then compiled into standard Python bytecode and executed by the regular CPython interpreter, seamlessly integrating with the existing PyTorch 2 compilation pipeline. This design enables
+GraphMend
+to automatically restructure code before it reaches TorchDynamo.
+
+We evaluate
+GraphMend
+on a benchmark suite of 8 Hugging Face
+[
+10
+]
+models that trigger FX graph breaks.
+GraphMend
+removes all fixable breaks, reducing the break count to 0 in 6 models and from 5 to 2 in another, with 1 remaining unfixed. On NVIDIA RTX 3090 and A40 GPUs, it achieves 30–75% lower cold-start forward latency, 2.5–25% lower steady-state latency, and 5–8% higher end-to-end throughput. Improvements are larger when a graph break lands in the middle of a hot function where its disruption is highest, and smaller when the break is less disruptive; very small models also tend to see larger relative reductions in per forward pass latency because CPU to GPU handoff dominates a greater share of their runtime.
+
+Our contributions are, (1) We introduce a benchmark suite of eight Hugging Face models that naturally exhibit graph breaks, providing a realistic and reproducible testbed for evaluating PyTorch compilation. (2) We design and implement the
+GraphMend
+compilation technique, which automatically restructure high level code to eliminate common graph breaks. (3) We conduct comprehensive evaluations on this benchmark suite using real world models and hardware, demonstrating the effectiveness of our approach in reducing graph breaks and improving performance.
+
+II
+Background
+
+Optimization pipelines in PyTorch aim to capture execution graphs that can be globally optimized by compilers, unlike eager mode where each operation runs immediately and independently
+[
+1
+,
+3
+]
+.
+
+II-A
+
+Graph Capturing Techniques in PyTorch Before PyTorch 2
+
+Early approaches to graph capture were limited.
+torch
+.
+jit
+.
+trace
+
+[
+11
+]
+used record–replay at the C++ dispatcher level but ignored Python control flow and often produced incomplete or misleading graphs.
+torch
+.
+jit
+.
+script
+
+[
+12
+]
+analyzed Python ASTs but followed an “all-or-nothing” rule: if a single construct was unsupported, capture failed entirely. To address these limitations, PyTorch introduced the
+torch
+.
+fx
+
+[
+3
+]
+module, enabling symbolic execution of Python code to generate an FX graph, a higher-level IR. Although more flexible,
+symbolic
+\
+_trace
+could still misrepresent certain operations.
+
+II-B
+
+FX Graph IR
+
+An FX graph represents operations as nodes connected by data dependencies
+[
+2
+,
+3
+]
+. Unlike eager execution, which evaluates operations sequentially, an FX graph exposes the computation as a data flow structure. This global view enables the compiler backend to apply optimizations such as operation fusion and kernel specialization.
+
+To illustrate, consider the simple PyTorch forward function in Figure
+1(a)
+. When captured by TorchDynamo, it is transformed into the FX graph shown in Figure
+1(b)
+, where each operation is represented as a node in the IR.
+
+⬇
+
+1
+
+def
+
+forward
+(
+x
+,
+
+y
+):
+
+2
+
+z
+
+=
+
+x
+*2
+
++
+
+y
+*2
+
+3
+
+return
+
+torch
+.
+relu
+(
+z
+)
+
+(a)
+
+Forward function in PyTorch
+
+⬇
+
+%
+x
+
+:
+
+torch
+.
+Tensor
+
+%
+y
+
+:
+
+torch
+.
+Tensor
+
+%
+mul_x
+
+:
+
+torch
+.
+Tensor
+
+=
+
+torch
+.
+ops
+.
+aten
+.
+mul
+.
+Tensor_Scalar
+(%
+x
+,
+
+2)
+
+%
+mul_y
+
+:
+
+torch
+.
+Tensor
+
+=
+
+torch
+.
+ops
+.
+aten
+.
+mul
+.
+Tensor_Scalar
+(%
+y
+,
+
+2)
+
+%
+z
+
+:
+
+torch
+.
+Tensor
+
+=
+
+torch
+.
+ops
+.
+aten
+.
+add
+.
+Tensor
+(%
+mul_x
+,
+
+%
+mul_y
+)
+
+%
+out
+
+:
+
+torch
+.
+Tensor
+
+=
+
+torch
+.
+ops
+.
+aten
+.
+relu
+.
+default
+(%
+z
+)
+
+return
+
+(%
+out
+)
+
+(b)
+
+Corresponding FX graph IR
+
+Fig. 1
+:
+A simple forward function (a) and its compiled FX graph IR (b).
+
+This FX graph serves as the foundation for subsequent compiler passes that optimize and lower the computation into efficient GPU kernels.
+
+II-C
+
+TorchDynamo in PyTorch 2
+
+PyTorch 2
+[
+2
+]
+introduced TorchDynamo, Python bytecode-level tracer tightly integrated with CPython. It symbolically evaluates Python bytecode to extract PyTorch operations into FX graphs, while delegating unsupported constructs back to Python. This avoids incomplete graphs but may still fragment the computation by generating partial graphs by inserting graph-breaks.
+
+⬇
+
+1
+
+def
+
+f
+(
+x
+,
+
+y
+):
+
+2
+
+x_1
+
+=
+
+x
+*2
+
+3
+
+y_1
+
+=
+
+y
+*2
+
+4
+
+if
+
+x
+.
+sum
+()
+
+>
+
+10:
+
+#
+
+<--
+
+graph-break
+
+here
+
+5
+
+z
+
+=
+
+x_1
+
++
+
+y_1
+
+6
+
+else
+:
+
+7
+
+z
+
+=
+
+x_1
+
+*
+
+y_1
+
+8
+
+return
+
+torch
+.
+relu
+(
+z
+)
+
+(a)
+
+A PyTorch forward pass with data dependent control flow. The conditional branch on
+x.sum
+cannot be captured, causing a graph break.
+
+⬇
+
+1
+
+def
+
+f
+(
+x
+,
+
+y
+):
+
+2
+
+x_1
+
+=
+
+x
+*2
+
+3
+
+y_1
+
+=
+
+y
+*2
+
+4
+
+cond
+
+=
+
+x
+.
+sum
+
+>
+
+10
+
+5
+
+z_add
+
+=
+
+x_1
+
++
+
+y_1
+
+6
+
+z_mul
+
+=
+
+x_1
+
+*
+
+y_1
+
+7
+
+8
+
+#
+
+rewrite
+
+dynamic
+
+control
+
+flow
+
+using
+
+tensor
+
+select
+
+9
+
+z
+
+=
+
+torch
+.
+where
+(
+cond
+,
+
+z_add
+,
+
+z_mul
+)
+
+10
+
+return
+
+torch
+.
+relu
+(
+z
+)
+
+(b)
+
+Eliminating the graph break by rewriting data dependent control flow with
+torch.where
+, keeping the computation in a single FX graph.
+
+Fig. 2
+:
+Comparison of control flow handling in
+torch.compile
+: (a) graph break due to Python control flow, and (b) fixed version using
+torch.where
+.
+
+(a)
+
+(b)
+
+Fig. 3
+:
+Profiled traces of forward pass execution across CPU and GPU. (a) Forward pass execution trace of code with graph breaks in Figure
+2(a)
+. (b) Forward pass execution trace of equivalent code with graph breaks fixed in Figure
+2(b)
+.
+
+III
+Motivating Example
+
+As discussed in §
+II
+, TorchDynamo attempts to capture a single FX graph for the forward function but inserts graph breaks whenever it encounters unsupported constructs, forcing execution to fall back to eager mode
+[
+2
+]
+.
+
+III-A
+
+FX graph breaks
+
+Let us consider the modified program in Figure
+2(a)
+, which adds a conditional branch to the forward pass of Figure
+1(a)
+. When Dynamo tries to symbolically evaluate the function to capture FX graph, it cannot capture the conditional branch because the outcome depends on the runtime value of the tensor expression
+x.sum
+. Therefore, it inserts a graph break. As a result, the computation before the branch is recorded in one FX graph, the conditional is executed in eager mode, and the remaining operations are traced into a second FX graph
+[
+2
+,
+13
+]
+.
+
+III-B
+
+Impact of graph breaks
+
+The backend compiler (TorchInductor by default) compiles each captured FX graph separately and lowers it to GPU executables such as fused Triton kernels
+[
+2
+,
+14
+]
+. Each compiled FX graph corresponds to a
+torch
+.
+compiled
+region.
+When graph breaks occur, a single Python function results in multiple compiled regions separated by segments of unsupported Python code
+[
+13
+]
+.
+
+⬇
+
+1
+
+def
+
+fn
+(
+x
+):
+
+2
+
+x
+
+=
+
+torch
+.
+relu
+(
+x
+)
+
+3
+
+print
+(
+"tensor:"
+,
+
+x
+)
+
+#
+
+<--
+
+graph-break
+
+here
+
+4
+
+return
+
+torch
+.
+sin
+(
+x
+)
+
+(a)
+
+Compiled function with a debug
+print
+of tensor
+statistics. Dynamo inserts a graph break at the print statement.
+
+⬇
+
+1
+
+def
+
+fn
+(
+x
+):
+
+2
+
+x
+
+=
+
+torch
+.
+relu
+(
+x
+)
+
+3
+
+to_print
+
+=
+
+"tensor:"
+,
+
+x
+
+#
+
+<--
+
+assign
+
+variable
+
+to
+
+print
+
+4
+
+y
+
+=
+
+torch
+.
+sin
+(
+x
+)
+
+5
+
+print
+(
+to_print
+)
+
+#
+
+<--
+
+print
+
+at
+
+the
+
+end
+
+of
+
+tracing
+
+6
+
+return
+
+y
+
+(b)
+
+Fixing the graph break by registering
+print
+as a
+reorderable logging function. TorchDynamo can now safely reorder
+the call and keep the computation in a single FX graph.
+
+Fig. 4
+:
+Fixing graph breaks due to Python I/O: (a) direct print causes a graph break,
+(b) reordering via variable assignment avoids the break.
+
+⬇
+
+1
+
+if
+
+x
+
+>
+
+0:
+
+2
+
+return
+
+1
+
+3
+
+else
+:
+
+4
+
+return
+
+-1
+
+(a)
+
+Python function with if-else branch
+
+⬇
+
+2
+
+LOAD_CONST
+
+1
+
+(0)
+
+4
+
+COMPARE_OP
+
+4
+
+(>)
+
+6
+
+POP_JUMP_IF_FALSE
+
+14
+
+8
+
+LOAD_CONST
+
+2
+
+(1)
+
+10
+
+RETURN_VALUE
+
+14
+
+LOAD_CONST
+
+3
+
+(-1)
+
+16
+
+RETURN_VALUE
+
+(b)
+
+Disassembled Python bytecode
+
+⬇
+
+1
+
+if
+
+x
+
+>
+
+0:
+
+2
+
+return
+
+1
+
+3
+
+return
+
+-1
+
+(c)
+
+Python function having identical bytecode to (a)
+
+Fig. 5
+:
+Bytecode-level limitations of TorchDynamo.(a) (a) and (c) show two syntactically different functions with equivalent semantics. (b) Both compile to identical Python bytecode.
+
+During runtime, the first compiled region runs on the GPU, after which control returns to the Python interpreter to execute unsupported code in eager mode before switching back to the GPU for subsequent compiled regions. These context switches introduce overhead and lower GPU utilization per forward pass
+[
+2
+]
+.
+
+This effect is illustrated in Figure
+3(a)
+, which shows the CPU–GPU profiling trace of the function in Figure
+2(a)
+. The trace reveals two separate
+torch
+.
+compile
+regions, corresponding to two FX graphs. The graph break is visible in the device-to-host (D2H) memcpy following the first FX graph, where control returns to the CPU to execute unsupported code, leaving the GPU idle until the second CUDA graph launch begins. This fragmentation both increases CPU-side scheduling overhead and prevents cross-graph optimizations such as kernel fusion.
+
+If the graph break is eliminated and the computation is captured in a single FX graph, the execution trace in Figure
+3(b)
+shows one continuous CUDA graph region. In this case, the GPU remains fully utilized without falling back to the CPU, and no device-to-host memory transfers are observed between regions. As a result, kernel launches are streamlined and synchronization overhead is removed. Therefore, eliminating graph breaks is necessary.
+
+IV
+GraphMend Compiler Technique
+
+Fig. 6
+:
+GraphMend compiler integration in the Jac pipeline. The pipeline (top) lowers Python/Jac source code into a unified intermediate representation (UniiR) with AST, symbol table, and CFG. GraphMend (bottom) analyzes entry points, detects graph breaks, and applies AST transformations (Predicated Dynamic Control Flow and Graph-Epilogue Deferred Side Effects) to eliminate breaks before execution.
+
+As discussed in §
+III
+, graph breaks in PyTorch 2 introduce significant overhead, undermining the performance gains expected in PyTorch 2. In this work, we focus on two common sources of graph breaks and introduce a compiler technique that eliminates them prior to execution.
+
+IV-A
+
+Classification of Graph Breaks
+
+In practice, most graph breaks arise from two common situations:
+
+1.
+
+Data dependent operations
+[
+2
+,
+13
+]
+: Constructs whose outcome depends on runtime values and hence, cannot be traced.
+
+2.
+
+Unsupported operations
+[
+2
+,
+13
+]
+: Several Python built in functions or certain functionalities that TorchDynamo does not support.
+
+In this section, we discuss these types of graph breaks.
+
+IV-A
+1
+Data dependent operations
+
+Dynamo inserts graph breaks when it encounters control flow that depends on tensor values, such as
+if
+-statements or loops, as well as direct tensor data accesses (e.g.,
+.
+item
+,
+.
+data_ptr
+). Among these cases, when Dynamo encounters dynamic control flow based on a tensor value as shown in Figure
+2(a)
+, we can fix the graph break by rewriting the code into operations supported by the GPU.
+
+IV-A
+2
+Python builtin functions
+
+Some Python built-in functions such as printing, logging, or issuing warnings can also trigger graph breaks. Figure
+4(a)
+shows an example where a debug
+print
+statement in the middle of the function causes a break.
+
+IV-B
+
+Fixing Common Graph Breaks
+
+Among these graph break reasons, there are two main reasons that are common and fixable which are (1) Data-dependent Control Flow and (2) Python I/O Operations.
+
+IV-B
+1
+Data-dependent Control Flow
+
+Dynamo inserts graph breaks for constructs such as if-statements or loops where branching depend on tensor values. Returning to the example in Figure
+2(a)
+, the conditional introduces a graph break. In such cases,we can rewrite the function using tensor operations such as
+torch
+.
+where
+, which are supported by the GPU. The graph break fixed version using
+torch
+.
+where
+is shown in Figure
+2(b)
+for the same function in Figure
+2(a)
+. This eliminates the graph break and allows Dynamo to capture a single FX graph.
+
+IV-B
+2
+Python I/O Operations
+
+Python I/O functions such as Printing/logging/issuing warnings will result in a graph break. An example for this is shown in Figure
+4(a)
+as there is a debug print statement in the middle of the function.
+If we can defer
+print
+statement to the end of the function, then we can avoid graph breaks as shown in Figure
+4(b)
+.
+
+These graph-fixing techniques are simple and straightforward: by applying source-level transformations, we can often avoid graph breaks. However, TorchDynamo traces at the bytecode level, which prevents it from leveraging such transformations and leads to unnecessary graph breaks. For example, consider Figure
+5
+. The function in Figure
+5(a)
+uses an explicit if–else block, while the function in Figure
+5(c)
+omits the else and relies on a fall-through return. Although the two versions differ syntactically, both compile to the same bytecode shown in Figure
+5(b)
+. Because TorchDynamo operates purely on bytecode, it cannot distinguish between these semantically equivalent but syntactically distinct patterns.
+
+Similarly, logging operations introduce host I/O into the forward pass. Because it is unsafe to alter such effects directly at the bytecode level, TorchDynamo also treats these sites as graph breaks. In both cases, the limitation stems from relying solely on bytecode-level semantics captured just-in-time.
+
+To address this, we implement a compilation technique that analyzes and transforms programs at a higher-level IR. By operating on high-level IR, we preserve structural information lost in bytecode, enabling more sophisticated analyses and safe source-to-source rewrites that remove graph breaks before execution. This implementation of the technique is shown in Figure
+6
+which is elaborated in the rest of this section.
+
+IV-C
+
+Jac Compilation Pipeline
+
+To implement our compiler technique, we build on the Jac framework
+[
+6
+,
+7
+,
+9
+]
+, which extends Python with additional language features through its runtime system. The Jac compiler accepts both Jac and Python code, parses it into an abstract syntax tree (AST), and progressively lowers it into a unified intermediate representation (UniiR). As illustrated in the top half of Figure
+6
+, UniiR interleaves three structures: AST, control-flow graph (CFG), and symbol table. In this way, structural, semantic, and control-flow information are combined in a single representation. This integration enables cross-cutting analyses that are difficult to achieve when these structures are maintained separately. The CFG is constructed by linking AST nodes to their successors, embedding control-flow edges within the tree. This process is implemented in the
+CFGBuildPass
+.
+
+Our
+GraphMend
+pass takes UniiR as input and performs analyses to identify the two types of graph breaks, as illustrated in the bottom half of Figure
+6
+. It then applies transformations on the AST to rewrite the code and eliminate these breaks. Afterward, UniiR is rebuilt and verified before being passed back to the Jac compiler pipeline. At that stage, the pipeline can either compile the program to bytecode for execution on the Python interpreter or generate a transformed Python source file.
+
+Input:
+
+UniiR; TorchAttrTable (torch attributes
+\mapsto
+{dynamic, static})
+
+Output:
+
+Tags:
+GraphBreak[DynCtrlFl]
+,
+GraphBreak[logger/print]
+
+foreach
+
+Dynamo Entry Point
+
+r
+in UniiR
+
+do
+
+Initialize worklist with successors of
+r
+
+while
+
+worklist not empty
+
+do
+
+Pop node
+n
+from worklist; push unseen successors of
+n
+
+//
+1) Dynamic control-flow via if-conditions
+
+if
+
+n
+is an
+IfStmt
+
+then
+
+E\leftarrow
+subexpressions of
+\texttt{cond}(n)
+
+dyn\leftarrow\textbf{false}
+
+foreach
+
+e\in E
+
+do
+
+if
+
+e
+has a torch attribute
+
+then
+
+a\leftarrow
+attribute of
+e
+
+//
+e.g., .sum
+
+if
+
+TorchAttrTable[
+a
+] = dynamic
+
+then
+
+dyn\leftarrow\textbf{true}
+;
+break
+
+end if
+
+end if
+
+end foreach
+
+if
+
+not
+dyn
+
+then
+
+if
+
+E
+is input/tensor-value dependent (via SymbolTable + CFG)
+
+then
+
+dyn\leftarrow\textbf{true}
+
+end if
+
+end if
+
+if
+
+dyn
+
+then
+
+Tag
+n
+as
+GraphBreak[DynCtrlFl]
+
+end if
+
+end if
+
+//
+2) Logger / print side effects
+
+if
+
+n
+is a call to
+print
+or
+logger.*
+
+then
+
+Tag
+n
+as
+GraphBreak[logger/print]
+
+end if
+
+end while
+
+end foreach
+
+Algorithm 1
+
+Fixable Graph-Break Detection
+
+IV-D
+
+GraphMend
+Implementation
+
+Our compiler technique consists of three main passes, illustrated in the bottom half of Figure
+6
+.
+
+IV-D
+1
+Dynamo Entry Point Analysis Pass
+
+To identify potential TorchDynamo compilation entry points, this pass traverses the AST and analyzes each node. A node is tagged when a function or an
+nn
+.
+Module
+object wrapped or decorated with
+torch
+.
+compile
+is encountered.
+
+If no occurrences of
+torch
+.
+compile
+are found in the codebase,
+GraphMend
+compilation is skipped. Otherwise, the tagged nodes serve as entry points for subsequent passes.
+
+IV-D
+2
+Graph Break Type Analysis Pass
+
+We implement a compound analysis pass on UniiR to identify potential graph-break locations, following the procedure in Algorithm
+1
+.
+Starting from each Dynamo entry point, the pass traverses the control-flow graph (CFG) to locate program points that may induce graph breaks. For conditional branches, the pass inspects the subexpressions of the condition. If any involve Torch attributes known to be dynamic (e.g.,
+.sum()
+), the branch is marked as dynamic control flow. Otherwise, a use-def analysis over the symbol table and CFG determines whether the condition depends on model inputs or tensor values; if so, it is also tagged as dynamic. In addition, side-effecting operations such as
+print
+and
+logger.*
+calls are detected and annotated as logging-induced graph breaks as in Algorithm
+1
+.
+
+These annotations guide the subsequent transformation passes that eliminate graph breaks.
+
+IV-D
+3
+AST Transformation Pass
+
+After identifying graph-break locations, the AST must be modified to eliminate them. As discussed earlier in this section, these fixes can be applied through source-level transformations. Following the same approach, the AST is modified according to the graph-break tags identified in the previous pass. Based on these tags, one of the following transformations is performed.
+
+Predicated Dynamic Control Flow Transformation
+
+To address data-dependent control-flow graph breaks, we first evaluate the branch condition and store it as a predicate. The control flow is then rewritten using
+torch
+.
+where
+, which enables predicated execution of both branches. This process is illustrated in Figure
+6
+. In the AST Transformation Pass (Figure
+6
+), the original branch
+if
+
+x
+.
+sum
+()
+
+>
+
+5:
+
+...
+
+else
+:
+
+...
+is reduced by extracting the condition into a symbolic variable
+pred
+(
+R 1
+). Next, the two branch assignments are merged into a single dataflow expression using
+torch
+.
+where
+(
+pred
+,
+
+e1
+,
+
+e2
+)
+. Finally, the
+if
+and
+else
+AST nodes are removed, and their child nodes are reconnected to the parent, producing a transformed tree in which both execution paths are explicitly represented.
+
+Graph-Epilogue Deferred Side Effect Transformation
+
+For
+print
+or
+logger
+calls, the message is first stored in a temporary variable. This variable is then passed to the outermost forward function and executed at the end of the function (epilogue) before returning, as shown in Figure
+6
+. In the example ASTs in Figure
+6
+, the original call
+print
+(
+"Logger
+
+message"
+)
+is rewritten as a deferred assignment
+deferred
+
+=
+
+"Logger
+
+message"
+. This assignment is then moved to the epilogue block, where it is printed after graph execution (
+R 2
+). In this way, the logging effect is preserved while remaining safely outside the traced region. Note that any computation in the return statement must be moved before the epilogue, stored in a temporary variable, and then returned afterward to avoid introducing a graph break.
+
+IV-E
+
+Healing UniiR and Downstream Flow
+
+After the AST transformations, the UniiR is no longer consistent. Therefore, the symbol table and CFG must be rebuilt using the same passes that originally created them. As shown in Figure
+6
+, once the
+GraphMend
+pass is complete, the
+SymTabBuildPass
+and
+CFGBuildPass
+are rerun to restore UniiR for downstream compilation.
+
+At the end of the Jac compiler pipeline, Python bytecode is generated for interpretation, enabling TorchDynamo to seamlessly operate on the transformed code.
+
+TABLE I
+:
+Models in benchmark suite
+
+Benchmark Model Name
+
+Graph break count
+
+Graph break reasons
+
+Total Operators
+
+biogpt
+[
+15
+]
+
+2
+
+logger calls
+
+408
+
+blenderbot-400M-distill
+[
+16
+]
+
+3
+
+logger calls
+
+489
+
+flan-t5-large
+[
+17
+]
+
+3
+
+logger calls
+
+2130
+
+longformer-base-409
+[
+18
+]
+
+5
+
+logger calls,
+tensor.item()
+call
+
+913
+
+moe-minicpm-x4-base
+[
+19
+]
+
+15
+
+Dynamic shape operator
+
+280
+
+Phi-4-mini-instruct
+[
+20
+]
+
+5
+
+Dynamic control flow
+
+1541
+
+Qwen-Audio-Chat
+[
+21
+]
+
+2
+
+Dynamic control flow
+
+1647
+
+tiny-random-PegasusForCausalLM
+[
+22
+]
+
+2
+
+logger calls
+
+64
+
+V
+Evaluation
+
+We evaluate
+GraphMend
+on real-world models that exhibit graph breaks. Our goals are to quantify (i) how often
+GraphMend
+removes fixable breaks and (ii) the end-to-end improvement after those fixes.
+
+Experimental Setup
+
+We implement
+GraphMend
+on top of Jaseci
+[
+6
+,
+7
+,
+9
+]
+, an open-source research infrastructure that provides both compiler and runtime control as a Python superset. Our experiments are conducted on NVIDIA RTX 3090 and A40 GPUs, using TorchInductor as the backend compiler.
+
+Benchmark Suite
+
+To construct our benchmark, we (1) randomly sample 65 Hugging Face
+[
+10
+]
+models spanning diverse architectures and task categories; (2) identify models that trigger FX graph breaks; and (3) retain the eight models with breaks for evaluation. Table
+I
+summarizes the resulting suite, including the number and causes of graph breaks and the total operator count. A similar methodology was used in prior works to construct benchmark suite
+[
+2
+]
+.
+
+Profiling Methodology
+
+We profile the forward pass using PyTorch Profiler
+[
+23
+]
+. For each model, we evaluate two configurations: original model and graph breaks fixed version. Each configuration is executed for 7 iterations: one cold-start iteration followed by six warm iterations. The profiler records CPU and CUDA activities and operator-level events; traces are exported and inspected with Chrome’s trace viewer.
+
+V-A
+
+GraphMend
+’s Ability to Fix Graph Breaks
+
+TABLE II
+:
+Graph break counts in the original model and fix rates achieved by applying
+GraphMend
+across the benchmark suite.
+
+Benchmark Model
+
+Graph Breaks
+
+Fixed (%)
+
+biogpt
+
+2
+
+100
+
+blenderbot-400M-distill
+
+3
+
+100
+
+flan-t5-large
+
+3
+
+100
+
+longformer-base-4096
+
+5
+
+40
+
+moe-minicpm-x4-base
+
+15
+
+0
+
+Phi-4-mini-instruct
+
+5
+
+100
+
+Qwen-Audio-Chat
+
+2
+
+100
+
+tiny-random-PegasusForCausalLM
+
+2
+
+100
+
+First, we check
+GraphMend
+’s ability to fix graph breaks across the benchmark suite.
+Table
+II
+shows that
+GraphMend
+fully eliminates graph breaks in 6 of the 8 models.
+It partially fixes
+longformer-base-4096
+and leaves
+moe-minicpm-x4-base
+unchanged. By cause,
+GraphMend
+removes all breaks due to logging statements and data-dependent control flow. The remaining breaks:
+tensor.item()
+and dynamic-shape operators could not be fixed by code transformations.
+For the performance analysis that follows, we report results on the seven models whose break counts were fully eliminated or reduced, excluding
+moe-minicpm-x4-base
+.
+
+V-B
+
+Latency Improvement per Forward Pass Using
+GraphMend
+to Fix Graph Breaks
+
+We measure
+Relative Latency Improvement (%)
+as
+
+100\times\frac{T_{\text{break}}-T_{\text{fixed}}}{T_{\text{break}}},
+
+where
+T_{\text{break}}
+is the per-forward-pass latency for the benchmarked model with graph breaks, and
+T_{\text{fixed}}
+is the latency after applying
+GraphMend
+fixes.
+
+We report the relative improvement per forward pass for break-fixable models in the benchmark suite, using PyTorch Profiler data for both cold and warm (steady-state) runs.
+
+Cold Start Latency Improvement
+
+Figure
+7(a)
+reports results on both RTX 3090 and A40 GPUs. Across models, we observe a relative latency reduction of about 30–75% for both GPUs, indicating substantial gains in cold runs. At cold start, each graph break incurs significant overhead because every CUDA graph requires a separate record and caching. After eliminating these breaks, only a single (or fewer) CUDA Graph capture is needed, resulting in fewer records and reduced capture time, which minimizes overhead. Consequently, we achieve larger relative latency improvements per forward pass in cold runs. A more detailed analysis is provided in §
+V-D
+.
+
+Steady-State Latency Improvement
+
+Figure
+7(b)
+shows steady-state improvements on RTX 3090 and A40 GPUs, ranging from about 2.5% to 25% across models. After the cold run, the captured graph is cached and replayed, removing the high capture overhead present initially. However, when graph breaks persist, execution still incurs GPU–CPU switches (as discussed in §
+V-D
+), which add latency. Eliminating these breaks with
+GraphMend
+removes such switches, yielding additional improvements in relative latency per forward pass.
+
+Notably,
+tiny-random-PegasusForCausalLM
+shows over 25% improvement. Since this model is very small, with only 64 operators, the fixed costs from graph breaks (such as host–device synchronization, and extra graph launches) take up a large portion of the runtime. Removing these breaks therefore gives a huge speedup per forward pass.
+
+(a)
+
+(b)
+
+Fig. 7
+:
+Latency improvements from
+GraphMend
+(a) Cold-start latency reductions (b) Steady-state latency reductions across benchmark models on RTX 3090 and A40 GPUs.
+
+Fig. 8
+:
+Relative throughput improvement across benchmark suite
+
+V-C
+
+Relative Throughput Improvement by Fixing Graph Breaks
+
+We measure
+Relative Throughput Improvement (%)
+as
+
+100\times\frac{Tp_{\text{fixed}}-Tp_{\text{break}}}{Tp_{\text{break}}},
+
+where
+Tp_{\text{break}}
+is the throughput (output tokens per second) for the model with graph breaks, and
+Tp_{\text{fixed}}
+is the throughput after applying
+GraphMend
+fixes.
+
+We measure the relative throughput across the models in the benchmark suite that are fixable through
+GraphMend
+for both RTX 3090 and A40.
+Figure
+7(b)
+shows a relative throughput improvement of about 5-8% across all models on both GPUs.
+This improvement follows from the relative latency reduction per forward pass observed in Section
+V-B
+: as each step becomes faster, the end-to-end tokens per second increase. The variation of improvement across models highlights an important point: the magnitude of improvement depends on the extent to which a graph break affects the forward path. When the impact of a break is small, the corresponding throughput gain is also limited.
+
+For example, in both
+Phi-4-mini-instruct
+and
+Qwen-Audio-Chat
+, the root cause of the breaks is dynamic control flow. We observe a 7.5%–8% improvement for
+Qwen-Audio-Chat
+, compared to 5%–6% for
+Phi-4-mini-instruct
+from both GPUs. The difference arises because the break in
+Phi-4-mini-instruct
+occurs near the beginning of the forward function, whereas in
+Qwen-Audio-Chat
+it occurs in the middle, where its impact is higher. Thus, the location of a break determines its effect: fixing some breaks yields larger throughput gains, while fixing others has a smaller impact.
+
+tiny-random-PegasusForCausalLM
+achieves more than 25% lower forward-pass latency, but throughput gains are smaller. This is because throughput also depends on prefill, decode, CPU tasks (e.g., sampling, tokenization), and data transfers, which are unaffected. For such a small model, these fixed costs dominate, so removing the break speeds up GPU compute but has less impact on end-to-end tokens/s, especially when decode dominates generation.
+
+V-D
+
+Overhead Analysis of Graph Breaks
+
+We conducted an analysis to evaluate how fixing graph breaks with
+GraphMend
+reduces overhead. We analyze
+Qwen-Audio-Chat
+model running on an A40 GPU which has 2 graph breaks.
+
+(a)
+
+Profiler tracer for one iteration of warm runs for Qwen-Audio-Chat original model before fixing the graph break run in A40 GPU
+
+(b)
+
+Profiler tracer for one iteration of warm runs for Qwen-Audio-Chat model after fixing the graph break run in A40 GPU
+
+Fig. 9
+:
+(a) Profile traces.
+
+Fig. 10
+:
+Profiler tracer of cold run of Qwen-Audio-Chat model run on A40 GPU.
+
+(a)
+
+Steady State - Original Model
+
+(b)
+
+Cold Start - Original Model
+
+(c)
+
+Steady State - Fixed Model
+
+(d)
+
+Cold Start - Fixed Model
+
+Fig. 11
+:
+CPU/GPU activity time traces for Qwen-Audio-Chat model run on A40 GPU.
+
+To ensure a consistent comparison in this section, all activity plots (Figures
+11(a)
+,
+11(b)
+,
+11(c)
+, and
+11(d)
+) are drawn only for the time interval between the first and second CUDA graph executions in the original model; for the fixed model, we consider the identical time region.
+
+Steady-state run overhead analysis
+
+Figure
+9(a)
+shows the profiler trace for the original model. Execution is split into three CUDA graphs because of two graph breaks, with idle GPU periods between the first and second FX graph executions. This is clearly visible in Figure
+11(a)
+, the GPU becomes idle while the CPU handles control flow in eager mode, including a device-to-host (
+D2H
+) memcpy triggered by dynamic control flow (graph break reason for this model). This CPU fallback introduces an overhead.
+
+After applying
+GraphMend
+, the rewritten code replaces the dynamic branch with a GPU-supported
+torch.where
+. The resulting trace (Figure
+9(b)
+) shows one continuous CUDA graph. As confirmed in Figure
+11(c)
+, GPU activity remains uninterrupted and CPU fallbacks disappear. Thus,
+GraphMend
+eliminates the overhead of CPU–GPU context switching during steady-state runs.
+
+Cold run overhead analysis
+
+Cold runs introduce even larger overheads. In the profiler trace of original model (Figure
+10
+), each graph break triggers a separate CUDA Graph recording and caching, leading to long idle GPU phases and heavy CPU involvement as shown in Figure
+11(b)
+. In this interval, we observe that GPU idle time dominates, while the CPU is heavily active, reflecting significant overhead. By contrast, the fixed model (Figure
+11(d)
+) executes with a single capture, avoiding repeated records and reducing idle GPU time. Overall,
+GraphMend
+reduces overhead more significantly in cold runs than in steady state, explaining the substantial cold-start latency reductions per forward pass reported in Figure
+7(a)
+.
+
+V-E
+
+GPU Runtime Kernel Statistics Analysis
+
+We analyze how fixing graph breaks affects GPU kernel counts, ordering, and scheduling, and whether this enables new optimization opportunities. Using the
+Phi-4-mini-instruct
+model on an A40 GPU, the profiler reports 404 executed kernels for the original model and 393 for the fixed model with a reduction of 11. This drop indicates more fusion and fewer launches, as removing breaks allows the compiler to capture larger regions and emit fewer, larger kernels.
+
+Figure
+12
+illustrates this change. In the original model, 3 small kernels appear that are replaced in the fixed model by a single fused kernel. We also observe reordering: one kernel from the original run shifts upward in the fixed run. With one CUDA Graph, the runtime can reorder independent regions and pack launches more effectively, reducing stalls and improving locality.
+
+Graph breaks force separate CUDA Graph captures, blocking fusion across the break and restricting scheduling to smaller windows. Removing them allows larger portions of the forward pass to be captured together, enabling the compiler and runtime to fuse operations, remove redundant launches, and reorder independent work. As a result, kernel gaps shrink and device utilization improves.
+
+In summary, fixing graph breaks with
+GraphMend
+not only reduces launch overhead but also exposes new optimization opportunities, underscoring the importance of eliminating such breaks.
+
+Fig. 12
+:
+Kernel Fusion and Reordering Visualization for Phi-4-mini-instruct model.
+
+VI
+Related Work
+
+PyTorch has long sought to balance performance with Python’s flexibility.
+TorchScript’s tracing and scripting enabled ahead-of-time graph capture but
+struggled with dynamic control flow and unsupported constructs
+
+[
+12
+,
+11
+]
+. PyTorch 2 introduced TorchDynamo for
+bytecode-level capture and TorchInductor for backend compilation
+
+[
+2
+,
+1
+]
+, yet graph breaks remain common
+when encountering data-dependent branches or Python I/O. Our work reduces these
+breaks by rewriting source code before execution, allowing more continuous FX
+graphs.
+
+General compiler infrastructures such as XLA
+[
+24
+]
+, TVM
+[
+25
+]
+, and
+MLIR
+[
+26
+]
+provide IR-based optimization, while Glow
+[
+27
+]
+, TASO
+
+[
+28
+]
+, and ONNX Runtime
+[
+29
+]
+extend portability across
+hardware and frameworks. These systems assume large graphs are already
+available, whereas we restructure PyTorch code to maximize graph continuity so
+their optimizations can be applied more effectively.
+
+Dynamic models motivate systems like GRAPE
+[
+30
+]
+and Triton
+
+[
+31
+,
+32
+]
+, which manage runtime variability through
+efficient kernel generation. PyTorch’s compiler stack still falls back to eager
+execution in such cases, while our method removes common break sources by
+rewriting branches into tensorized forms that remain graph-compatible.
+
+Program transformations more broadly, as seen in Halide
+[
+33
+]
+, Lantern
+
+[
+34
+]
+, and DLVM
+[
+30
+]
+, show the potential of semantics-preserving
+rewrites for optimization. Our approach follows this tradition but targets
+PyTorch specifically, introducing lightweight transformations that enable
+TorchDynamo to capture larger uninterrupted graphs.
+
+VII
+Conclusion
+
+We presented
+GraphMend
+, a source-level compiler technique for PyTorch that systematically eliminates common FX graph breaks before execution. By restructuring code constructs such as dynamic control flow and Python I/O operations,
+GraphMend
+reduces fragmentation in the compilation pipeline and enables larger unified graphs to be captured by TorchDynamo. Our evaluation across a diverse suite of Hugging Face models demonstrates that
+GraphMend
+removes nearly all fixable breaks and consistently improves runtime efficiency, with substantial latency and throughput gains on modern GPUs.
+

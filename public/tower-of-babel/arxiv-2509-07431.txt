@@ -1,0 +1,1660 @@
+Network-accelerated Active Messages
+Md Ashfaqur Rahaman, Alireza Sanaee, Todd Thornley, Sebastiano Miano, Gianni Antichi, Brent E. Stephens, Ryan Stutsman
+
+Abstract
+Remote Direct Memory Access (RDMA) improves host networking performance by eliminating software and server CPU involvement. However, RDMA has a limited set of operations, is difficult to program, and often requires multiple round trips to perform simple application operations (e.g., hash table lookup). Programmable SmartNICs provide a different means to offload work from host CPUs to a NIC while supporting application logic. This leaves applications with the complex choice of embedding logic as RPC handlers at servers, using RDMA’s limited interface to access server structures via client-side logic, or running some logic on SmartNICs. The best choice varies between workloads and over time. To solve this dilemma, we present NAAM, network-accelerated active messages . NAAM applications specify small, portable eBPF functions associated with messages. Each message specifies what data it accesses using an RDMA-like interface. NAAM runs at various places in the network, including at clients, on server-attached SmartNICs, and server host CPU cores. Due to eBPF’s portability, the code associated with a message can be run at any location. Hence, the NAAM runtime can dynamically steer any message to execute its associated logic wherever it makes the most sense based on the data it accesses or current network or CPU load. To demonstrate NAAM’s flexibility, we built several applications, including the MICA hash table and lookups from a Cell-style B-tree. With an NVIDIA BlueField-2 SmartNIC and integrating its NIC-embedded switch, NAAM can run any of these operations on client, server, and NIC cores, shifting load in tens of milliseconds on server compute congestion. NAAM dynamically offloads up to 1.8 million MICA ops/s for YCSB-B and 750,000 Cell lookups/s from server CPUs. Finally, whereas iPipe, the state-of-the-art SmartNIC offload framework, only scales to 8 application offloads on BlueField-2, NAAM scales to hundreds of application offloads with minimal impact on tail latency due to eBPF’s low overhead.
+
+
+
+1
+Introduction
+
+Remote Direct Memory Access (RDMA) can significantly improve the performance of end-host networking
+by bypassing software networking stacks and offloading server CPUs
+[
+12
+,
+18
+,
+20
+,
+19
+,
+55
+]
+. This can dramatically reduce tail latency and CPU usage by avoiding packet processing costs, which consume a large fraction of CPU cycles
+[
+22
+,
+41
+]
+.
+
+However, RDMA verbs are notoriously difficult to program, and multiple round trips are typically required for complex operations on server structures (e.g., looking up a key-value pair in a hash table) or they require careful RDMA-specific re-engineering of data structures
+[
+20
+,
+12
+]
+.
+Historically, remote procedure call (RPC) has been the solution to this problem since it runs application-defined logic at servers in response to network messages; however, this comes at the cost of server CPU load.
+Recently, SmartNICs have been employed to help solve this by allowing custom operations to be defined and run on NICs
+[
+37
+,
+27
+,
+8
+]
+, generally at server SmartNIC CPUs.
+
+The result is that developers are faced with the complex choice of using RDMA and client-side logic, using RPC and server-side logic, or using custom SmartNIC offloads.
+Each model has different trade-offs and bottlenecks, and the best configuration can vary between workloads and even over time. For example, during normal operation, it is often faster to use a server SmartNIC core or CPU core to walk a remote data structure like a hash table or a B-tree to avoid multiple network round trips. However, if the remote server cores are overloaded, then it can be better to run the logic at the client.
+
+Building applications that can monitor network and server load and dynamically move logic to optimize performance is difficult.
+To solve this, we propose NAAM, network-accelerated active messages, a new framework for remote memory access and function offloading.
+NAAM avoids the need to re-implement the same logic for multiple different platforms because NAAM replaces RDMA with active messages that execute small, portable eBPF functions
+[
+2
+,
+30
+]
+.
+Instead of writing multiple functions with different RDMA verbs for the same logic (e.g., using both one-sided and two-sided logic), applications can specify a single RPC-like function that can be associated with network messages. This function can access state stored on servers, and it can run custom code; NAAM decides how best to schedule and run these messages’ functions on the available compute in the network.
+
+NAAM runs as a software switch at various places in the network, including at clients, on server-attached SmartNICs, and on server host CPU cores. eBPF’s portability ensures that each message’s code can run at any of these locations, so
+the NAAM runtime can dynamically steer any message to execute its associated logic wherever it makes the most sense (e.g., based on load).
+In addition to being able to dynamically and incrementally scale workloads to span both SmartNIC and host CPU cores, NAAM can also route around transitory CPU contention at sub-second timescales to improve tail latency.
+
+Although some prior SmartNIC programming frameworks have helped address the problems associated with mapping some work to SmartNIC resources while mapping other work to server host CPUs, they all have important limitations.
+For example, Floem pipelines are mapped to SmartNIC and CPU resources, and they do not adapt the placement of work when workloads change
+[
+37
+]
+, creating bottlenecks. iPipe uses an actor-based model to dynamically move work between SmartNIC and host CPU resources within a server
+[
+27
+]
+. However, iPipe depends on a special “on-path” SmartNIC that integrates compute elements directly into its packet processing pipeline and exposes an exotic software-managed TLB.
+Without this special hardware, iPipe’s approach breaks down on commodity “off-path” SmartNICs like the NVIDIA BlueField-2 that we use, where SmartNIC cores must access packets over a bus (PCIExpress). When running just nine actors on BlueField-2, iPipe’s tail response latency increases by three orders of magnitude, and its efficiency breaks down. This is a significant limitation in a multi-tenant data center, where numerous applications are co-located.
+NAAM’s eBPF runtime is small and has a low cost to enter/exit without specialized hardware, so it efficiently scales to hundreds of inter-isolated user-defined operations with tail response times of tens-of-microseconds, even with popular off-path SmartNICs.
+
+Overall, we show that by reactively shifting active message processing to the ARM cores of a BlueField-2 SmartNIC, NAAM can reduce tail latency by 400
+\times
+when host x86 CPUs are contended. Furthermore, when the NIC ARM cores become overloaded, NAAM automatically reconfigures the integrated BlueField-2 hardware switch to allow the host x86 CPUs to help out, avoiding the bottleneck due to CPU saturation when under heavy load. We show in the evaluation that this allows NAAM to transparently scale request processing for a disaggregated MICA-based
+[
+26
+]
+in-memory hash table from the ARM CPUs’ limit of 1.8 Mop/s to 6 Mop/s with assistance from host CPU cores. Finally, as a full application benchmark, we evaluate the lookup path of a re-implementation of the Cell B-tree
+[
+32
+]
+. At 1 million requests/s, SmartNIC cores using NAAM achieve comparable performance to using client-driven RDMAs while moving
+4.3\times
+less data.
+In sum, this paper
+
+1.
+
+describes NAAM’s design for a unified interface for application-defined remote memory operations, and its active message-based approach to executing them, which can transparently use heterogeneous platforms that span clients, servers, and SmartNICs;
+
+2.
+
+details NAAM’s eBPF runtime, which includes a new scheme that cooperatively suspends and resumes the execution of eBPF functions while still supporting a fast, JIT-based implementation on x86-64 and ARMv8;
+
+3.
+
+describes how this cooperative yield leads to an implementation of NAAM as an efficient software switch that ensures remote state access never introduces blocking within the runtime, which would hurt throughput;
+
+4.
+
+shows that NAAM balances load across host and SmartNIC resources via NIC hardware features while redistributing load when workloads change or interfere at sub-second timescales, resulting in improved tail latency.
+
+2
+Background & Motivation
+
+RDMA and its limitations.
+
+Recently, data center NIC bandwidth has exploded to 400 Gbps, with 800 Gbps coming soon. At these speeds, software-based TCP/IP packet processing costs lead to intolerable overheads. This has led to pervasive use of hardware offloads, including RDMA, which offers direct access to the memory of a remote machine without involving its CPU. RDMA delivers lower latency, lower CPU costs, and improved throughput compared to traditional networking stacks
+[
+12
+,
+13
+,
+34
+]
+, making it a popular choice for distributed applications including machine learning
+[
+47
+,
+53
+]
+, distributed transactions
+[
+13
+,
+28
+,
+50
+]
+, replicated state machines
+[
+38
+]
+, graph processing
+[
+49
+,
+42
+,
+17
+,
+23
+]
+, and key-value stores
+[
+20
+,
+32
+,
+12
+,
+21
+]
+.
+
+Despite its advantages, RDMA has limitations that prevent it from being widely adopted. RDMA provides two kinds of interfaces:
+one-sided
+and
+two-sided
+.
+
+One-sided
+RDMA operations are handled entirely by the receiver’s NIC, eliminating all server CPU involvement, but these operations are mostly limited to reading or writing one contiguous remote memory location.
+Operations over more complex structures (e.g. a hash table) must be composed of multiple one-sided operations, complicating client logic, making synchronization challenging, and cutting into the benefits of off-loading operations to the NIC.
+
+Two-sided
+RDMA operations still require the receiver’s CPU to handle each incoming message. Two-sided operations effectively provide fast RPC, preserving a classic client-server design; however, many applications use small messages at a high rate, so this approach can often result in a bottleneck at the server’s CPU.
+
+This dichotomy presents a complex decision for application developers, who must consider a range of factors (compute capacity, data access patterns, and the nature of data-dependent operations) to determine the most suitable RDMA model for their specific application. This problem is compounded by the fact that workloads change over time.
+
+Enhancing capabilities with SmartNICs.
+
+Recently, SmartNICs have emerged as an approach to enable more general offloads to NICs.
+There are two main classes of compute elements on SmartNICs: FPGAs
+[
+51
+,
+52
+]
+
+or SoC cores
+[
+11
+,
+46
+,
+36
+,
+45
+]
+.
+SmartNICs also include ASIC accelerators for specific tasks like TCP/UDP offload and encryption/decryption.
+SoC-based SmartNICs generally include capable but simple multicore ARM or MIPS processors.
+
+This categorization further breaks down into two types based on their interaction with network traffic:
+on-path
+and
+off-path
+.
+On-path SmartNICs incorporate processing elements directly into the data path, processing every packet through SmartNIC cores.
+Off-path SmartNICs generally include
+(i)
+a hardware switch that separates compute elements from the data path, allowing for flexible packet routing to either the host system or the SmartNIC cores,
+(ii)
+a general-purpose multicore CPU capable of running custom applications, and
+(iii)
+an efficient mechanism for NIC CPUs to access host memory either via DMA or RDMA.
+
+Unlike on-path SmartNICs, off-path variants run full-fledged operating systems, such as Linux, and support kernel-bypass systems like DPDK. They also have substantial onboard NIC memory and are free from the static resource constraints of FPGA-based SmartNICs that can limit the number of concurrently offloadable applications.
+Off-path SmartNICs also avoid the time-consuming and manually-intensive process of writing highly NIC-specific, resource-constrained packet processing code. For example, they avoid the need for FPGA synthesis and reconfiguration (including partial reconfiguration)
+[
+48
+]
+.
+Considering these strengths, this paper demonstrates an approach for programming offloads that works well for off-path SmartNICs while still admitting an efficient implementation for on-path SmartNICs.
+
+System
+
+Programmability
+
+Multi-Tenant
+
+Scaling
+
+Dynamic
+
+Offloading
+
+Commodity
+
+SmartNIC
+
+RMC
+[
+8
+]
+
+✓
+
+✓
+
+✗
+
+✓
+
+PRISM
+[
+10
+]
+
+✗
+
+✓
+
+✗
+
+✓
+
+StRoM
+[
+43
+]
+
+✓
+
+✗
+
+✗
+
+✗
+
+1RMA
+[
+44
+]
+
+✗
+
+✓
+
+✗
+
+✗
+
+iPipe
+[
+27
+]
+
+✓
+
+✗
+
+✓
+
+✓
+
+Bertha
+[
+35
+]
+
+✓
+
+✗
+
+✓
+
+✗
+
+FaRM
+[
+12
+,
+13
+]
+
+✓
+
+✗
+
+✗
+
+N/A
+
+Snap
+[
+29
+]
+
+✓
+
+✓
+
+✗
+
+N/A
+
+Splinter
+[
+24
+,
+9
+,
+54
+]
+
+✓
+
+✓
+
+✓
+
+N/A
+
+NAAM
+
+✓
+
+✓
+
+✓
+
+✓
+
+Table 1:
+A comparison of existing works on custom RDMA extensions and SmartNIC offload frameworks.
+
+2.1
+Toward an Active Messaging Framework
+
+The evolution of RDMA and the advent of SmartNICs present an opportunity to redefine how distributed applications are developed and executed.
+An ideal framework for custom remote memory operations should solve several key challenges. Building a framework that is universally applicable and efficient requires simultaneously addressing all of these challenges.
+Here, we outline these challenges; Table
+1
+compares NAAM to other significant contributions in this field.
+
+Programmability.
+
+Foremost, a remote memory programming framework must
+provide an easy-to-use programming model that shifts developers’ focus from the complexities of RDMA operations to the logic of their applications.
+Writing RDMA code requires changing every memory access to issue a remote operation including handling errors and synchronization. Synchronization can be especially difficult because ongoing operations on server host CPUs are unaware of RDMA accesses, and additional round trips to set/clear synchronization flags over RDMA are prohibitively expensive.
+For example, if a client issues an RDMA read of a value on a server, the returned value may not be atomic due to ongoing server CPU operations that are updating the value (or concurrent RDMA writes).
+The resulting code is complex and hard to debug, especially compared to accessing server data structures via RPC, which uses local memory accesses.
+
+PRISM
+[
+10
+]
+and 1RMA
+[
+44
+]
+
+introduce new RDMA verbs for more complex operations; however, their set of verbs is still fixed, so their performance benefits don’t generalize to all applications. Applications also must still handle errors and synchronization just as with RDMA. FaRM allows applications to mix RPC and RDMA code but it doesn’t support SmartNICs or handle multiple tenants
+[
+12
+,
+13
+]
+.
+
+Dynamic Offloading and Resource Management.
+
+The optimal choice between one-sided and two-sided operations often hinges on the system load
+[
+25
+]
+, necessitating multiple code versions to accommodate varying system conditions
+[
+55
+,
+14
+]
+.
+iPipe
+[
+27
+]
+uses distributed actors which can be moved between host CPU cores and a SmartNIC to solve this, but it only works with a limited number of actors for off-path SmartNICs.
+Bertha
+[
+35
+]
+lets applications express chains of offloads while choosing their implementations at runtime, but it is restricted to a set of pre-existing kernels and offloads.
+RMC
+[
+8
+]
+lets developers use arbitrary code to specify application-specific offloads to SmartNICs, but it doesn’t support online reconfiguration of where those offloads run.
+Similarly, StRoM
+[
+43
+]
+allows the synthesis of C++ onto an FPGA-enabled NIC to enable new RDMA verbs, but it doesn’t support online reconfiguration to divide work across host and SmartNIC resources.
+
+An ideal framework would allow application logic to be run on server CPUs, on client CPUs, or offloaded to SmartNICs, with placement decisions automatically handled by the framework in response to changing workloads and resources.
+
+Scalability in Multi-tenant Environments.
+
+Data centers host many applications; a robust framework must handle the diverse, concurrent demands of co-located tenants. State-of-the-art approaches to co-locating offloads rely on standard inter-process isolation between tenant code, which limits scaling as process context switch latency and overhead interfere.
+
+Some existing on-path approaches sidestep these limitations by using specialized hardware and privileged software. For example, on an on-path SmartNIC iPipe
+[
+27
+]
+avoids context switch overheads by controlling a software-managed TLB. These optimizations don’t work on SmartNIC platforms without this specialized hardware and where the SmartNIC runs a commodity OS kernel that doesn’t expose control of low-level address translation hardware to applications.
+
+Other, Non-SmartNIC Frameworks.
+
+Nu is a framework for specifying functions that are co-located with in-memory state
+[
+39
+]
+, which are dynamically migrated together to load balance, which is similar to NAAM’s adaptive placement. Unlike Nu, NAAM doesn’t migrate in-memory heap state (yet), instead, it ships functions to the data they operate on or uses remote access.
+
+Splinter and systems that build on it execute arbitrary code extensions embedded in a kernel-bypass key-value store and dynamically shift code execution between server and client CPU cores based on CPU congestion
+[
+24
+,
+9
+,
+54
+]
+. In Splinter, a function cannot be migrated without restarting it, and it does not support execution across heterogeneous CPU architectures. These systems address questions about where to place execution, but, unlike NAAM, these placement decisions have to be made using software-based dispatchers rather than reconfiguring the hardware load-spreading features of NICs, and they don’t use SmartNICs. AIFM is a far-memory system that uses a limited set of pre-defined operations that are accelerated via running at remote memory nodes
+[
+40
+]
+.
+
+Next, we describe NAAM’s approach for developing efficient application-defined remote memory operations that scale to hundreds of tenants with dynamic load balancing across machines and commodity off-path SmartNICs.
+
+3
+NAAM Design
+
+Figure 1:
+NAAM messages run application-defined functions on server-side state, and NAAM can adaptively run them on \scriptsize\sfA⃝ client CPUs, \scriptsize\sfB⃝ a server-side SmartNIC, or \scriptsize\sfC⃝ server-side CPUs.
+
+NAAM (
+network-accelerated active messages
+) is a framework and runtime that allows applications to define custom remote memory operations whose processing is transparently offloaded between host and SmartNIC CPU cores. To overcome the limitations of existing frameworks that allow custom remote memory operations or that offload logic to SmartNICs, NAAM’s design centers around five key goals:
+
+Programmability.
+
+NAAM remote memory operations are written in C and include arbitrary application code that can affect remote state. Messages can trigger simple RDMA-like operations, or they can perform complex operations like hash table or B-tree lookups. Applications use a standard RDMA-like interface in NAAM code to access state stored at servers.
+
+Efficiency.
+
+NAAM message code
+is compiled to eBPF bytecode and just-in-time compiled for each CPU architecture the message is processed on. This ensures that even application-defined logic in the messages runs at near-native speed whether running on a host x86 CPU or on a SmartNIC. We use eBPF due to its portability, security, isolation, and its proven support for a wide variety of network applications.
+
+Transparent Function Movement.
+
+eBPF ensures that each NAAM message’s associated code is portable; NAAM code is written once and can run anywhere. NAAM also ensures that each message captures the whole state of its running code. This allows load and processing to be redirected by simply redirecting packets. NAAM’s novel eBPF extensions let it efficiently suspend and resume code (§
+3.3
+).
+
+Non-blocking Memory Access.
+
+Message code is inexpensive to suspend and messages are self-contained, so NAAM provides a novel RDMA-like interface to remote memory that avoids blocking, waiting, or synchronizing on data access.
+When remote data is needed, NAAM suspends execution of the message’s code, forwards it to the location where the data resides, and resumes it there.
+Messages run in a non-blocking fashion at each location until they are forwarded to fetch data, leading to a natural and efficient implementation of NAAM as a software switch.
+NAAM uses multicore and kernel bypass to efficiently fetch message batches, processes them in FIFO order, and forwards them to the data they wish to access.
+
+Multi-tenant Scaling.
+
+Many applications may define custom operations. NAAM uses eBPF to isolate them from one another rather than hardware paging mechanisms, which are costly to reconfigure. This lets NAAM scale to orders of magnitude more custom operation types than existing approaches.
+
+Figure
+1
+shows how NAAM messages are processed. Due to the portability of NAAM functions, each message’s function can be executed anywhere the message encounters idle compute along the path despite the differences between the platforms. This includes \scriptsize\sfA⃝ client CPU cores, \scriptsize\sfB⃝ server CPU cores, or \scriptsize\sfC⃝ the SmartNICs that might sit in between them.
+
+With the help of hardware flow steering, NAAM messages can be dynamically redirected to idle compute for the same cost as a simple network packet. This allows NAAM functions to adapt and provide high performance in the face of changing conditions in the data center environment, including host CPU, SmartNIC CPU, and network utilization even down to sub-second timescales (§
+3.5
+).
+
+3.1
+NAAM Architecture
+
+Figure 2:
+NAAM runs as a software switch on host or SmartNIC cores. NIC hardware balances NAAM messages across receive queues, one per device CPU core. Messages are processed by NAAM’s uBPF module, which runs the JIT-compiled eBPF code for each message and then forwards the message to the UDMA module if data access is needed. UDMA reads or writes the memory region, and then forwards the message back to uBPF to finish processing until the message’s code completes.
+
+To use NAAM, applications link to a
+libnaam
+library. Servers run one instance of the NAAM runtime on their host CPUs and another on their SmartNIC (Figure
+1
+); these instances coordinate to decide how to split work between them. Each instance runs as a software switch that processes NAAM messages using DPDK and an augmented verison of the uBPF userspace eBPF runtime
+[
+7
+]
+(Figure
+2
+).
+
+The client library lets applications create
+memory regions
+that hold application data in NAAM. Each memory region resides in host memory or SmartNIC memory. Clients also use this library to register NAAM code for their application, which they provide as an ELF file that contains an eBPF function whose signature matches the signature of Linux’s XDP in-kernel packet processing hook. These functions can be expressed in arbitrary C code (or in other languages that target eBPF), and they can access registered NAAM memory regions (via
+UDMA
+s, §
+3.3
+). Each registered function receives a unique function ID and destination UDP port number. Registration runs an eBPF verifier over the function before installing it and JIT-compiling in each instance’s uBPF module.
+
+After registration, the client can send NAAM messages that are tagged with the ID and port of that function. Instances of the NAAM runtime that receive this message run the function associated with the message using their uBPF module. These functions are passed an XDP context that refers to the NAAM message, so the code associated with a NAAM function operates on and transforms the NAAM message itself.
+
+Generally, if a client sends a NAAM message to a server, the NAAM runtime at the server’s SmartNIC receives the message first. NAAM configures the NIC hardware load balancer to divide work among available CPU resources; this includes CPU cores both on the SmartNIC and the host CPU. Each CPU has a dedicated receive queue and processes NAAM messages independently of the other CPU cores.
+
+Whenever a function running in a uBPF module requests data from a memory region, the function is suspended and its state is captured into the message. Then, the message is forwarded to a UDMA module on the server where the requested data resides, which reads or writes the requested data from the memory region. Afterward, the message is recirculated to NAAM’s uBPF module to resume executing the function. Once the function completes, the resulting (transformed) message is transmitted back to the client via the core’s transmit queue.
+
+This design meets NAAM’s key goals. It is programmable and efficient: NAAM messages contain arbitrary code JIT-compiled to the underlying architecture, eBPF’s portability ensures NAAM can steer messages anywhere for execution, and its scheme for function migration allows NAAM cores to forward the message to the data it wants to access rather than holding the message while awaiting remote data. Next, we describe NAAM’s memory regions and its UDMA operations in detail, then we describe its load balancing; finally, we describe NAAM’s security model.
+
+3.2
+Memory Regions
+
+NAAM memory regions are allocations of memory that can be accessed by NAAM messages to store application state. Each region has a unique ID and a fixed size, and it can reside in the host’s local memory or on-NIC memory. Applications use a control-plane RPC to a NAAM service to create memory regions. Afterward, these regions are globally addressable by NAAM functions via their memory region ID and offset. Memory regions are implemented using shared memory so NAAM runtime instances can access them from any core. If a NAAM message is running on SmartNIC cores and it requests access to a memory region in the host CPU’s memory, then the access is performed using DMA from the NIC.
+
+3.3
+UDMA
+
+NAAM messages may need to access server-side state wherever they run, which NAAM’s
+universal direct memory access
+(UDMA) interface provides.
+All external state accesses by NAAM functions happen through eBPF helper functions that trigger UDMA operations, which have similar semantics to RDMA operations. However, unlike RDMA operations, UDMA operations are executed differently depending on where they are triggered. When running on the client, UDMA operations trigger remote DMA operations to the server; when running at the server’s SmartNIC they trigger local DMA operations over PCIExpress; and when running at the server CPUs they manifest as local
+memcpy
+s. This ensures that all state accesses use one interface regardless of where the message’s code executes while eliminating the overhead of full RDMA operations when possible. Hence, the same eBPF function can be used to access state regardless of where the function is executed, providing a unified programming model for writing remote memory applications. Stateful applications can be written once, compiled to eBPF, and run anywhere.
+
+3.3.1
+UDMA Interface
+
+struct addr_t
+{u8  region_id;  u64  offset};
+
+APP_REGION
+(void *msg)
+\rightarrow
+(size_t, void*)
+
+Get offset and pointer to usable packet buffer region.
+
+UDMA
+(xdp_md *ctx,  addr_t  dst,  addr_t  src,  u64  len)
+\rightarrow
+u8
+
+Copy len bytes from src to dst. Returns 0/1 on success/failure.
+
+UCAS
+(xdp_md *ctx,  addr_t  dst, u32  old,  u32  new)
+\rightarrow
+u32
+
+Atomic compare-and-swap; *dst = new if *dst == old.
+
+Returns *dst from before swap.
+
+UFAA
+(xdp_md *ctx,  addr_t  dst,  u32  val)
+\rightarrow
+u32
+
+Atomic add; *dst += val. Returns *dst from before add.
+
+Table 2:
+API for Network-accelerated Active Messages
+
+Table
+2
+lists the interface that NAAM exposes to NAAM functions to perform UDMA operations.
+
+Read/write.
+
+A NAAM message uses
+UDMA(ctx, src, dst, len)
+to move data to/from a memory region and its message buffer (Table
+2
+).
+src
+and
+dst
+each specify a memory region id and an offset into it. Memory region 0 is special; it always refers to the message’s own buffer. Commonly, UDMA operations specify a destination with memory region 0 with offset
+APP_REGION(msg).offset
+; this copies bytes out from the source memory region stored at the host, letting the message code access it via its buffer, similar to an RDMA READ. Flipping the source and destination moves data from the message to the host memory region, similar to an RDMA WRITE.
+
+Atomic Operations.
+
+UCAS
+and
+UFAA
+perform atomic compare-and-swap and atomic fetch-and-add operations on a 32-bit value in a memory region. These operations execute native atomic operations on the host memory if the function runs on the host. Otherwise, they perform atomic operations over DMA/RDMA if the function runs on the NIC. This only works if the NIC supports either atomic DMA operations or RDMA atomics. If one of these isn’t supported, atomic operations are forwarded to the UDMA module at the correct host CPU, leveraging NAAM’s location independence.
+
+⬇
+
+1
+
+typedef
+
+struct
+
+__attribute__
+((
+__packed__
+))
+
+{
+
+2
+
+u32
+
+val
+;
+
+//
+
+Value
+
+in
+
+the
+
+linked
+
+list.
+
+3
+
+u32
+
+next_off
+;
+
+//
+
+Next
+
+node
+
+offset
+
+in
+
+memory
+
+region.
+
+4
+
+}
+
+llnode_t
+;
+
+5
+
+6
+
+//
+
+Returns
+
+last
+
+node
+
+in
+
+linked
+
+list
+
+stored
+
+in
+
+a
+
+memory
+
+region.
+
+7
+
+SECTION
+(
+"xdp"
+)
+
+8
+
+u64
+
+prog
+(
+struct
+
+xdp_md
+
+*
+ctx
+)
+
+{
+
+9
+
+//
+
+Prove
+
+to
+
+the
+
+verifier
+
+no
+
+out-of-bounds
+
+accesses.
+
+10
+
+if
+
+(
+ctx
+->
+data
+
++
+
+offsetof
+(
+req_pkt_t
+,
+
+ctx
+->
+data
+)
+
++
+
+sizeof
+(
+llnode_t
+)
+
+>
+
+ctx
+->
+end
+)
+
+return
+
+1;
+
+11
+
+12
+
+//
+
+Refers
+
+to
+
+the
+
+head
+
+node
+
+at
+
+the
+
+start
+
+of
+
+memory
+
+region
+
+1.
+
+13
+
+addr_t
+
+src
+{1,
+
+0};
+
+14
+
+//
+
+Refers
+
+to
+
+the
+
+app-usable
+
+region
+
+of
+
+NAAM
+
+message
+
+buffer.
+
+15
+
+addr_t
+
+dst
+{0,
+
+APP_REGION
+(
+msg
+).
+offset
+};
+
+16
+
+17
+
+for
+
+(
+u32
+
+i
+
+=
+
+0;
+
+i
+
+<
+
+16;
+
+i
+++)
+
+{
+
+//
+
+16
+
+max
+
+len
+
+bounds
+
+loop.
+
+18
+
+//
+
+Read
+
+node
+
+from
+
+the
+
+memory
+
+region
+
+to
+
+message
+
+buffer.
+
+19
+
+u8
+
+ret
+
+=
+
+UDMA
+(
+ctx
+,
+
+dst
+,
+
+src
+,
+
+sizeof
+(
+llnode_t
+));
+
+20
+
+if
+
+(
+ret
+
+==
+
+1)
+
+return
+
+1;
+
+//
+
+Return
+
+failure.
+
+21
+
+22
+
+//
+
+Fetched
+
+node
+
+is
+
+now
+
+in
+
+the
+
+message
+
+buffer.
+
+23
+
+llnode_t
+
+*
+node
+
+=
+
+(
+llnode_t
+
+*)
+APP_REGION
+(
+msg
+).
+addr
+;
+
+24
+
+if
+
+(
+node
+->
+next_off
+
+==
+
+-1)
+
+break
+;
+
+//
+
+Found
+
+end.
+
+25
+
+26
+
+//
+
+Next
+
+node
+
+in
+
+the
+
+list.
+
+27
+
+src
+.
+offset
+
+=
+
+node
+->
+next_off
+;
+
+28
+
+}
+
+29
+
+return
+
+0;
+
+30
+
+}
+
+Listing 1:
+Linked list traversal as a NAAM function.
+
+3.3.2
+UDMA Example
+
+Listing
+1
+shows example NAAM message code that implements traversal of a linked list stored in memory region 1 on a host. On line 13, offset 0 in the memory region 1 is set as the source address, which is the address of the head node in the linked list. On line 15, the message-usable region of the buffer is set as the destination. Line 19 sets up a UDMA descriptor in the message buffer with
+src
+and
+dst
+for length 8, which is the size of each list node. Once
+UDMA()
+creates the descriptor, it forces the code to yield back to the NAAM runtime, which forwards the message to the UDMA module. The UDMA module copies the requested data into the message, and it forwards the message to the uBPF module, which resumes execution of the message code where it left off. The code extracts the next node’s offset (Line 27), and this repeats until the end of the list has been reached (Line 24), or
+MAX_LEN
+iterations have occurred.
+
+This code is compiled to eBPF bytecode and sent to all the locations where the function will be executed.
+UDMA()
+will perform local memory accesses if the function runs in the host or DMA if the function runs on the NIC. If the code runs at the client
+UDMA()
+will fetch nodes from the host memory.
+
+Figure 3:
+\scriptsize\sf1⃝ Clients send NAAM messages. The NIC forwards the message to where it will be executed. \scriptsize\sf2⃝ The uBPF module executes it; it forwards the message as a reply to the client if the function exits, \scriptsize\sf3⃝ otherwise, on UDMA operations the uBPF module stores the function state into the message, sets up a UDMA descriptor and forwards the message to a UDMA module. \scriptsize\sf4⃝ After the UDMA module fills the message with requested data, it forwards the message back to the uBPF module. \scriptsize\sf5⃝ The uBPF module uses the function state in the message to resume at the next instruction.
+
+3.3.3
+Non-Blocking UDMA Execution
+
+A key challenge with UDMA operations is that they can vary in response time depending on where NAAM functions are run. Stalling the processing of a NAAM message to await remote operations could result in head-of-line blocking or high synchronization costs to suspend operation on one NAAM message to start processing another. Having deep queues of packets awaiting remote operations is costly.
+
+To avoid this, NAAM adds new eBPF functionality to support functions that cooperatively yield while saving register and stack state. NAAM messages store this register and stack state directly in the message’s packet buffer (Figure
+3
+, \scriptsize\sf1⃝).
+Whenever a NAAM message calls
+UDMA()
+to access a memory region, a descriptor is added to the message buffer indicating what data should be read or written by the operation (\scriptsize\sf2⃝). Then, the runtime saves the running state of the function into the message, and the whole message is sent to a UDMA module where the region resides (\scriptsize\sf3⃝). The UDMA module copies the requested data based on the descriptor in the message (\scriptsize\sf4⃝). Finally, the UDMA module recirculates the message to a uBPF module (generally on the node where the UDMA completed) (\scriptsize\sf5⃝), and the function can be seamlessly resumed after the requested data has been copied into the NAAM message.
+
+In some circumstances, NAAM’s uBPF and UDMA module can be separated by the network.
+The function can be resumed on a different machine or different CPU architecture. Hence, unlike most approaches where suspended code must await and synchronize with remote responses for data, NAAM messages are self-contained. This allows them to be processed from FIFO queues without introducing stalls or extra overhead. On remote access, execution is suspended into the NAAM message, and the entire message can be forwarded to the data and resumed there (or elsewhere).
+
+For example, NAAM also supports running functions at the client’s CPUs. In this case, the uBPF module runs as part of the client’s
+libnaam
+code, which then forwards messages to a remote server’s UDMA module in order to perform remote state accesses. It is also possible that a function running on one device wishes to access a memory region stored on another device, in which case the NAAM message must be forwarded between the uBPF module on one machine and the UDMA module on another.
+
+When a UDMA module on a SmartNIC must access state stored in a memory region stored in host memory,
+it uses local DMA over PCIExpress instead of
+memcpy
+. On the BlueField-2, DMA operations have roughly 3.5 µs latency, so NAAM takes advantage of this context switch mechanism to pipeline them. While one batch of NAAM messages is awaiting the completion of DMA operations in the UDMA module, the uBPF module executes the functions for another batch of NAAM messages. This helps hide the cost of DMAs that functions trigger from a SmartNIC to access host memory.
+
+Cooperative Yields.
+
+Each NAAM message buffer contains network headers followed by program state, consisting of a stack, register values, and a program counter (Figure
+3
+). The rest of the buffer is accessible to the program to use as inputs or scratch space. One register always holds a pointer to an XDP context, which contains a pointer to the message buffer; another register holds the uBPF VM stack pointer.
+
+When the VM starts a function, it loads the VM registers from the buffer, loads the buffer’s stack area into the stack pointer register, and executes the function from the first instruction. Directly using the stack from the message buffer eliminates the need to copy the stack when suspending and resuming the program. This reduces state copy overhead in yield points when the function is suspended and resumed.
+
+When
+UDMA()
+is called, the active program counter and register values are copied into the message buffer, including the stack pointer, so nothing more has to be done for the stack. The parameters to
+UDMA()
+are used to form a UDMA descriptor in the buffer. Then, the message buffer is forwarded to the UDMA module. After the UDMA completes, this or another uBPF module can resume the function by restoring the registers and stack pointer. For JIT-compiled eBPF, we append context-restoring code to the start of the program, and we inject context-saving code at every yield point.
+
+On resuming from these context switches, NAAM can run the program on any uBPF module. For example, part of a NAAM program can run on the SmartNIC, and then it can be resumed at the host, even if their CPU architectures differ. Furthermore, since UDMA parameters are stored inside the packet buffer, uBPF modules and UDMA modules can live across machine boundaries from each other. For example, the uBPF module can run eBPF code in the client, and the DMA module can run in the server SmartNIC, which would give RDMA-like execution to the function. Alternatively, a uBPF module may run together with a DMA module, which would give the program RPC-like execution, where the program and the data it accesses are local and co-located.
+
+3.4
+Hardware-Assisted Load Balancing
+
+To enable dynamic placement of NAAM functions, NAAM messages must be quickly and efficiently steered to the locations where they will be executed. Commodity off-path SmartNICs support hardware flow steering to redirect traffic from the NIC physical port to host CPU cores, to SmartNIC cores, or both. Openflow
+[
+31
+]
+rules can be installed to program the flow steering hardware. Initially, low-priority rules are installed on the hardware to redirect all the traffic to the SmartNIC cores. Then, if the SmartNIC cores are overloaded, new rules are installed with a higher priority to redirect a fraction of the traffic to the host. Redirecting traffic shifts load from one place to another as it moves function execution from one place to another. Traffic is matched based on the UDP source port numbers to divide it up. For example, consider ten flows with ten different source port numbers coming from the clients and going to the SmartNIC. If the SmartNIC is overloaded, an OpenFlow rule will be installed in the flow steering hardware to send one of these flows to the host. This moves 10% of the traffic to the host and removes 10% load from the SmartNIC cores. On the other hand, if the SmartNIC cores are underloaded, this rule can be deleted to move 10% of the traffic from host CPU cores to SmartNIC CPU cores.
+libnaam
+at each client chooses UDP source port numbers in a fashion that helps the matching for hardware flow steering.
+
+3.5
+Resource Monitoring and Load Shifting
+
+NAAM provides system designers with a framework for implementing policies to automatically move functions based on workload requirements and system resource usage.
+
+To help with this, NAAM tracks the time messages spend in NIC receive queues using
+NIC hardware timestamping.
+Each time a NAAM message is received, it stores the NIC’s clock cycle count in a metadata field in the message.
+The NIC and the CPU clock have different frequencies. On NAAM initialization, the difference between the clocks is determined. Each time the clocks are used, NAAM compensates for the frequency difference in order to determine message queuing delay.
+Reading the timestamp for each message is costly, so NAAM reads the timestamp of one message from each batch.
+
+NAAM calculates the average queue time in 10 ms windows. If three consecutive windows out of five are above a threshold, then NAAM decides that the host is overloaded, and it installs rules in the NIC flow steering hardware to move a fraction of the load to the NIC. We have used this mechanism to detect whether there is interference from another application in a latency-critical NAAM application. When there is interference, NAAM function execution is moved to SmartNIC cores.
+
+NAAM also monitors packet loss which can be used as a signal for reconfiguring how messages are steered between host and SmartNIC cores. To give NAAM’s monitors a global view, a monitoring daemon on the host CPUs pushes statistics to the NAAM monitoring daemon on the SmartNIC which makes reconfiguration decisions.
+
+3.6
+Security
+
+NAAM functions are associated with specific memory regions, and all accesses that an invocation of a function makes are restricted to target (a) the invocation’s private register file or stack (stored in its message buffer) or (b) an authorized memory region for that function via UDMA operations. To achieve this, NAAM relies on five key properties.
+
+Memory Safety.
+
+First, NAAM relies on eBPF to ensure running NAAM function code can only access the function’s VM state or call UDMA helper functions.
+The Linux eBPF runtime
+[
+3
+]
+has a verifier that statically checks the memory and type safety of a program to ensure it can only access its own stack and register state and that it respects the expected calling conventions for trusted kernel helper functions. Since the Linux eBPF verifier isn’t easy to extract from the Linux kernel, NAAM provides these guarantees using the PREVAIL eBPF verifier
+[
+15
+]
+, which it runs in userspace at function registration time. PREVAIL works unchanged on NAAM messages that contain no yield points; however, yield points create a special challenge. Specifically, a function invocation’s stack and register file state can move (in memory or even between nodes) in between the yield and resume, creating challenges for pointers that are embedded in the saved stack and registers. We discuss how our extensions to PREVAIL’s verifier solve this issue safely and efficiently in Section
+4
+.
+
+Memory Region Allow-Lists.
+
+Second, each UDMA engine keeps an allow-list of functions that can access each memory region. Since functions cannot tamper with state outside of their VM and memory regions, they cannot tamper with the allow-list or the function ID associated with their execution.
+
+VM State Initialization.
+
+Third, NAAM uses a trusted module that maps UDP destination ports in client messages to function IDs and ensures that the message buffer contains an initialized and “zeroed” state for the message’s function execution including its registers and stack. This ensures each client request message first enters its NAAM function in the same state that the verifier assumed when statically checking the safety of the NAAM code. NAAM’s eBPF runtime ensures that functions cannot directly tamper with the regions of their message buffer that contain VM state (e.g. via pointers or UDMAs), which ensures the verifier’s assumptions are upheld. NAAM performs no special authentication of incoming messages targeting NAAM functions’ associated UDP port numbers; any message targeting a function’s associated UDP port number is allowed to execute after safe VM state initialization. Hence, if application-level access control policies are needed, NAAM function code is expected to enforce them.
+
+Migration Integrity.
+
+Fourth, whenever a NAAM function’s execution is suspended and forwarded to another node to continue execution, the NAAM runtime sends the message to a special destination UDP port number on the target node. This acts as a flag indicating that the VM state was generated by another NAAM node and that it represents a valid suspended state for the function associated with the message. Clients should not generate messages with this destination UDP port number, since they might craft arbitrary saved register and stack state that would violate the verifier’s assumptions and could lead to unsafe execution. One way to enforce this is to trust network source and destination addresses and to have NAAM nodes reject messages targeted to this specific UDP port number unless they are generated by another known NAAM node. Our current implementation does not make this check; instead, we trust clients not to send messages directly to this UDP port number. Since NAAM functions can modify message headers, they could craft packets that target this UDP port number. To prevent this, NAAM checks the UDP destination port after each function yield and it discards any message that has this special UDP port number as its destination.
+
+Network Trust Model.
+
+Finally, NAAM trusts the network for any secrecy and integrity properties that the operator desires. For example, if the network or a node attached to the network modifies the function ID, destination port number, or VM state of any NAAM message, NAAM’s safety guarantees breakdown. In networks without this trust, connections between the NAAM nodes and between their clients and the nodes would need to be protected e.g. via TLS.
+
+4
+Implementation
+
+NAAM’s self-contained and stateless messages leads to a natural implementation of the NAAM runtime as a platform-agnostic virtual switch where these stateless messages can flow between different operational components of the switch. NAAM is implemented on top of the BESS virtual switch
+[
+1
+]
+. BESS is kernel bypassed, high-performance, easily extensible, and modular. Each BESS module implements a specific NIC feature and can send/receive packets from other modules. Pipelines are created by composing these modules. We have added the uBPF module to execute eBPF bytecode and UDMA modules for performing location-independent memory accesses. Additionally, we have ported BESS to the ARM architecture so that it can be run on both x86 and ARM platforms to make it a platform-agnostic virtual switch. The uBPF module uses uBPF
+[
+7
+]
+, a userspace implementation of an eBPF virtual machine for executing eBPF bytecode. We have modified the interpreter and the x86 and ARM JIT compiler to support cooperative yield via helper function calls that save/restore contexts to/from NAAM messages.
+
+Cooperative yield.
+
+To implement cooperative yield, we augmented uBPF’s interpreter and JIT-compiler. Each yield returns twice. The first is when
+UDMA()
+is called. An eBPF
+ret
+instruction is executed that passes a return code (via
+r0
+) to the uBPF module to signal that the function has yielded and that the message should be forwarded to the UDMA module. Then, when the message comes back from the UDMA module, after restoring the state from the message, the status of the UDMA operation is assigned to
+r0
+, and the function resumes after the previous
+ret
+. From the running function’s perspective, this final value of
+r0
+is the return value of the
+UDMA()
+call.
+
+Implementing this on the eBPF interpreter is easy as the full state of the running function is available; however, implementing this in the JIT compiler is more challenging as access to the program state is limited. For example, to save or restore program state, the JIT-compiled code needs access to the message. By convention,
+r1
+contains a pointer to the context, which contains a pointer to the message, but this register is also one of the five registers used to pass parameters to eBPF helper functions. So, before calling a helper function, the eBPF compiler always moves context pointer to another register. To solve this problem, the first argument to the yielding call is always a pointer to the context; this ensures that
+r1
+will hold a pointer to the context upon yield.
+
+Message Buffer Relocation.
+
+One challenge with resuming yielded functions is that the location of the message buffer might change before and after a yield point. For example, a function could begin executing on one machine; after a yield, the NAAM message could resume on another machine where the location of the message buffer has changed in the address space of the NAAM runtime. Without care, this could lead to incorrect function behavior, and it could allow functions to access and corrupt arbitrary state in the NAAM runtime.
+
+To solve this issue, NAAM uses a combination of extensions to its eBPF verification and to its runtime. At a high level, it uses the verifier to assess which registers and stack locations contain pointers to locations in the message buffer. NAAM function compilation takes this information as input to generate correct relocation code; on yield and resume, the code injected during compilation informs the runtime of which addresses need relocation to ensure they refer to the correct, inbound offsets in the new message buffer.
+
+In more detail, the yielding UDMA calls in Table
+2
+have a corresponding internal implementation helper function that takes an extra 64-bit vector as an argument. This vector indicates which saved registers and stack locations contain pointers that need relocation on resume. Only four registers from
+r6
+-
+r9
+need to be checked, since they are the callee save registers; the other registers can be zeroed out when resuming at a yield point. The four least significant bits of the vector correspond to these registers; the remaining 60 bits correspond to the first 60 naturally-aligned eBPF stack locations, which are the only stack locations that can hold pointers. However, in practice there are 64 stack locations (in eBPF’s standard 512 B stack); if our verifier encounters a message buffer pointer in the last 4 potential stack locations it rejects the function. This is safe, but it disallows some otherwise safe functions that yield while holding pointers on their nearly full stack. This could be solved by passing a longer vector to each yielding call, but no function that we wrote in the course of this work spilled a message buffer pointer to
+any
+location on the stack, so this hasn’t been a concern thus far.
+
+If a bit is set in the bit vector that means the corresponding register or stack location contains a pointer to the message buffer or stack and it needs relocation. Running NAAM’s PREVAIL-based verifier outputs information indicating the needed register and stack information for each yield. A script parses this information and constructs the vector for each UDMA call. Then the NAAM function is recompiled with the correct bit vector for each UDMA call. At runtime, NAAM uses this vector together with the saved
+r1
+which contains the old message buffer location to do relocation as follows:
+state[i] = new_r1 + (state[i] - r1)
+
+where
+state[i]
+contains the corresponding register or stack location. Then, the new message buffer address is assigned to
+r1
+, and the function is resumed from the next instruction.
+
+Atomic UDMA operations.
+
+To perform atomic operations from the NIC on host memory, the NIC must support atomic DMA operations or RDMA atomics. The BlueField-2 DOCA library does not expose atomic DMA operations
+[
+4
+]
+. RDMA atomics support two modes
+[
+6
+]
+;
+IBV_ATOMIC_HCA
+guarantees atomicity on-device, which is insufficient to synchronize with host CPU operations, and
+
+IBV_ATOMIC_GLOB
+, which synchronizes across host CPU and devices. The BlueField-2 supports
+IBV_ATOMIC_GLOB
+, but we were unable to get it to work despite using it on a supported PCIe configuration.
+To solve this,
+UCAS
+and
+UFAA
+operations are forwarded to the UDMA module on the host with the corresponding memory region.
+
+NIC flow steering rules.
+
+NAAM uses NIC hardware flow steering to shift computation between host and SmartNIC resources.
+To support fine-grained compute movement, we considered three approaches to configure the flow steering rules. The first uses OpenFlow weighted group bucket rules
+[
+5
+]
+which allow NAAM to directly control the fraction of traffic sent to the host and NIC.
+The rule can be updated to adjust the fraction. The second uses OpenFlow range-based rules
+[
+5
+]
+, where a range of flows can be specified to split traffic. By controlling the range, traffic can be split between the host and NIC. This requires updating two rules to update the split. Our experiments showed significant packet loss with both approaches since these rules trigger software paths on the SmartNIC. Hence, NAAM uses a one-rule-per-flow approach; this approach moves traffic in sufficient enough granularity with a modest number of flows. With ten rules and ten flows, compute can be moved at 10% granularity.
+
+5
+Evaluation
+
+To evaluate NAAM, we use both synthetic applications and real-world workloads – MICA, an efficient hash table
+[
+26
+]
+and a B-Tree similar to Cell
+[
+33
+]
+. We seek to answer these questions in evaluating NAAM:
+
+1.
+
+How does NAAM compare with the state-of-the-art SmartNIC offloading frameworks (iPipe)
+[
+27
+]
+?
+
+2.
+
+Does dynamic offloading allow a server to scale beyond the throughput it can achieve with CPU cores alone?
+
+3.
+
+Can dynamic offloading react quickly enough in response to load changes to avoid bottlenecks?
+
+4.
+
+Can NAAM mitigate CPU interference on host CPU cores by quickly detecting and reacting to interference?
+
+5.
+
+What is the trade-off for running NAAM functions in different locations (client side, server side, and server side with automatic SmartNIC offload enabled)?
+
+6.
+
+Can NAAM prevent crashes due to functions with bugs?
+
+7.
+
+What is the cost that eBPF adds to NAAM functions compared to using natively compiled code?
+
+8.
+
+How does NAAM compare with RDMA on applications?
+
+Experimental Setup.
+
+All experiments use two machines, one acting as a client and another acting as a server. The client machine has two 12-core Intel Xeon Silver 4310 CPUs, 128 GB RAM, and an NVIDIA ConnectX-6 100 Gbps NIC. The server has the same CPUs, 256 GB RAM, and an NVIDIA BlueField-2 200 Gbps SmartNIC. Both NICs use a PCIe
+\times
+16 link. The SmartNIC runs firmware v24.37.1014, DPU BSP v3.9.3 as the OS, and NVIDIA DOCA library v1.5.0. It is set to run in SmartNIC mode with hardware offloading enabled. This reduces the latency since, initially, all flows go to its ARM cores, but subsequent packets are directly passed from the hardware switch to the destination cores without routing through the ARM cores first. One port on the SmartNIC is connected directly via Ethernet to a 100 Gbps port on the client machine’s NIC without an intervening switch.
+
+The client uses DPDK v20.11 LTS to generate load in an open loop.
+All SmartNIC experiments process messages on six of the eight SmartNIC cores; the other two cores are used for NAAM control plane services.
+
+5.1
+Scaling to Many Functions
+
+Figure 4:
+Multi-tenancy scaling for iPipe and NAAM.
+
+Multi-tenancy is important in data centers since many co-located applications run together on shared hardware. Since NAAM’s eBPF-based approach to function isolation doesn’t require special hardware support, it scales independently of CPU cores, address-space identifiers, or other hardware-limited resources. This distinguishes NAAM’s approach from other state-of-the-art SmartNIC offloading approaches.
+
+For example, iPipe is a state-of-the-art actor-based approach to offloading functions to SmartNICs. Its actor-based model is attractive for NAAM-like applications since actors can be small, and the state they act on can be explicitly contained in each actor. However, iPipe’s inter-actor isolation model relies on specialized hardware features specific to Marvell’s Liquid IO II on-path SmartNIC. Specifically, iPipe establishes separate TLB entries for each actor in a software-managed TLB on the SmartNIC’s MIPS cores. This allows each SmartNIC core to receive a packet and then run code on behalf of any actor without the high cost of address space switching required in Linux on conventional CPU architectures like Intel and ARM. NAAM’s approach avoids the cost of address space switching by using eBPF for isolation rather than unconventional address translation hardware.
+
+The BlueField-2’s ARM CPUs only support conventional page table switching for address space isolation, so iPipe’s actors must be run as separate processes as the authors suggest
+[
+27
+]
+. Processes’ conflation of threads and address spaces requires context switching between actors that share a core; this requires invoking the Linux kernel scheduler on the BlueField-2, which has a high cost. The result is that iPipe’s performance breaks down if there are more actors than cores on the NIC since frequent context switching is needed.
+
+Figure
+4
+shows this effect. In this experiment, the client sends a low rate of MICA hash table lookup requests to the server; each request is processed entirely at the SmartNIC. The code needed to handle these requests is run by NAAM and our iPipe setup with an increasing number of functions and actors, respectively. The separate buffer pool needed for each iPipe process makes it difficult to run with more than four processes, so these results limit both frameworks to four cores; without this restriction, iPipe could scale to eight actors but its performance would still collapse at 16 actors when there are more actors than SmartNIC CPU cores.
+
+Because NAAM relies on eBPF, many different functions can run on the same thread at low cost. Hence, NAAM’s hardware load balancing at the SmartNIC routes NAAM messages to cores randomly; the core that receives a request runs the associated JIT-ed eBPF function and sends back a response. The results show that NAAM can run a mix of 128 different functions at the same request rate with only a 47.3% increase in 99
+th
+-percentile response latency compared to when all requests target the same function.
+
+The “iPipe” line shows an approach similar to what iPipe suggests for using off-path SmartNICs like the BlueField-2; the original iPipe code only supports on-path SmartNICs. In this set up each actor is run as a separate process. We use the SmartNIC’s hardware load balancer to route incoming packets to the correct actor; each process receives packets from a separate queue, which avoids synchronization costs between the actors to dispatch requests among actors. As the results show, iPipe’s approach works well when only one actor is scheduled per available SmartNIC core, but when there are more inter-isolated actors, the performance breaks down as the kernel scheduler must begin timeslicing the actor processes on cores. This slowdown results in tens of milliseconds of response latency even at low load. Results under higher load would be worse since this context switching also leads to a large throughput loss at higher request rates.
+
+In sum, the state-of-the-art approaches to SmartNIC offloading provide good performance when used to shift remote-memory-style operations to SmartNICs, but CPU paging hardware and context switch overheads prevent them from scaling to more than a handful of inter-isolated functions.
+
+5.2
+Dynamic Load Shifting
+
+Figure 5:
+Impact of hardware flow steering reconfiguration.
+
+To efficiently shift load, NAAM must reconfigure the NIC’s hardware flow steering rules based on CPU load and queuing; implementing this in software would be too costly, and it would use nearly all of the available SmartNIC CPUs.
+To redirect traffic in real time in response to the changing CPU load, NAAM uses a monitoring script on the SmartNIC that detects packet loss at the host and the NIC. The script reconfigures hardware flow steering rules to shift load as needed.
+
+Reconfiguring hardware rules could delay or disrupt ongoing traffic.
+To measure this disruption, we run an experiment where new load balancing rules are installed while under steady load. Figure
+5
+shows the response time of messages that perform a 16 B UDMA writes to server memory over time. Initially, all messages are processed at the SmartNIC; at 15 s a rule is installed to shift 10% of the traffic to the host. The rule takes effect, and queues build over about a 50 ms window (at 15.6 s); after less than 100 ms messages begin processing at host CPU cores, restoring low response times. The shift is fast enough that it induces no loss.
+
+Figure 6:
+Dynamic load shifts prevent SmartNIC overload.
+
+To show that NAAM can continuously shift load between SmartNIC and host CPU cores online as needed, we run an experiment that slowly increases client-offered load from 500,000 MICA ops/s every 5 seconds. The results are shown in Figure
+6
+.
+The circle data points show the total client-observed throughput; the cross data points show the throughput that is due to the ops processed by the server host CPU rather than its SmartNIC. Initially, all the responses are from the SmartNIC.
+At 15 s the offered 2M ops/s exceeds the throughput that the SmartNIC can sustain;
+NAAM detects the resulting packet loss and shifts 10% of the traffic to the host.
+As the offered load increases, more traffic is shifted to host CPU cores. The graph shows that the system scales beyond the 1.8 messages/s that the SmartNIC can process by dynamically shifting load to the host when it is overloaded.
+
+5.3
+Mitigating Host CPU Interference
+
+(a)
+Host CPU; no interference.
+
+(b)
+Host CPU; interference from 10 to 20 s; monitoring off.
+
+(c)
+Adaptive; interference from 10 to 20 s; monitoring on
+
+Figure 7:
+NAAM shifts load to avoid host CPU contention.
+
+Latency-critical networked applications often avoid disruptions due to kernel thread scheduling decisions by dedicating CPU cores to applications. Even so, these disruptions can occur, especially when a server’s CPU becomes oversubscribed. For example, a Spark job might be scheduled on a CPU core ordinarily used for processing requests to a networked key-value store. NAAM’s ability to flexibly move message processing by rerouting or retransmitting a message makes it well-suited to solving this temporary interference.
+The main challenge in doing this is that NAAM must quickly detect this interference, and its changes to hardware flow steering rules need to take effect quickly to avoid disruption (§
+3.5
+).
+
+Figure
+7a
+shows the tail latency of a NAAM application running on one host CPU core without interference; Figure
+7b
+shows the same application when it must be scheduled with another thread on the same core. This spikes tail latency by three orders of magnitude: from 25 µs to 20 ms. In Figure
+7c
+, NAAM quickly detects interference for such cases; within 500 ms, it moves execution from the host to the SmartNIC.
+
+5.4
+The Impact of Placement
+
+Figure 8:
+Cost of running MICA lookups from different locations.
+
+NAAM messages have the same semantics wherever they run, but the latency and cost of their UDMA operations differ for each application and execution location. Figure
+8
+compares using NAAM messages to perform MICA hash table lookups when messages are run on a client CPU core, on a host CPU core, or on a combination of the host SmartNIC and a host CPU core. Running NAAM messages at the client results in about 3.01 UDMA requests to the host for each NAAM message since it must read at least one hash table bucket along with the correct key-value pair. Running at the host gives better tail response times (2.6-4.0
+\times
+speedup) and improves throughput since UDMA operations don’t result in multiple round-trips between the client and the host.
+Letting NAAM balance across the SmartNIC and host CPU provides tail response times better than client-side operations (up to 1.3
+\times
+speedup). It also allows NAAM to scale beyond what the SmartNIC or host CPU core could each sustain on its own.
+
+5.5
+Handling Faults
+
+(a)
+BESS has availability gaps on faults.
+
+(b)
+NAAM rejects functions with memory safety bugs.
+
+Figure 9:
+NAAM is resistant to faults
+
+eBPF’s safety guarantees ensure that NAAM functions cannot crash its runtime, which could otherwise cause a denial-of-service by forcing software switch restarts. To demonstrate this, we run an experiment where packets that trigger failures are injected into a forwarding application implemented both as BESS module and as a NAAM application. The function that handles each packet accesses a memory location based on a malformed value found in the packet buffer. This triggers a NULL pointer dereference, which crashes BESS. This function is rejected by NAAM since it does not pass the verifier. Figure
+9a
+shows BESS crashing upon receiving the malformed packet and then restarting, which causes it to be unavailable for about 10 s. On the other hand, NAAM is available all the time, even in the face of faulty packets (Figure
+9b
+).
+
+5.6
+The Costs of eBPF
+
+Time (ns)
+
+x86-64
+
+ARMv8
+
+eBPF
+
+eBPF
+
+eBPF
+
+eBPF
+
+Benchmark
+
+Native
+
+Interp
+
+JIT
+
+Native
+
+Interp
+
+JIT
+
+Empty Fn
+
+< 1
+
+25.8
+
+12.4
+
+< 1
+
+103
+
+54.7
+
+Fn Yield
+
+-
+
+91.3
+
+14.8
+
+-
+
+177
+
+54.8
+
+UDMA Rd
+
+8.7
+
+365
+
+35.5
+
+16.5
+
+1511
+
+109
+
+UDMA Wr
+
+11.4
+
+399
+
+26.7
+
+24
+
+1536
+
+125
+
+Table 3:
+Comparison of Basic NAAM operation latency on x86-64 and ARM in C, in eBPF, and in JITed eBPF code.
+
+Finally, to break down the cost that NAAM messages pay to use eBPF for portability and isolation, we profiled several of NAAM’s basic operations. Table
+3
+shows the results for x86-64 (the client and host architecture) and ARMv8 (the SmartNIC architecture). “Native” shows the performance for implementing the listed functionality in C. All UDMA operations are performed against device-local memory (host DRAM on x86-64 and SmartNIC DRAM on ARM).
+
+Our experience and end-to-end benchmarks have suggested to us that each ARM SmartNIC core takes about 5
+\times
+longer to perform operations than an x86 core. The results here corroborate that. Both on x86 and ARM eBPF’s just-in-time compilation to the target CPU architecture improves the performance of operations substantially from 1.9 to 13.8
+\times
+.
+
+Finally, the results show that NAAM’s fast and JITed scheme for suspending function execution from and to a message’s packet buffer is extremely efficient. While function yield and resume accounts for about half of the overhead of a UDMA for an operation that completes against local memory, the cost of suspending and resuming a NAAM function is lower than the cost to set up an RDMA operation (which requires multiple descriptors and DMAs) or the overhead to stall the operation awaiting a response from a remote machine.
+
+5.7
+Cell B-Tree
+
+(a)
+B+tree Lookup Latency-Throughput.
+
+(b)
+B+tree Lookup Data Transmission Rate.
+
+Figure 10:
+B+tree Performance.
+
+To demonstrate NAAM’s performance benefits in a more complete application, we re-implemented the Cell key-value store’s
+GET
+operations
+[
+33
+]
+, which execute against an ordered B+tree stored host memory. The original Cell system used a hybrid RDMA and RPC-based access path, and it used response times to decide between using RPCs that traverse the tree or using multiple RDMA read operations that traverse the tree without server CPU involvement. In our reimplementation, we compare the performance of
+GET
+operations implemented with RDMA only, using the Host CPU only, and on the DPU only. DPU_CACHE is a variant that runs
+GET
+operations from a cache in DPU memory, which can be done in a consistent fashion by having the DPU flush items which are affected by
+PUT
+operations similar to BMC
+[
+16
+]
+.
+
+The tree is populated with 10 M eight-byte keys, making the tree five levels deep. Figure
+10a
+shows that NAAM messages on the Host CPU sustain 1.75 M GET op/s with
+48\text{\,}\mathrm{\SIUnitSymbolMicro s}
+p99 latency. NAAM messages run at the DPU sustain 0.75 M GET op/s with
+286\text{\,}\mathrm{\SIUnitSymbolMicro s}
+p99 latency, which improves to 1.3 M GET op/s with
+375\text{\,}\mathrm{\SIUnitSymbolMicro s}
+p99 latency when the tree is cached in DPU memory. RDMA sustains 1.3 M GET op/s with
+263\text{\,}\mathrm{\SIUnitSymbolMicro s}
+p99 latency. For all of these experiments, the client sends batches of 32 requests (for RDMA these are simply 32 concurrent, pipelined requests). Though RDMA shows similar performance to the DPU when it is using caching, it has an additional cost. RDMA clients must transfer four internal B-tree nodes from the host for each lookup in addition to the leaf page containing the value the client is searching for. Additionally, RDMA-based clients cannot efficiently interpose on all
+PUT
+operations issued by all clients for each key. Hence, they cannot efficiently cache the data they read from host memory to avoid this overhead in the same way that DPU_CACHE does.
+Figure
+10b
+shows the network bandwidth consumed by each of the approaches. At 1 M op/s, NAAM uses 5.8 Gbps (where operations execute at the server or its SmartNIC) while RDMA uses 25 Gbps (
+4.3\times
+).
+
+NAAM gives Cell’s hybrid
+GET
+execution approach more flexibility in where it runs operations. Operations run most efficiently at the Host CPU by avoiding extra round trips and transfers. When the Host CPU becomes congested, NAAM’s SmartNIC DPU can use caching for read-intensive workloads which delivers similar performance to the original hybrid Cell approach without wasting network bandwidth. Finally, NAAM could also combine all three approaches by balancing work across Host CPU, DPU, and RDMA.
+
+6
+Conclusion
+
+NAAM is a new approach to network acceleration that lets applications define simple, portable RPC-like functions over remote data. NAAM implements these functions as active messages that are executed in multiple places in the network efficiently. NAAM is efficient since remote memory accesses never stall its runtime, and it can rebalance load using hardware flow steering. Hence, NAAM scales applications across client, server, and SmartNIC in 100s of milliseconds to avoid bottlenecks and route around transient CPU contention.
+
+7
