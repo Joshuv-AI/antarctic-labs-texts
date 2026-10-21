@@ -1,0 +1,2535 @@
+Dynamic Sparse Attention on Mobile SoCs
+Wangsong Yin ⧫ , Daliang Xu ◇ , Mengwei Xu ◇ , Gang Huang ⧫ , Xuanzhe Liu ⧫
+
+Abstract
+. On-device running Large Language Models (LLMs) is nowadays a critical enabler towards preserving user privacy. We observe that the attention operator falls back from the special-purpose NPU to the general-purpose CPU/GPU because of quantization sensitivity in state-of-the-art frameworks. This fallback results in a degraded user experience and increased complexity in system scheduling. To this end, this paper presents shadowAttn , a system-algorithm codesigned sparse attention module with minimal reliance on CPU/GPU by only sparsely calculating the attention on a tiny portion of tokens. The key idea is to hide the overhead of estimating the important tokens with a NPU-based pilot compute. Further, shadowAttn proposes insightful techniques such as NPU compute graph bucketing, head-wise NPU-CPU/GPU pipeline and per-head fine-grained sparsity ratio to achieve high accuracy and efficiency. shadowAttn delivers the best performance with highly limited CPU/GPU resource; it requires much less CPU/GPU resource to deliver on-par performance of SoTA frameworks.
+
+
+
+1.
+Introduction
+
+On-device Large Language Models (LLMs) has been a critical enabler to privacy-preserving and ubiquitous artificial intelligence.
+Recently, the emergence of mobile-size LLMs like Qwen series
+(
+Bai et al. 2023
+;
+Qwen et al. 2025
+)
+catalyzes killer applications such as content summarization and GUI/API agents
+(
+rew 2025
+;
+Chen and Li 2024
+;
+Xie et al. 2024
+;
+Zhang et al. 2024a
+)
+.
+
+NPU-centric LLM inference.
+
+Mobile devices typically incorporate heterogeneous processors such as CPU, GPU, and NPU.
+Ideally, the LLM inference shall be end-to-end executed on the mobile NPUs with minimal out-of-NPU resources.
+The advantages of such NPU-centric LLM inference are twofold.
+First, mobile NPUs, as dedicated for neural networks, are with high-throughput integer capability and much more power-saving than CPU/GPU
+(
+Xu et al. 2025d
+;
+Sen et al. 2025
+;
+Chen et al. 2025
+;
+Wei et al. 2023
+)
+.
+Second, it avoids resource contention with other general-purpose mobile workloads (e.g., user interaction handling and rendering) that rely on CPU and GPU.
+Co-locating LLM inference with those workloads can easily hamper user experience, adding extra complexity to the system scheduling
+(
+Yi and Lee 2020
+;
+Jeong et al. 2022
+;
+Fu et al. 2022
+;
+Zou et al. 2025
+;
+Tan et al. 2025
+)
+.
+
+However, in practice we find the attention operation in LLMs often falls back to mobile CPU/GPU in state-of-the-art on-device inference frameworks
+(
+Xu et al. 2025d
+;
+MLC team 2025
+;
+Chen et al. 2025
+;
+ggml 2025
+)
+.
+For instance, llm.npu
+(
+Xu et al. 2025d
+)
+offloads the non-attention operations to NPUs; yet the attention still runs on CPUs — not NPU-centric.
+
+Such a compromise is underpinned by the rationale of quantization sensitivity.
+On one hand, activations in LLMs feature much more hard-to-quantize outliers compared to weights
+(
+Xiao et al. 2024a
+;
+Lin et al. 2024
+)
+,
+while the attention operation computes on multiple activation tensors, i.e., the Q, K, V tensors.
+On the other hand, the NPU’s static graph hampers fine-grained quantization.
+It sets superparameters (tensor shape and constants such as scale factor) before compilation for resource scheduling.
+Such a paradigm leads to sharing a fixed scale factor for an entire tensor, further limiting the attention quantization.
+In the following experiments (Table
+3
+), we find that NPU-based attention leads to on average 18 pp accuracy drop on mobile LLMs/tasks.
+This echos the necessity of offloading the attention to CPU/GPU.
+
+NPU-centric LLM inference by sparse attention.
+
+A key opportunity to minimize the reliance on CPU/GPU resource is the the highly sparse feature of attention operations.
+A small portion of tokens can be much more important than others; sparsely computing these tokens can significantly reduce the CPU/GPU computation with almost no accuracy drop.
+As detailed in
+\lx@sectionsign
+2
+, in the Qwen2-1.5B model, on average more than 80% of the tokens are assigned relatively low importance in the WikiText-2 dataset.
+
+Surprisingly, despite the promised advantages, our preliminary results indicate that directly applying sparse attention in LLM inference yields no performance gain, as before the sparse computation can be executed, an estimation stage is required to evaluate token importance, incurring substantial overhead on the CPU/GPU. This stage involves a matrix multiplication to compute attention scores for each token in
+Q
+and
+K
+
+(
+Zhang et al. 2023
+;
+Wang et al. 2021
+)
+. Consequently, the estimation stage dominates the overall attention computation under high sparsity. For instance, with a sparsity ratio of
+20\%
+(i.e.,
+80\%
+of tokens pruned), estimation alone contributes over
+60\%
+of the total overhead, reducing CPU/GPU resource consumption by only about
+20\%
+.
+Intuitively, we can downsample the Q and K for an efficient estimation, yet leading to significant accuracy drop.
+For instance, when eliminating the estimation overhead by grouping adjacent tokens in a block and only computing the block-level importance, the accuracy undergoes an average drop of 4 pp on mobile LLMs/tasks compared to token level sparsity.
+To this end, the key question of
+shadowAttn
+’s design is how to compute sparse attention accurately and efficiently in NPU-centric LLM inference.
+
+shadowAttn
+: Dynamic sparse attention with NPU-based estimation.
+
+In this paper, we propose
+shadowAttn
+, a system-algorithm co-designed on-device sparse attention module for NPU-centric LLM inference while minimizing its reliance on CPU/GPU fallback (e.g., only one CPU core).
+Its key idea is that the estimation of important tokens can be much more resilient to quantization compared to the end-to-end attention.
+The rationale is that determining the important tokens only requires the relative value of attention scores, while calculating the attention’s exact result requires the absolute value.
+Thus,
+shadowAttn
+offloads the estimation to NPU, and transfers the position indices of the important tokens to CPU/GPU for further sparse attention calculation.
+By doing so, only a small portion of tokens are computed on CPU/GPU with high precision float operations.
+Besides,
+shadowAttn
+also identifies the uneven property of each head’s sparsity ratio.
+It determines the ratio for each head by a lightweight offline profiling, further optimizing the accuracy-efficiency tradeoff.
+When designing
+shadowAttn
+, however, we need further
+to address the following major challenges that have not been explored in the existing literature.
+
+(1) The inflexibility of NPU static compute graph.
+
+The software stack of NPUs employs a static compute graph, which specifies the shape and quantization scale factors as constant for offline optimization.
+However, the attention input tensors are highly dynamic;
+their scale factors exhibit large fluctuation.
+The tensor shape may also vary in different cases.
+Directly generating one static compute graph for the attention leads to accuracy drop and under utilization of NPU.
+
+(2) Multi-faceted NP-hard NPU–CPU/GPU scheduling.
+
+The two stages of
+shadowAttn
+’s sparse attention can be overlapped by a head-level fine-grained pipeline on both the NPU and CPU/GPU. However, achieving efficient fine-grained scheduling is non-trival and challenging because (i) the pipeline can be optimized from various deeply buried aspects like NPU kernel fused launching.
+Its performance may be degraded without carefully going through all of these aspects. (ii) the pipeline planning problem is NP-hard.
+
+shadowAttn
+incorporates the following techniques with deep insights towards the aforementioned challenges.
+
+(1) NPU compute graph bucketing
+(
+\lx@sectionsign
+3.3
+).
+To mitigate the limitations of static compute graph,
+shadowAttn
+offline generates multiple graphs and organizes them in buckets for online selection.
+Specifically, a bucket contains graphs with various shapes and the same scale factor of input tensors.
+At online inference stage, the bucket whose scaling factor is closest to that of the input tensor is selected, followed by selecting a graph with an appropriate shape from the bucket.
+
+(2) Head-wise NPU-CPU/GPU pipeline
+(
+\lx@sectionsign
+3.4
+).
+
+shadowAttn
+proposes a head-level pipeline that leverages the following insights.
+Firstly, it overlaps the NPU estimation, CPU/GPU top k operation and CPU/GPU sparse attention with each other.
+On top of this, it launches the NPU kernels with the same scale in one-shot to maximize the NPU utilization, and carefully plans the execution order of each head to minimize the pipeline bubbles.
+To achieve fast on-device planning, it simplifies the NP-hard planning complexity by a heuristic greedy search, which selects the head that minimizes the pipeline latency at each step.
+
+Implementation and Evaluation.
+
+We prototype
+shadowAttn
+in over 10,000 LoC of C++/Python.
+We test
+shadowAttn
+on commercial-off-the-shelf smartphones MI14 and Redmi K60 Champion Edition with snapdragon 8gen3/8gen2 equipped.
+We only use one CPU core for necessary control flow and sparse compute, with other compute completely on NPUs.
+
+We test both the breakdown performance of the attention module and the end-to-end performance of integrating
+shadowAttn
+into the state-of-the-art NPU framework llm.npu
+(
+Xu et al. 2025d
+)
+.
+The evaluation is conducted on mobile LLMs, including Qwen2-0.5B/1.5B and PhoneLM-0.5B/1.5B.
+We report the results on three representative datasets of mobile-specific tasks (NLP and agents).
+Compared to four design alternatives with a circumstance of highly limited CPU/GPU resources,
+shadowAttn
+exhibits up to 6.9
+\times
+breakdown speedup, up to 4.5
+\times
+end-to-end speedup and up to 7.7
+\times
+energy reduction.
+Compared to native attention of SoTA frameworks,
+shadowAttn
+achieves on-par or even better performance with significantly fewer CPU/GPU resources.
+The accuracy loss is only 0.4 pp on average on four models and three datasets.
+
+Contributions
+are as follows.
+
+\bullet
+We identify the significant problem of NPU-centric LLM inference on mobile devices, and propose
+shadowAttn
+, a system-algorithm codesigned sparse attention that significantly reduces the reliance on float compute of CPU/GPU.
+
+\bullet
+We propose several key techniques, including NPU offloading of token importance estimation, NPU compute graph bucketing and NPU-CPU/GPU pipeline, and tackle the main challenges of NPU-centric on-device attention.
+
+\bullet
+
+shadowAttn
+outperforms strong baselines while minimizing CPU/GPU resource.
+shadowAttn
+can be plug-and-play to any mainstream on-device LLM inference frameworks.
+
+2.
+Background and Motivation
+
+2.1.
+LLM Inference on Mobile SoCs
+
+Vendor
+
+SoC
+
+NPU
+
+INT
+
+Capability
+
+Float
+
+Capability
+
+Qualcomm
+
+Snapdragon
+
+Hexagon
+
+DSP
+
+High
+
+No
+
+Qualcomm
+
+Snapdragon
+
+HTP
+
+High
+
+Low
+
+Texas
+
+Instruments
+
+TMS320F2812
+
+C28x
+
+DSP
+
+High
+
+No
+
+Nvidia
+
+Orin
+
+DLA
+
+High
+
+No
+
+Tesla
+
+FSD
+
+FSD D1
+
+High
+
+No
+
+Table 1
+.
+NPUs of mainstream mobile/embedded SoCs. High-throughput integer capability is the main focus of NPUs.
+
+Framework
+
+llm.npu
+
+HeteroLLM
+
+llama.cpp
+
+mlc-llm
+
+Atten.
+
+CPU
+
+GPU
+
+CPU
+
+GPU
+
+Non-Atten.
+
+NPU
+
+GPU/NPU
+
+CPU
+
+GPU
+
+Table 2
+.
+On-device frameworks typically run the attention operation on CPU/GPUs.
+
+Mobile NPUs: integer accelerators for DNN inference.
+
+Due to increasing concerns about individual data protection and safety, more users are opting to run large language models directly on their personal devices rather than sending sensitive information to remote servers.
+To achieve higher performance, on-device LLM inference shall be executed on NPUs, specialized hardware designed for DNN inference. Such paradigm is referred as
+NPU-centric inference
+.
+Table
+2
+summarizes the NPUs on mainstream mobile/embedded SoCs, including Qualcomm Snapdragon series
+(
+8ge 2025
+;
+snp 2025
+)
+, Texas Instruments TMS320F2812
+(
+TMS 2025
+)
+, Nvidia Orin
+(
+ori 2025
+)
+, etc.
+We observe that the commonality among these NPUs is their primary focus on
+low-precision integer compute
+, i.e., all of them support integer operation, but have zero or relatively low float capabilities.
+This situation arises because (i) DNNs are able to be quantized to lower precisions for efficient execution and memory saving compared to general workloads.
+(ii) supporting multiple data precision types consumes more chip area or introduces significant additional design complexity for unit reusing
+(
+Park et al. 2023
+;
+Lokhande and Vishvakarma 2025
+;
+Lokhande et al. 2024
+)
+.
+
+The static compute graph of mobile NPUs.
+
+To schedule the resources for the best runtime efficiency, mobile NPUs typically employ a static compute graph.
+Figure
+1
+illustrates the workflow of a static-graph-based inference procedure for QNN SDK
+(
+qnn 2025
+)
+.
+In the offline stage, a computation graph is first built and then loaded into the device memory.
+During the online inference stage, the input data is fed into the graph for execution.
+Finally, the graph is offline released from the memory.
+
+The static graph requires several key hyperparameters to be specified and fixed during the offline graph-building stage.
+As illustrated in Figure
+1
+, this procedure includes assigning a single float value as the scale factor for an INT8 tensor and defining the tensor exact shape.
+The tensors and an operator type provided by the vendor are then assembled into a compute graph.
+Finally, the graph is compiled into a binary file through a series of optimization passes.
+
+The time overhead of each stage is listed in Figure
+1
+.
+The offline stage is extremely time-consuming compared to the online stage.
+This makes it impossible to dynamically online build the graph for each input.
+
+Figure 1
+.
+The workflow of static compute graph of mobile NPUs. The latency is acquired on QNN SDK
+(
+qnn 2025
+)
+by a basic matrix multiplication operation.
+
+Dataset
+
+PhoneLM
+
+-0.5B
+
+PhoneLM
+
+-1.5B
+
+Qwen2
+
+-0.5B
+
+Qwen2
+
+-1.5B
+
+C/G
+
+N
+
+C/G
+
+N
+
+C/G
+
+N
+
+C/G
+
+N
+
+ArxivSum
+(
+Cohan et al. 2018
+)
+
+14.7
+
+0.0
+
+11.9
+
+0.0
+
+10.7
+
+9.4
+
+8.5
+
+9.1
+
+DroidCall
+(
+Xie et al. 2024
+)
+
+27.5
+
+20.5
+
+20.5
+
+19.0
+
+34.5
+
+27.5
+
+48.0
+
+22.5
+
+Octopus
+(
+Chen and Li 2024
+)
+
+64.6
+
+24.1
+
+79.2
+
+24.7
+
+60.6
+
+34.8
+
+61.2
+
+34.2
+
+Table 3
+.
+Accuracy on mobile LLMs and tasks. “C/G” means running attention on CPU/GPU in float32; “N” means running attention on NPU in INT8.
+
+The attention falls back to CPU/GPUs in state-of-the-art on-device LLM inference frameworks.
+
+Table
+2
+lists representative on-device LLM inference frameworks, including llm.npu
+(
+Xu et al. 2025d
+)
+, HeteroLLM
+(
+Chen et al. 2025
+)
+, llama.cpp
+(
+ggml 2025
+)
+and mlc-llm
+(
+MLC team 2025
+)
+.
+
+They all delegate the attention operation to CPU or GPU.
+
+For instance, although llm.npu offloads its non-attention parts to NPU, the attention operation still runs on CPU; HeteroLLM also employs such an NPU-CPU/GPU collaborated paradigm.
+The CPU-based framework llama.cpp and GPU-based framework mlc-llm also show this property.
+This is mainly because that the attention is unfriendly to mobile NPUs.
+The attention compute involves multiple activations (i.e., the non-weight tensors in a neuron network), which are hard to quantize
+(
+Xiao et al. 2024a
+;
+Lin et al. 2024
+)
+.
+Further, the static graph limits the quantization on NPUs to per-tensor static quantization.
+Such a quantization method is very coarse-grained.
+It shares a fixed scale factor across an entire tensor, preventing the NPU from adopting fine-grained methods such as K-quant
+(
+ggml 2025
+)
+or AWQ
+(
+Lin et al. 2024
+)
+.
+Table
+3
+shows that offloading the attention operation to mobile NPUs leads to significant accuracy degradation.
+For instance, PhoneLM-0.5B shows a 14.7 pp accuracy drop and a 7 pp accuracy drop on ArxivSum dataset and DriodCall dataset, respectively.
+On three datasets and four models, the NPU-based attention exhibits an average drop of 18 pp.
+
+The reliance on CPU/GPU fallback for high accuracy makes the on-device inference not NPU-centric.
+It fails to leverage the high-throughput compute capability and low energy consumption of mobile NPUs.
+Even worse, it leads to severe resource contention between other mobile apps co-located on CPU/GPU.
+
+2.2.
+Sparse Attention
+
+The opportunity of minimizing the reliance on CPU/GPU is the highly sparse characteristic of attention operation.
+
+The attention can be highly sparse.
+
+We observe that only a small fraction of tokens in the attention mechanism are truly important.
+We evaluate 128 randomly sampled data points from the WikiText-2 corpus
+(
+Merity et al. 2016
+)
+, analyzing two randomly selected attention heads from Qwen2-0.5B and Qwen2-1.5B. The results are shown in Figure
+2
+.
+For Qwen2-0.5B, more than 80% attention scores fall below 0.01; over 90% attention scores fall below 0.03.
+A similar trend is observed in Qwen2-1.5B. These near-zero values contribute negligibly to the attention output and, therefore, need not be computed. In other words, the reliance of attention on CPU/GPU computation can be substantially reduced.
+
+Figure 2
+.
+The attention score skewness of LLMs. Profiled on 128 samples from WikiText-2.
+
+Figure 3
+.
+The workflow of sparse attention.
+
+The workflow of sparse attention.
+
+Figure
+3
+shows the general workflow of a sparse attention.
+This workflow is flexible enough to encompass various empirical sparsity patterns—such as sliding windows or vertical-slash patterns
+(
+Lai et al. 2025
+;
+Jiang et al. 2023
+;
+Jiang et al. 2024
+)
+, and can also handle sparsity without obvious structural patterns.
+It consists of two stages: (1)
+Estimation stage
+.
+An attention score matrix is calculated by
+attentionScores=softmax(mask(\frac{Q\cdot K}{\sqrt{d_{k}}}))
+, with all tokens in Q and K involved.
+After that, top k values out of the attention scores are selected, with their indices transferred to the next stage.
+(2)
+Attention stage
+.
+Only the tokens that are retained by the indices from the estimation stage is involved in the sparse compute of
+O=softmax(mask(\frac{Q\cdot K}{\sqrt{d_{k}}}))\cdot V
+.
+
+Bottleneck: the estimation stage.
+
+Despite the potential advantages of sparse attention, directly applying it in LLM inference provides little performance benefit.
+As shown in Figure
+4
+, given a sparsity ratio of 40%/30%/20%, the end-to-end latency of an attention kernel only speeds up by 12.4%/24.7%/34.3%.
+This is because, unlike the attention stage that computes only the important tokens, the estimation stage requires processing all tokens, dominating the overall computation when the attention is extremely sparse.
+For instance, in a kernel with 20% sparsity (80% tokens are discarded), 66.7% out of the end-to-end computation is attributed to the estimation.
+An intuitive approach is to group the adjacent tokens in Q and K into a block before the estimation, and use the attention score of the entire block to represent the importance of each token in this block, i.e., block sparse attention
+(
+Yang et al. 2025a
+)
+, reducing the estimation overhead.
+However, the block sparse attention degrades the accuracy of mobile LLMs significantly, as it overlooks some important tokens due to its coarse-grained estimation.
+For instance, in Figure
+4
+, PhoneLM-1.5B shows a 6.1 pp accuracy drop on ArxivSum dataset.
+
+In a nut shell,
+shadowAttn
+must carefully design the estimation stage to ensure high accuracy while keeping latency low.
+
+(a)
+
+Latency breakdown.
+
+(b)
+
+Accuracy drop.
+
+Figure 4
+.
+(a): The breakdown latency of an attention kernel that runs on a CPU mid core of snapdragon 8egn3 SoC. (b): The accuracy drop when grouping 64 tokens as a block for estimation on mobile LLMs and tasks.
+
+3.
+The Design
+
+3.1.
+Overview
+
+Figure 5
+.
+The workflow of
+shadowAttn
+.
+
+Design Goal.
+
+shadowAttn
+is a system–algorithm co-designed, NPU-centric LLM inference framework tailored for mobile SoCs. Its goal is to execute attention both accurately and efficiently, while minimizing reliance on general-purpose processors such as CPUs and GPUs.
+
+Workflow of
+shadowAttn
+.
+
+Figure
+5
+shows the workflow of
+shadowAttn
+that consists the following parts.
+
+\bullet
+
+The offline stage.
+
+shadowAttn
+performs several kinds of lightweight profiling on general corpora (by default 128 samples from WikiText-2).
+Firstly,
+shadowAttn
+determines a sparse ratio for each separated head based on its importance and global sparsity ratio (configured by system).
+Then,
+shadowAttn
+generates multiple static graphs and organizes them in buckets for online inference.
+Besides, it also profiles the on-device execution overhead of key operators on the SoC with OS-configured available CPU/GPU resource for pipeline planning.
+This stage is mainly performed on cloud servers before installing the model to mobile devices, with negligible time and resource overhead (e.g., < 1 cloud GPU hours for each model).
+
+\bullet
+
+The NPU-centric compute graph.
+
+shadowAttn
+generates a sparse attention module.
+This module can be further integrated into the on-device inference frameworks as an end-to-end NPU-centric compute graph.
+As shown in Figure
+5
+, the operators excluding the attention run on NPU by the inference framework.
+For the attention module, the RoPE is run on CPU/GPU, and the estimation of Q
+\cdot
+K is run on NPU in INT8.
+After getting the top k positions, the CPU/GPU runs the fragmented QKV sparsely to get the output O.
+The compute and data movement outside the NPU is minimized.
+
+\bullet
+
+The online stage.
+
+The compute graph takes the user’s prompt text as the input, and executes each part on the CPU/GPU/NPU of mobile SoC.
+During inference, two optimizations are further introduced, i.e., NPU compute graph bucketing (
+\lx@sectionsign
+3.3
+) and Head-wise NPU-CPU/GPU pipeline (
+\lx@sectionsign
+3.4
+).
+
+3.2.
+Dynamic Sparse Attention of
+shadowAttn
+
+(a)
+
+Loss on each head.
+
+(b)
+
+Loss on each layer.
+
+Figure 6
+.
+The importance is uneven across heads and layers.(a): Removing the heads in layer 1 of PhoneLM-0.5B; (b) removing the layers of PhoneLM-0.5B. The data is on 128 samples of WikiText-2. Loss values over 1e-3 are clamped to 1e-3. The y-axis of subfigure (b) is processed by log10.
+
+Models
+
+Various global sparse ratios
+
+20%
+
+30%
+
+40%
+
+50%
+
+80%
+
+PhoneLM-0.5B
+
+99.32%
+
+99.39%
+
+99.45%
+
+99.51%
+
+99.79%
+
+PhoneLM-1.5B
+
+99.24%
+
+99.27%
+
+99.29%
+
+99.34%
+
+99.61%
+
+Qwen2-0.5B
+
+99.03%
+
+99.32%
+
+99.51%
+
+99.59%
+
+99.86%
+
+Qwen2-1.5B
+
+99.68%
+
+99.80%
+
+99.83%
+
+99.84%
+
+99.95%
+
+Table 4.
+Predicting the important positions in the Q
+\cdot
+K via NPU. Data: 128 samples from WikiText-2. We report the average recall rate of all heads with the float QxK as ground truth. The rate is surprisingly high under various global sparse ratios.
+
+Head-specific sparse ratio.
+
+One of
+shadowAttn
+’s insight is that the sparse ratio of attention should be head-specific.
+
+According to the progress of eXplainable AI (XAI)
+(
+Mersha et al. 2024
+)
+, the importance of a certain module of a neuron network can be measured by the delta loss after removing it.
+For instance, on a calibration dataset
+C
+, the importance of head
+i
+in layer
+j
+can be measured as
+
+(1)
+
+\begin{split}headImp_{i}=loss(head_{i}=0,C)-loss(C),\end{split}
+
+and the layer j where the head is located can be measured by
+
+(2)
+
+\begin{split}layerImp_{j}=loss(layer_{j}=0,C)-loss(C).\end{split}
+
+In Figure
+6
+, we show the importance of head
+i
+and layer
+j
+.
+We remove the heads in the first layer in Figure
+6
+(a), and show the loss after removal.
+The results exhibit obvious unevenness.
+For instance, the head 2 makes the loss value increase to over 100, yet the head 8 only makes the loss value increase to less than 60.
+Such an observation can also be found in Figure
+6
+(b), which depicts the layer-level loss.
+The rationale behind the unevenness is mainly that various parts of a neuron network may learn various aspects of the data
+(
+Cai et al. 2025
+;
+Jiang et al. 2024
+;
+Ge et al. 2024
+)
+, especially in compact mobile LLMs.
+
+In summary, for different heads in different layers, the sparsity ratio should also be uneven.
+An important head should retain more tokens, while a trivial head should retain less.
+Given a global average sparsity ratio
+r
+and the number
+N
+of all heads in a model, the sparsity ratio of
+head_{i}
+is
+
+(3)
+
+\begin{split}\frac{r\cdot N\cdot clamp(headImp_{i}\cdot layerImp_{j})}{sum(clamp(headImp_{i}\cdot layerImp_{j}))},1\leq i\leq N,\end{split}
+
+where
+clamp(\cdot)
+means clamping extremely large points (e.g., over 1e-3) and
+j=i/headNumPerLayer
+.
+In doing so, the intrinsic feature of attention heads is fully explored.
+
+The sparse ratio of each head is determined at offline stage and stays fixed during online stage, incurring no overhead for inference.
+The default calibration dataset is 128 samples from WikiText-2.
+The offline profiling only takes about 5 minutes for a mobile LLM on a cloud server with a single A100 GPU, being affordable for most developers.
+
+Running estimation on NPU.
+
+Another key insight of
+shadowAttn
+is that the estimation can be offloaded to low-precision NPU.
+
+shadowAttn
+’s observation is that only determining the important positions in Q
+\cdot
+K is less prone to quantization compared to calculating the exact value of the QKV result.
+For instance, Table
+4
+shows the average recall rate of predicting the important positions in the Q
+\cdot
+K via NPU’s INT8 per-tensor quantization.
+Surprisingly, the rate is more than 99% for various models and global sparsity ratios.
+This stands in stark contrast to the significant accuracy drop observed (e.g., 40.5% on Octopus, PhoneLM-0.5B) when using NPU to compute QKV.
+The rationale behind it is not hard to comprehend.
+The computation of QKV results requires precise “value equality”, whereas identifying the positions of larger elements in Q
+\cdot
+K allows the computational results to fluctuate within a certain range.
+For example, the latter accepts both a Q
+\cdot
+K = {0.4, 0.3, 0.2, 0.1} and a quantized Q
+\cdot
+K = {0.5, 0.4, 0.08, 0.02}, while the former only accepts the non-quantized Q
+\cdot
+K.
+
+On top of this,
+shadowAttn
+’s workflow of estimation stage is as follows.
+Firstly, it quantizes the Q and K tensor and runs dense INT8 Q
+\cdot
+K on NPU.
+Then, the Q
+\cdot
+K result is transferred to CPU/GPU to find the top k values.
+Finally, the CPU/GPU computes the sparse QKV according to the positions of the top k values.
+A detail here is that
+shadowAttn
+does not further compute the masked attention score based on Q
+\cdot
+K.
+Since the softmax operation is strictly monotonically increasing, we can directly use the Q
+\cdot
+K that before softmax for top k.
+Also, the causal mask is not applied to Q
+\cdot
+K.
+Instead
+shadowAttn
+straightforwardly skips the masked positions for the top k operation.
+The skip is very convenient on CPU/GPU.
+
+3.3.
+NPU Compute Graph Bucketing
+
+Figure 7
+.
+The CDF of each head’s scale factors of Q/K. Model: Qwen2-0.5B; data: 128 samples from WikiText-2. The x axis is logged by 10.
+
+Figure 8
+.
+Bucketing the graphs to handle varying inputs.
+
+The fluctuation of scale factors.
+
+As shown in Figure
+7
+, we show the scale factors of each head in Q tensor and K tensor for NPU-based estimation stage, with a per-tensor (per-head) linear quantization of INT8.
+The data samples are the same to the aforementioned.
+The results show that the value of the scale factor varies significantly for each head in both Q and K.
+For instance, over 30% scale factors in Q tensor are larger than 0.2; in comparison, 20% scale factors are smaller than 0.1.
+Recall that to maximize the runtime efficiency, the software stack of NPU requires offline compiling a static compute graph that with fixed constant and shape.
+If we apply a single graph to all inputs, the accuracy will drop significantly since there is no one-size-fits-all scale factor as the graph constant.
+
+Our solution: bucketing the graphs.
+
+shadowAttn
+offline generates multiple graphs and cache them in buckets for online usage.
+Specifically, as shown in Figure
+14
+, we denote
+\lambda^{Q}
+/
+\lambda^{K}
+as the scale factor of Q/K, and
+\lambda=<\lambda^{Q}
+,
+\lambda^{K}>
+as the constant of a QxK compute graph.
+
+At offline stage, we profile the average
+\bar{\lambda}
+on the calibration corpora, and generate
+\{<\bar{\lambda}^{Q},\bar{\lambda}^{K}>,<\bar{\lambda}^{Q}\cdot\sigma,\bar{\lambda}^{K}/\sigma>,\cdots,<\bar{\lambda}^{Q}\cdot\sigma,\bar{\lambda}^{K}\cdot\sigma>\}
+buckets, where
+\sigma
+is the step size (by default 5e-1, detailed later in
+\lx@sectionsign
+5.2
+).
+Notably, a bucket contains multiple graphs with various shapes
+1
+1
+
+1
+
+The “shape” here mainly refers to the head dimension. On mobile devices, there is almost no batched input, and the sequence dimension is also fixed thanks to the chunked inference feature in modern on-device Transformer inference frameworks
+(
+Xu et al. 2025d
+)
+.
+due to the NPU kernel fused launch (detailed in
+\lx@sectionsign
+3.4
+).
+The memory overhead of caching the graphs is negligible.
+Since a QxK graph does not contain any weight, a graph only takes about 10–100 KB.
+
+At online stage, in Figure
+14
+, given a pair of input tensors Q and K, we first calculate the MSE of
+<\lambda^{Q},\lambda^{K}>
+to each bucket’s
+\lambda
+.
+Then, the input falls into the bucket with the smallest MSE.
+Finally, a compute graph with the corresponding shape is selected out for the following inference.
+In doing so, the accuracy of NPU estimation is guaranteed.
+The configuration details of bucketing the graphs are discussed in
+\lx@sectionsign
+5
+.
+
+3.4.
+Head-Wise NPU-CPU/GPU Pipeline
+
+Figure 9
+.
+An illustration of NPU-CPU/GPU pipeline.
+
+Consider the execution of
+shadowAttn
+’s dynamic sparse attention.
+Figure
+9
+shows a minimal illustration with two heads.
+In each head, we need to first estimate the attention scores (i.e., the blue section), then select top k positions (i.e., the orange section), and finally do sparse QKV operations.
+Formally, if we use
+{\zeta}^{i}_{npu}
+,
+{\zeta}^{i}_{topk}
+, and
+{\zeta}^{i}_{qkv}
+to represent executing the corresponding section of the
+i_{th}
+of
+n
+heads, the execution obeys
+
+(4)
+
+\begin{split}{\zeta}^{i}_{npu}\leftarrow{\zeta}^{i}_{topk};\quad{\zeta}^{i}_{npu},{\zeta}^{i}_{topk}\leftarrow{\zeta}^{i}_{qkv},\forall i\in n,\end{split}
+
+where “
+\leftarrow
+” means the dependency.
+
+The naive way is running each operation sequentially (Figure
+9
+(1)).
+However, this ignores several key optimizations in this procedure.
+
+shadowAttn
+further introduces the following insights.
+
+Overlapping.
+
+Both
+{\zeta}^{i}_{npu}
+and
+{\zeta}^{i}_{qkv}
+operations are compute-bound, and the
+{\zeta}^{i}_{topk}
+is relatively memory-bound.
+Furthermore,
+{\zeta}^{i}_{npu}
+and
+{\zeta}^{i}_{qkv}
+run on separate processors (NPU and CPU/GPU, respectively).
+Thus, according to Formula
+4
+, if
+{\zeta}^{i}_{npu}
+
+{\zeta}^{j}_{topk}
+and
+{\zeta}^{k}_{qkv}
+have no dependency, then they can be executed in parallel.
+As shown in Figure
+9
+(2), after overlapping these operations by a three-stage pipeline, the end-to-end latency can be reduced.
+
+NPU kernel fused launch.
+
+The NPU is designed for high-throughput dense operations.
+A vanilla method of launching a single head for execution causes under-utilization of the IDU.
+For instance, the QxK compute graph of Q=[1,1,128,64] and K=[1,1,2048,64] (layouted in BHSD) takes 2ms on MI14; a graph that fuses 2 heads or 4 heads together only takes 3 ms or 4ms, respectively.
+On the other hand, since the number of scale factor buckets is finite (in fact a few buckets are enough, as detailed in
+\lx@sectionsign
+5.2
+), there exist many heads share the same scale factor.
+Thus, such heads can be fused together in a launch.
+As shown in Figure
+9
+(3), head 1 and head 2 have the same scale factor.
+After fusing, the pipeline latency is further reduced.
+
+Reordered execution.
+
+There exist bubbles in the pipeline due to the dependency in Formula
+4
+.
+Since each head has its own sparsity ratio, the execution order of the heads influences the bubbles.
+A good order can squeeze out more bubbles.
+As shown in Figure
+9
+(4), executing head 2 before head 1 further achieves latency reduction.
+
+The pipeline planning policy.
+
+shadowAttn
+’s pipeline puts the above optimizations together.
+Yet, solving the planning of such a pipeline has O(n!) time complexity, which is NP-hard and unacceptable on mobile devices.
+To this end,
+shadowAttn
+employs a greedy search with polynomial complexity in Algorithm
+1
+.
+Basically, we first do fused launch at the beginning of planning (line 15).
+Then, for each planning step, we select the
+{\zeta}^{i}_{npu}
+,
+{\zeta}^{i}_{topk}
+and
+{\zeta}^{i}_{qkv}
+that minimize the current pipeline latency.
+The overhead of
+{\zeta}^{i}_{npu}
+,
+{\zeta}^{i}_{topk}
+and
+{\zeta}^{i}_{qkv}
+is obtained in the lightweight offline stage mentioned in
+\lx@sectionsign
+3.1
+.
+Such a pipeline planning policy incurs negligible online overhead on mobile devices (e.g. < 1 ms on MI14).
+
+Algorithm 1
+
+The pipeline planning policy.
+
+Input:
+
+heads_{c/gpu}
+: each head of the attention.
+
+Output:
+
+res_{npu}
+,
+res_{c/gpu}
+: the execution order.
+t_{qkv}
+: the total execution time.
+
+1:
+
+C/GPUPlan
+(
+t_{npu}
+,
+t_{topk}
+,
+t_{qkv}
+,
+fusedHeads
+)
+
+2:
+
+res
+= []
+
+3:
+
+for
+
+head
+in
+fusedHeads
+
+4:
+
+t_{min}
+= INF,
+selectedHead
+= -1
+
+5:
+
+for
+
+head
+in
+fusedHeads
+
+6:
+
+if
+
+head
+in
+res
+
+then
+continue
+
+7:
+
+t^{new}_{topk}
+= max(
+t_{npu}
+,
+t_{topk}
+) + topk time of
+head
+
+8:
+
+t^{new}_{qkv}
+= max(
+t_{qkv}
+,
+t_{topk}^{new}
+) + qkv time of
+head
+
+9:
+
+if
+
+t_{qkv}^{new}
+<
+t_{min}
+
+then
+
+t_{min}
+=
+t_{qkv}^{new}
+,
+selectedHead
+=
+head
+
+10:
+
+res
+.append(
+selectedHead
+)
+
+11:
+
+t_{topk}
+= max(
+t_{npu}
+,
+t_{topk}
+) + topk time of
+selectedHead
+
+12:
+
+t_{qkv}
+= max(
+t_{qkv}
+,
+t_{topk}
+) + qkv time of
+selectedHead
+
+13:
+
+return
+
+res
+,
+t_{topk}
+,
+t_{qkv}
+
+14:
+
+Plan
+(
+heads_{c/gpu}
+)
+
+15:
+
+heads_{npu}
+
+\leftarrow
+
+heads_{c/gpu}
+
+\triangleright
+fuse the heads
+
+16:
+
+t_{npu}
+= 0,
+t_{topk}
+= 0,
+t_{qkv}
+= 0,
+res_{npu}
+= [],
+res_{c/gpu}
+= []
+
+17:
+
+for
+
+fusedHeads
+in
+heads_{npu}
+
+\triangleright
+a planning step
+
+18:
+
+t_{min}
+= INF,
+selectedHeads
+= None,
+res
+= []
+
+19:
+
+for
+
+fusedHeads
+in
+heads_{npu}
+
+\triangleright
+greedy search
+
+20:
+
+if
+
+fusedHeads
+in
+res_{npu}
+
+then
+continue
+
+21:
+
+t_{npu}^{new}
+=
+t_{npu}
++ npu time of
+fusedHeads
+
+22:
+
+res
+,
+t_{topk}^{new}
+,
+t_{qkv}^{new}
+=
+C/GPUPlan
+(
+t_{npu}^{new}
+,
+t_{topk}
+,
+t_{qkv}
+,
+fusedHeads
+)
+
+23:
+
+if
+
+t_{qkv}^{new}
+<
+t_{min}
+
+then
+
+24:
+
+t_{min}
+=
+t_{qkv}^{new}
+,
+selectedHeads
+=
+fusedHeads
+
+25:
+
+res_{npu}
+.append(
+selectedHeads
+),
+res_{fsu}
++=
+res
+
+26:
+
+t_{npu}
+=
+t_{npu}
++ npu time of
+selectedHeads
+
+27:
+
+\_
+,
+t_{topk}
+,
+t_{qkv}
+=
+C/GPUPlan
+(
+t_{npu}
+,
+t_{topk}
+,
+t_{qkv}
+,
+selectedHeads
+)
+
+28:
+
+return
+
+res_{npu}
+,
+res_{c/gpu}
+,
+t_{qkv}
+
+4.
+Implementation
+
+We prototype
+shadowAttn
+with 10,000 LoC in C++/python.
+We choose COTS smartphones with Qualcomm SoCs as the testbed, and
+shadowAttn
+can also work on other mainstream mobile devices.
+We only apply a middle core of ARM CPU as the minimal available CPU/GPU resource.
+We vary the available resource in the following experiments in
+\lx@sectionsign
+5.2
+.
+The NPU’s software stack is built upon QNN
+(
+qnn 2025
+)
+and Hexagon SDK
+(
+hex 2025
+)
+of Snapdragon NPU.
+The CPU/GPU’s software stack consists of ARM NEON
+(
+arm 2025
+)
+, OpenCL
+(
+ope 2025
+)
+and LLVM ecosystem
+(
+llv 2025
+)
+, preserving the most runtime flexibility like dynamic graph execution.
+We fuse several operations, such as RoPE
+(
+Su et al. 2023
+)
+, quantization, matmul and softmax together in the kernel to minimize the redundant memory copy.
+Some non-sensitive instructions like multiplication inside them are further executed in half precision.
+
+shadowAttn
+is compatible with any on-device LLM inference library.
+It can be integrated by directly including a header file, being least intrusive to the original codebase.
+In the following end-to-end experiments, we choose a high performance framework llm.npu
+(
+Xu et al. 2025d
+)
+, whose non-attention parts can run on NPU.
+To the best of our knowledge, this is the only fully open-source framework running on NPUs.
+Specifically, we replace the attention operator with
+shadowAttn
+and its baselines for prefilling stage, and directly employ full attention on CPU/GPU for decoding since this stage is mainly memory-bound.
+
+5.
+Evaluation
+
+Devices.
+
+We mainly perform the experiments on MI14
+(
+xiaomi 2025
+)
+and Redmi K60 Champion Edition
+(
+redmi 2025
+)
+.
+MI14 is equipped with Qualcomm 8Gen3 SoC and 16+6GB DRAM; Redmi K60 Champion Edition has 8Gen2 and 16+3GB DRAM.
+The available NPU and CPU/GPU resources are Hexagon-V75/V73 and a mid-core Cortex-A720/A715 processor, respectively.
+
+Models.
+
+We mainly test
+shadowAttn
+on mobile LLMs.
+
+(1) Qwen2-0.5B/1.5B
+
+(
+qwen 2025a
+;
+qwen 2025b
+)
+;
+(2) PhoneLM-0.5B/1.5B
+
+(
+phonelm 2025a
+;
+phonelm 2025b
+)
+.
+The details are listed in Table
+5
+.
+The model weights are quantized by third-party frameworks in the following end-to-end experiments.
+
+Model
+
+Q Heads
+
+KV Heads
+
+Dims
+
+Layers
+
+PhoneLM-0.5B
+(
+phonelm 2025a
+)
+
+16
+
+16
+
+64
+
+24
+
+PhoneLM-1.5B
+(
+phonelm 2025b
+)
+
+16
+
+16
+
+160
+
+19
+
+Qwen2-0.5B
+(
+qwen 2025a
+)
+
+14
+
+2
+
+64
+
+24
+
+Qwen2-1.5B
+(
+qwen 2025b
+)
+
+12
+
+2
+
+128
+
+28
+
+Table 5.
+Models we use in our experiments.
+
+Datasets.
+
+We test
+shadowAttn
+on the following datasets.
+
+(1) ArxivSum
+
+(
+Cohan et al. 2018
+)
+is a general natural language comprehension task.
+We report the Rouge-L F1 score.
+
+(2) DroidCall
+
+(
+Xie et al. 2024
+)
+is an LLM agent task on mobile GUI automation.
+We report the top 5 single step complete accuracy.
+
+(3) Octopus
+
+(
+Chen and Li 2024
+)
+is an LLM agent task on mobile system API function calling.
+We report the top 5 function selection accuracy.
+
+Each test data is augmented by in-context learning with 5 samples.
+
+Baselines.
+We compare
+shadowAttn
+to the following design alternatives, with fully available NPU and highly limited CPU/GPU resource, i.e., one middle core of CPU.
+
+(1) Full Attention on CPU/GPU (C/G-Full)
+runs float32 full atention on CPU/GPU, a default setting of mainstream on-device inference frameworks, such as llm.npu
+(
+Xu et al. 2025d
+)
+, mlc-llm
+(
+MLC team 2025
+)
+and HeteroLLM
+(
+Chen et al. 2025
+)
+.
+
+(2) Sparse Attention on CPU/GPU (C/G-Sparse)
+runs float32 dynamic sparse attention on CPU/GPU, including the dense estimation procedure.
+This is a vanilla setting of fine-grained dynamic sparse attention
+(
+Wang et al. 2021
+;
+Zhang et al. 2023
+)
+.
+
+(3) Block Sparse Attention on CPU/GPU (C/G-Block-Sparse)
+runs float32 dynamic sparse attention with a 64x64 block size, which is a common setting in previous literature
+(
+Yang et al. 2025a
+)
+.
+
+(4) Full Attention on NPU (NPU-Full)
+runs INT8 full attention on NPU, with static graph and per-tensor quantization
+(
+Xue et al. 2024
+)
+.
+
+Settings.
+
+In the following experiments, we set global sparsity ratio as 20%, and the number of scale buckets as 9 (step size 5e-1).
+The rationale of selecting them is detailed in
+\lx@sectionsign
+5.2
+.
+The default available CPU/GPU resource for LLM inference is set to one mid core of CPU.
+
+5.1.
+End-to-End Performance
+
+shadowAttn
+is accurate.
+
+We first report
+shadowAttn
+’s accuracy on the aforementioned datasets and models against its baselines.
+As shown in Table
+6
+,
+shadowAttn
+is the most accurate alternative compared to the lossless baseline C/G-Full, with only 0.4 pp.
+This is due to
+shadowAttn
+’s well-designed dynamic sparsity, specifically the fine-grained token-level estimation and head-specific sparsity.
+Other baselines show significant accuracy loss compared to C/G-Full, with 7.4/11.4/18 pp.
+The reasons are many fold.
+The basic reason is that sparsity introduces more noise into the model, especially for compact mobile LLMs and datasets with high information density.
+For C/G-Block-Sparse, the blocked sparsity makes the model more easier to ignore important tokens.
+For NPU-Full, the limitations of static graphs and per-tensor quantization result in inaccuracy, particularly for the attention operator, where inputs are activations with high fluctuation.
+
+Model
+
+Dataset
+
+C/G-
+
+Full
+
+C/G-
+
+Sparse
+
+C/G-Block
+
+-Sparse
+
+NPU-
+
+Full
+
+Ours
+
+PhoneLM
+
+-0.5B
+
+ArxivSum
+
+14.7
+
+14.9
+
+10.0
+
+0.0
+
+15.2
+
+DroidCall
+
+27.5
+
+24.0
+
+25.5
+
+20.5
+
+25.5
+
+Octopus
+
+64.6
+
+71.3
+
+62.9
+
+24.1
+
+64.0
+
+PhoneLM
+
+-1.5B
+
+ArxivSum
+
+11.9
+
+12.1
+
+6.0
+
+0.0
+
+12.0
+
+DroidCall
+
+20.5
+
+23.5
+
+28.5
+
+19.0
+
+25.5
+
+Octopus
+
+79.2
+
+75.8
+
+45.5
+
+24.7
+
+75.8
+
+Qwen2
+
+-0.5B
+
+ArxivSum
+
+10.7
+
+11.4
+
+10.8
+
+9.4
+
+11.3
+
+DroidCall
+
+34.5
+
+34.5
+
+26.0
+
+27.5
+
+37.5
+
+Octopus
+
+60.6
+
+42.1
+
+37.6
+
+34.8
+
+61.2
+
+Qwen2
+
+-1.5B
+
+ArxivSum
+
+8.5
+
+2.0
+
+4.2
+
+9.1
+
+8.4
+
+DroidCall
+
+48.0
+
+19.0
+
+15.5
+
+22.5
+
+44.5
+
+Octopus
+
+61.2
+
+21.9
+
+32.0
+
+34.2
+
+56.1
+
+Average
+
+36.8
+
+29.4
+
+25.4
+
+18.8
+
+36.4
+
+Table 6
+.
+The accuracy on various datasets and models.
+
+Figure 10
+.
+With the same circumstance of highly limited CPU/GPU resources,
+shadowAttn
+can achieve much lower attention kernel latency compared to other baselines on MI14.
+
+Figure 11
+.
+With the same circumstance of highly limited CPU/GPU resources,
+shadowAttn
+can achieve much lower end-to-end average inference latency on datasets of real-world mobile tasks compared to other baselines on MI14.
+
+Figure 12
+.
+Compared to the native attention in SoTA NPU inference framework that shows high reliance on CPU/GPU,
+shadowAttn
+achieves on-par or lower latency with significantly fewer CPU/GPU resources. Device: MI14.
+
+shadowAttn
+is fast.
+
+As shown in Figure
+10
+, we first report the latency of the attention kernel on MI14.
+We test the kernel with various input length, i.e., 1024/2048/4096.
+The values of the input tensors are randomized, and the sparisty ratio of each head is set to global ratio.
+We have the following observations.
+Compared to the lossless baseline C/G-Full,
+shadowAttn
+is up to 6.9
+\times
+and on average 3.5
+\times
+faster.
+Compared to the lossy baselines,
+shadowAttn
+is up to 4.0
+\times
+faster.
+Note that according to Table
+6
+, employing these baselines for inference will result in significant accuracy loss.
+
+We further report the end-to-end latency with integrating
+shadowAttn
+and its baselines into third-party frameworks.
+By doing so, we can realize NPU-centric inference.
+The details are mentioned in
+\lx@sectionsign
+4
+.
+We perform the experiments on three datasets, whose input sequence dominates the inference (3840/4096/1792 for prefill and 50/10/10 for decode, respectively).
+This is the most common workload pattern on mobile devices.
+The results are shown in Figure
+11
+.
+Compared to the lossless baseline C/G-Full,
+shadowAttn
+is up to 4.5
+\times
+and on average 2.9
+\times
+faster.
+Compared to the lossy baselines,
+shadowAttn
+is up to 4.0
+\times
+faster.
+
+We briefly discuss the rationales behind the experimental results.
+For C/G-Sparse, although it enjoys a 20% sparsity, the speedup is relatively low compared to C/G-Full.
+This is due to the overhead of estimating the to-be-sparsified positions and the top-k operation.
+For C/G-Block-Sparse, the speedup is higher.
+This is due to the estimation overhead is lowered by pre-pooling the Q and K input tensors.
+For NPU-Full, although NPU has high throughput on matrix multiplication, the speedup is somewhat reduced by operations such as softmax and masking.
+In comparison,
+shadowAttn
+achieves the highest speedup.
+This is because that it minimizes the estimation overhead by offloading the estimation to NPU and overlapping NPU and CPU/GPU execution.
+
+Besides,
+shadowAttn
+achieves on-par or even lower performance compared to SoTA NPU framework llm.npu’s native attention.
+llm.npu supports two types of attentions, i.e., full attention on 4 CPU cores (1 prime core and 3 middle cores) and full attention on GPU.
+
+shadowAttn
+achieves up to 3.0
+\times
+lower latency with
+only one middle CPU core.
+
+shadowAttn
+can work well on various devices.
+
+We further show the effectiveness of
+shadowAttn
+on other devices.
+In Table
+7
+, we show the inference latency of PhoneLM-0.5B on Redmi K60 Champion Edition.
+
+shadowAttn
+still shows clear speedup against the baseline (2
+\times
+/1.25
+\times
+/1.22
+\times
+, respectively).
+The speedup is lower than on MI14.
+This is mainly due to that the Redmi K60 Champion Edition is equipped with V73 series NPU, which is inferior to the V75 NPU on MI14.
+
+ArxivSum
+
+Octopus
+
+DroidCall
+
+C/G-Full
+
+Ours
+
+C/G-Full
+
+Ours
+
+C/G-Full
+
+Ours
+
+1.2 Min.
+
+0.6 Min.
+
+2.5 Min.
+
+2.0 Min.
+
+2.7 Min.
+
+2.2 Min.
+
+Table 7
+.
+Running
+shadowAttn
+on Redmi K60 Champion Edition (Snapdragon 8Gen2). Model: PhoneLM-0.5B.
+
+shadowAttn
+is energy efficient.
+
+We show the energy consumption of running a single attention kernel with an input length of 1024 on Redmi K60 Champion Edition.
+The results are obtained from system APIs
+2
+2
+
+2
+
+/sys/class/power_supply/battery/voltage_now
+3
+3
+
+3
+
+/sys/class/power_supply/battery/current_now
+.
+As shown in Table
+8
+,
+shadowAttn
+exhibits up to 7.66
+\times
+lower energy consumption.
+This is primarily due to the reduced computational load and the proper utilization of NPU, which has relatively low power.
+
+Model
+
+(Single Kernel)
+
+C/G-
+
+Full
+
+C/G-
+
+Sparse
+
+C/G-Block-
+
+Sparse
+
+NPU-
+
+Full
+
+Ours
+
+PhoneLM-0.5B
+
+3.72 J
+
+2.81 J
+
+1.10 J
+
+0.85 J
+
+0.66 J
+
+PhoneLM-1.5B
+
+8.59 J
+
+5.16 J
+
+1.51 J
+
+1.29 J
+
+1.12 J
+
+Qwen2-0.5B
+
+3.38 J
+
+2.35 J
+
+0.88 J
+
+0.85 J
+
+0.56 J
+
+Qwen2-1.5B
+
+5.29 J
+
+3.28 J
+
+0.85 J
+
+1.10 J
+
+0.71 J
+
+Table 8
+.
+Energy consumption of an attention kernel. Device: Redmi K60 Champion Edition; Input length: 1024.
+
+5.2.
+Sensitivity Analysis and Ablation Study
+
+(a)
+
+Sparsity ratio v.s. accuracy.
+
+(b)
+
+Sparsity ratio v.s. latency.
+
+Figure 13
+.
+Sensitivity analysis of global sparsity ratio.
+
+(a)
+
+Sensitivity to bucket number.
+
+(b)
+
+Sensitivity to step size.
+
+Figure 14
+.
+Sensitivity analysis of scale factor buckets.
+
+Figure 15
+.
+Varying the available resource of CPU/GPU.
+
+Figure 16
+.
+Ablation study on Qwen2-0.5B, MI14, Octopus.
+
+Global sparsity ratio.
+
+We show the sensitivity of sparsity ratio in Figure
+13
+.
+Setting the ratio to 20% is a reasonable choice.
+A too large ratio (e.g. 30%, 40%, or 50%) reduces less latency;
+a too small ratio leads to significant accuracy loss.
+20% is the minimum sparsity ratio that maintains no accuracy loss, i.e., the knee point.
+As a result,
+shadowAttn
+chooses 20% as its default setting, which also aligns well with the aforementioned analysis in
+\lx@sectionsign
+3
+.
+
+Scale factor buckets.
+
+Recall that we cache subgraphs of various scales on NPU for Q
+\cdot
+K.
+In
+shadowAttn
+’s default setting, the number of buckets is set to 9 with a step size of 5e-1.
+More buckets offer a more fine-grained tradeoff space, which leads to higher accuracy (5 buckets to 9 buckets in Figure
+14
+); yet the number of buckets exhibits a marginal effect that adding more buckets shows almost no performance gain.
+As a result, typically we choose it as 9.
+Figure
+14
+shows why we choose a step size of 5e-1.
+Factors of other orders of magnitude lead to significant performance degradation.
+Interestingly, a very tiny step size (5e-3) results in less accuracy drop (yet still significant).
+This is primarily because that such a choice makes all samples fall back into the original bucket, since the scale factors of others are too large or too small.
+In a nut shell, the default setting of
+shadowAttn
+on the buckets is reasonable and leads to the best performance.
+
+The available CPU/GPU.
+
+Recall that in our default setting, we set the available CPU/GPU resource to a middle core of ARM CPU.
+We now vary the available resource in Figure
+15
+by mapping it to cores with various compute capability.
+The experiment is run on MI14, which has 1 prime core, 5 middle cores, and 2 small cores.
+Firstly,
+shadowAttn
+consistently outperforms C/G-Full.
+Besides, when expanding the compute resource (e.g., small core to middle core to prime core), the absolute inference latency of
+shadowAttn
+is also reduced, showing strong scalability.
+Overall,
+shadowAttn
+is a robust solution under various amount of compute resource.
+
+Ablation study.
+
+We conduct ablation study by gradually removing the key designs of
+shadowAttn
+.
+The results are shown in Figure
+16
+.
+When the pipeline is removed from
+shadowAttn
+, the end-to-end latency exhibits a significant rise.
+This is because that the pipeline overlaps the latency of NPU and CPU/GPU.
+On top of this, when we further remove the design of scale factor buckets, the accuracy shows a clear drop (1.2 pp).
+This is because the buckets allow the NPU to adapt better to the input range.
+Further, when we make each head share the same global sparsity ratio, the accuracy drops from 60.1 pp to 52.8 pp.
+The rationale is that the intrinsic importance of each head is ignored.
+Finally, when we even cancel the design of sparse compute on CPU/GPU and directly offloading the full attention to NPU, the accuracy is lowered to 34.8 pp, and the latency is moved to 0.6 minutes.
+This is because
+shadowAttn
+have to suffer the quantization loss on NPU, and the NPU is not friendly to sparse compute.
+In conclusion, each part of
+shadowAttn
+shows non-trivial contribution to its performance.
+
+App
+
+1
+
+2
+
+3
+
+4
+
+5
+
+Latency
+
+14.7 Sec.
+
+14.5 Sec.
+
+15.5 Sec.
+
+14.7 Sec.
+
+15.2 Sec.
+
+Table 9
+.
+Running
+shadowAttn
+with other apps. Model: PhoneLM-0.5B; Dataset: Octopus; Device: MI14.
+1
+: No concurrent apps;
+2
+: Taking photos;
+3
+: Watching videos;
+4
+: Listening to music;
+5
+: Browsing shopping apps.
+
+Running alongside other mobile apps.
+
+We show
+shadowAttn
+’s superiority by running the LLM inference together with other mobile apps.
+Specifically, we test the end-to-end inference time when the smartphone user is watching videos (GPU and CPU busy), listening to music (CPU busy), tasking photos (ISP and CPU busy) and browsing shopping apps (CPU busy).
+We exclude other apps for running on the selected middle core.
+The results are shown in Table
+9
+.
+The LLM inference can work well with these apps, with no obvious performance degradation.
+
+6.
+Related Work
+
+On-Device LLM Inference.
+
+Running mobile LLMs
+(
+Zhang et al. 2024b
+;
+Thawakar et al. 2024
+;
+Ma et al. 2024
+;
+Zhang et al. 2022
+;
+Abdin and Jyoti Aneja 2024
+;
+Lee et al. 2024
+;
+Subramanian et al. 2025
+;
+Li et al. 2024
+)
+on devices has become a key area in privacy-preserving mobile intelligence
+(
+Navardi et al. 2025
+;
+Belcak et al. 2025
+;
+Li et al. 2025
+;
+Skliar et al. 2025
+;
+Peng et al. 2024
+)
+.
+There exist many popular frameworks.
+For instance, HeteroLLM
+(
+Chen et al. 2025
+)
+proposes a GPU/NPU collaborated framework for LLM inference on mobile SoCs.
+It optimizes the memory copy efficiency.
+However, the attention and parts of MLP still run on GPU, which can be busy during the usage of mobile devices.
+Akin to HeteroLLM, llm.npu
+(
+Xu et al. 2025d
+)
+runs attention on CPU/GPU, which cannot realize the NPU-centric inference.
+PowerinferV2
+(
+Xue et al. 2024
+)
+employs dense attention on NPUs, i.e., the NPU-Full baseline.
+However, compared to
+shadowAttn
+, it does not support sparse attention.
+Even worse, it still suffers from the accuracy drop of attention quantization, especially on mobile-sized LLMs and mobile agent tasks.
+Its main focus is on extending the RAM of mobile devices to run large-scale LLMs that have stronger resilience to attention quantization.
+Akin to PowerinferV2, QNN
+(
+qnn 2025
+)
+also runs full attention on NPU, encountering the same problems.
+There are also frameworks that run both the attention and non-attention parts on CPU/GPU.
+For example, MLC-LLM
+(
+MLC team 2025
+)
+and TFLite
+(
+TFLite team 2025
+)
+run LLMs on GPUs; Llama.cpp
+(
+ggml 2025
+)
+runs LLMs on CPUs.
+By only keeping the sparse compute of important tokens on CPU/GPU,
+shadowAttn
+realizes the most accurate and efficient NPU-centric inference.
+
+Efficient Sparse Attention.
+
+Fixed-pattern sparse attention
+(
+Jiang et al. 2024
+;
+Jiang et al. 2023
+;
+Lai et al. 2025
+;
+Xiao et al. 2024b
+)
+identifies one of given patterns offline.
+Common patterns include sliding window,
+\Lambda
+-shape and vertical-slash, etc.
+Compared to ad-hoc fixed patterns,
+shadowAttn
+’s dynamic attention is a superset of the above patterns.
+Block sparse attention
+(
+Yang et al. 2025a
+;
+Zhang et al. 2025
+;
+Tang et al. 2024
+;
+Xu et al. 2025b
+)
+pre-pools the Q and K, and selects top k areas in coarse-grained block level.
+As discussed before, such a paradigm is less accurate.
+Reserving/discarding a whole region may dismiss important tokens.
+
+shadowAttn
+’s fine-grained sparse attention is much more accurate.
+Recently there is also a trend of training native sparse attentions
+(
+Yuan et al. 2025
+;
+Lu et al. 2025
+)
+.
+Such methods make the attention inherently sparse at the inference stage.
+However, the learned sparsity cannot directly transfer to downstream tasks and fine-tuned models.
+The resource consumption of pre-training is also not affordable to each developer.
+In comparison, the sparse attention of
+shadowAttn
+is plug-and-play.
+
+Mobile Intelligence.
+
+Mobile intelligence runs DNNs especially foundation models on edge/mobile devices for sensing the human/environment or acting with the cyber/physical world
+(
+Xu et al. 2025a
+;
+Xu et al. 2025c
+;
+Yin et al. 2024b
+;
+Yin et al. 2024c
+;
+Baris et al. 2025
+;
+Xu et al. 2024
+;
+Ouyang et al. 2024
+;
+Liu et al. 2025
+;
+Yang et al. 2025b
+;
+Yin et al. 2024a
+)
+.
+With
+shadowAttn
+’s NPU-centric inference, the execution of foundation models will be more transparent and less intrusive to the human and environment.
+
+7.
+Conclusion
+
+We present
+shadowAttn
+, a sparse attention module for NPU-centric on-device LLM inference.
+It incorporates innovative techniques including NPU-based estimation, NPU compute graph bucketing and NPU-CPU/GPU pipeline.
+It losslessly achieves up to 4.5
+\times
+end-to-end speed up while minimizing the reliance on CPU/GPU resources.
+
