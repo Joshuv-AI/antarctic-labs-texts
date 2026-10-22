@@ -1,0 +1,2929 @@
+FlashDMoE: Fast Distributed MoE in a Single Kernel
+Osayamen Jonathan Aimuyo, Byungsoo Oh, Rachee Singh
+
+Abstract
+The computational sparsity of Mixture-of-Experts (MoE) models enables sub-linear growth in compute cost as model size increases, thus offering a scalable path to training massive neural networks. However, existing implementations suffer from low GPU utilization , significant latency overhead , and a fundamental inability to leverage task locality , primarily due to CPU-managed scheduling, host-initiated communication, and frequent kernel launches. To overcome these limitations, we develop FlashDMoE, a fully GPU-resident MoE operator that fuses expert computation and inter-GPU communication into a single persistent GPU kernel . FlashDMoE enables fine-grained pipelining of dispatch, compute, and combine phases, eliminating launch overheads and reducing idle gaps. Unlike existing work, FlashDMoE obviates bulk-synchronous collectives for one-sided, device-initiated, inter-GPU (R)DMA transfers, thus unlocking payload efficiency , where we eliminate bloated or redundant network payloads in sparsely activated layers. When evaluated on an 8-H100 GPU node with MoE models having up to 128 experts and 16K token sequences, FlashDMoE achieves up to 9 × \times higher GPU utilization, 6 × \times lower latency, 5.7 × \times higher throughput, and 4 × \times better overlap efficiency compared to state-of-the-art baselines—despite using FP32 while baselines use FP16. FlashDMoE shows that principled GPU kernel-hardware co-design is key to unlocking the performance ceiling of large-scale distributed ML. (a) GPU SM Utilization (b) Scaling Tokens (c) Weak Scaling across GPUs (d) Across Experts Figure 1 : FlashDMoE performance.
+
+
+
+1
+Introduction
+
+Figure 2
+:
+Transformer blocks (a) without MoE, (b) with MoE, and (c) with distributed MoE and expert parallelism.
+
+T
+,
+E
+, and
+O
+represent input tokens, experts, and output activations, respectively.
+
+State-of-the-art large language models (LLMs), including DeepSeek-v3
+[
+1
+]
+, LLama4
+[
+2
+]
+,
+DBRX
+[
+3
+]
+and Snowflake Arctic
+[
+4
+]
+,
+have adopted the Mixture-of-Experts (MoE) architecture for its
+computational efficiency and strong performance across many tasks.
+The traditional Transformer block consists of a self-attention module followed by a
+dense feed-forward network (FFN)
+[
+5
+]
+.
+In contrast, MoE architectures replace this single FFN with identically sized FFNs,
+otherwise known as experts, (Figure
+2
+(b)).
+A trainable neural network, known as a gate function, sparsely activates these experts by
+dynamically routing input tokens to selected experts at runtime.
+This increase in model parameters (more FFNs) improves model quality without a
+
+corresponding increase in computational cost
+.
+
+Communication overheads in MoE.
+
+As MoE model sizes grow, GPU memory constraints prevent hosting all experts on a single device.
+The standard practice is to distribute experts across multiple GPUs using expert parallelism (EP),
+which requires token routing via many-to-many communication in
+AllToAll
+or
+AllGather
+
+[
+1
+,
+4
+,
+3
+,
+6
+]
+.
+Another round of said many-to-many communication is also necessary for restoring the permuted tokens processed by experts
+to their original order within the sequence.
+Existing work has observed these communication operations
+taking 68% of total runtime
+[
+7
+,
+8
+]
+,
+during which the GPU is completely idle, unless the implementation explicitly overlaps with computation.
+This form of pipelining is challenging to achieve efficiently because it requires
+
+asynchronous GPU-driven communication
+and
+kernel fusion
+to maximize the overlap efficiency.
+Typically, inter-GPU communication APIs available in frameworks like PyTorch are not of this kind but instead are
+
+CPU-driven
+
+[
+9
+]
+.
+
+Kernel launch overheads in MoE.
+
+The efficacy of communication overlap is further limited by the overhead of
+launching many kernels from the CPU.
+Specifically, existing implementations
+[
+10
+,
+11
+,
+12
+,
+13
+]
+
+require launching a large number of kernels per a single layer pass (see Table
+1
+).
+Frequent kernel launches negatively affect performance by:
+(1) creating non-deterministic kernel start times across GPUs, exacerbating straggler issues;
+(2) introducing unnecessary synchronization points, causing GPUs to wait on peers or the CPU before proceeding;
+and (3) incurring repeated global memory round trips at kernel boundaries.
+Although CUDA graphs
+[
+14
+]
+can partially mitigate the first issue in static workloads,
+they are incompatible with MoE’s dynamic expert routing patterns.
+Addressing the remaining issues requires novel solutions,
+which we provide in this work through complete kernel fusion and asynchronous device-initiated communication.
+
+Figure 3
+:
+Comparing FlashDMoE with state-of-the-art techniques that either do not overlap communication and computation (left, top) or do some overlap (left, middle). FlashDMoE is a persistent kernel that fuses all computation and communication of the MoE operator (left, bottom). FlashDMoE implements device-initiated computation (gate, expert FFN, scale) and communication tasks (right).
+
+Table 1
+:
+Kernel Fusion Comparison.
+
+Our method is the first to fully fuse the DMoE layer into a single GPU kernel.
+We report GPU operations from profiling with Nsight Systems. We count within a single layer
+(Gate
+\rightarrow
+Dispatch
+\rightarrow
+Expert
+\rightarrow
+Combine) on 2 A100s,
+where each GPU has 32 experts.
+
+Works
+
+Launched GPU Ops
+
+FlashDMoE
+
+1
+
+COMET
+[
+11
+]
+
+33
+
+Megatron-LM CUTLASS
+[
+12
+,
+15
+]
+
+85
+
+Megatron-LM TE
+[
+12
+,
+15
+]
+
+261
+
+Megatron-LM + DeepEP
+[
+1
+]
+
+432
+
+DeepSpeedMoE
+[
+10
+]
+
+550
+
+1.1
+Our Contributions: DMoE in a single kernel
+
+To overcome these fundamental inefficiencies in state-of-the-art MoE models, we develop FlashDMoE, where we
+integrate all DMoE computation and communication tasks into a single persistent GPU kernel
+
+i.e.,
+a kernel that remains active for the entirety of the MoE operator (Figure
+3
+bottom left).
+Instead of multiple kernel launches coordinated by the CPU, FlashDMoE requires launching only one kernel,
+significantly reducing the involvement of the CPU.
+Within the fused kernel, FlashDMoE implements a reactive programming model to achieve
+fine-grained parallelism and loosely coupled, non-blocking execution among tens of thousands of GPU threads.
+
+In-kernel Block scheduling and Tile parallelism.
+
+FlashDMoE implements
+tile-level parallelism
+,
+meaning it partitions input token matrices into smaller, independent units called
+tiles
+,
+which are processed by blocks but managed (scheduled and constructed) by warps.
+We specialize every thread block, except one, as
+processors
+to perform compute.
+In addition, we designate a dedicated Operating System (OS) block (4 warps) to perform administrative tasks of
+(1) scheduling computational work to processors (
+scheduler
+),
+and (2) decoding computational tasks from messages received from other GPUs (
+subscriber
+).
+This design allows FlashDMoE to dynamically assign tasks to GPU blocks based on
+readiness
+,
+ensuring that no GPU SM remains idle throughout the lifetime of the DMoE operator.
+FlashDMoE selects tile dimensions to maximize GPU arithmetic intensity
+while still benefitting from a high-degree of parallelism.
+
+Asynchronous and payload-efficient communication.
+
+By redesigning the MoE operator from the ground up,
+FlashDMoE resolves fundamental inefficiencies inherent in the conventional MoE execution pipeline.
+One notable inefficiency is token padding during communication.
+To simplify programming complexity and due to symmetry constraints of collective communication APIs,
+existing implementations have to zero-pad token payloads to match predefined buffer sizes.
+This occurs when tokens are asymmetrically routed to experts, resulting in GPUs receiving much less than the expected
+capacity.
+However, these null payloads waste communication bandwidth, bloat data transfer latency and may lead to
+unnecessary computations on null matrices in some implementations.
+FlashDMoE introduces
+payload-efficient
+communication by sending non-padded tokens only to
+GPUs with actively selected experts, conserving both communication and computational resources.
+
+Technical challenges.
+
+Realizing the single-kernel design of FlashDMoE required
+solving several technical challenges to achieve high performance:
+(1) lightweight computational dependency management; (2)
+navigating optimal SM occupancy configurations; (3) implementing in-device BLAS operations;
+(4) minimizing inter- and intra-device synchronization overheads; (5) implementing transfer-awareness by leveraging
+DMA over Unified Virtual Addressing (UVA) when available.
+In addressing these challenges, FlashDMoE’s design presents a
+radical departure from traditional synchronous
+AllToAll
+collectives,
+where GPUs exhibit significant idle time during layer execution.
+For device-initiated communication,
+FlashDMoE uses NVSHMEM
+[
+16
+]
+to establish a global address space across all GPUs to
+achieve the aforementioned Direct Memory Access (DMA) or Remote DMA (RDMA) communication.
+For in-device BLAS, FlashDMoE develops custom high-performance GEMM operations via CUTLASS
+[
+17
+]
+.
+
+Results.
+
+We evaluate FlashDMoE across multiple GPUs split across multiple nodes.
+Our evaluations show that FlashDMoE achieves
+6
+\times
+latency speedup,
+
+9
+\times
+higher GPU utilization,
+4
+\times
+better weak scaling efficiency and
+5.7
+\times
+
+increased throughput compared to state-of-the-art implementations.
+We project these performance gains becoming even better in multi-node scenarios,
+where inter-node communication occurs using lower bandwidth inter-node links (
+e.g.,
+RDMA, Infiniband).
+
+2
+Motivation
+
+2.1
+Synchronous Communication and Stragglers
+
+Figure 4
+:
+Overlapped Schedule (bottom) showing how idle time from the sequential schedule (top)
+is repurposed for computation. FlashDMoE implements the overlapped schedule.
+
+AlltoAll
+or
+AllGather
+communication as currently used in MoE frameworks
+is a
+synchronous
+collective operation, whose completion requires the participation of all involved GPUs.
+Here, disparities in processing speeds or kernel scheduling
+among GPUs induce a straggler effect detrimental (Figure
+4
+) to (1) the collective operation’s performance and (2)
+E2E performance, as stalled GPUs cannot proceed to downstream dependent or independent tasks until the collective terminates.
+Specifically, as shown in Figure
+15
+, for distributed training of a 1.3B GPT-3 MoE model across
+32 A100 GPUs, we see P95 communication performance degradation of
+1.32X
+when compared to the mean actual kernel time
+from Figure
+15(b)
+.
+This performance reduction is rather tame as the underlying hardware is a supercomputer well-tuned
+against “software jitter”
+[
+18
+]
+.
+However, we observe a more severe p95 performance loss of
+11X
+in a single-node Virtual Machine (VM).
+In line with prior HPC works
+[
+19
+,
+20
+]
+,
+we argue that obviating the inherent barrier in this synchronous collective communication would
+allow GPUs to repurpose this observed idle time for downstream computation as depicted in Figure
+4
+.
+
+Table 2
+:
+Straggler Delay within Synchronous
+All-to-All
+communication.
+We capture the distribution of delay induced by stragglers across many steps.
+Let
+Actual Time
+
+t_{a}
+denote the fastest kernel execution time across all GPUs,
+and
+Total Time
+
+t
+be the maximum recorded step time. We define
+
+Delay
+as the maximum difference between
+t
+and
+t_{a}
+. Note
+Delay
+is idle time. For the
+1x8 V100, we profile 1750 steps and 600 steps for the 8x4 A100. See Figure
+15
+
+for the raw distribution.
+
+System
+
+# Nodes
+
+# GPUs
+
+Median
+
+p95
+
+Commercial VM (V100)
+
+1
+
+8
+
+3.1x
+
+11.4x
+
+Supercomputer (A100)
+
+8
+
+32
+
+1.09x
+
+1.32x
+
+2.2
+Kernel launch overhead.
+
+(a)
+
+GPU SM Utilization across baselines
+
+(b)
+
+Kernel Launch overhead (CUDA API row)
+
+Figure 5
+:
+5(a)
+shows GPU utilization averaged across 100 MoE forward passes on 2 NVLinked A100s with
+300 GB/s unidrectional bandwidth.
+Despite the high-bandwidth interconnect, we observe up to 90% idle time,
+which we attribute to kernel launch gaps and non-overlapping communication.
+
+We compare the kernel launch overheads between FlashDMoE and existing baselines.
+Table
+1
+shows the number of kernel launches during a single forward pass: FlashDMoE launches exactly one persistent kernel, while the baselines launch up to 550 short-lived kernels to perform the same computation.
+Figure
+5
+provides a visual comparison using CUDA API traces captured by NSight Systems, illustrating the difference between FlashDMoE and DeepEP.
+DeepEP exhibits numerous small CUDA API calls, with frequent stalls between individual operators, leading to increased GPU idle time (Figure
+5(a)
+).
+In contrast, FlashDMoE maintains high GPU utilization by avoiding launch overhead and synchronization gaps—achieving
+93.17
+% GPU utilization compared to 14% for DeepEP.
+See §
+4
+for experimental results and §
+A
+for a discussion of related work.
+
+3
+Fused MoE Kernel Design
+
+Figure 6
+:
+FlashDMoE Fused Kernel
+
+Modern distributed MoE systems suffer from two limitations: (1) frequent many-to-many
+(
+AlltoAll or AllGather
+) collectives on the critical path, and
+(2) significant overhead from repeated kernel launches.
+We address these in FlashDMoE, a fully fused MoE operator implemented
+as a single persistent GPU kernel.
+Unlike previous approaches
+[
+11
+,
+1
+,
+10
+,
+12
+,
+21
+,
+8
+,
+22
+,
+23
+,
+24
+,
+25
+,
+26
+]
+,
+FlashDMoE is the first solution to implement a
+completely fused Distributed MoE kernel
+,
+eliminating kernel launch overhead entirely by requiring only a single kernel launch (see Table
+1
+).
+
+Input:
+
+A,O\in\mathbb{R}^{S\times H},\;X\in\mathbb{R}^{E\times H\times D},\;N
+
+begin
+
+1
+
+T_{\phi},G_{\phi}\leftarrow\mathbf{FusedGate}(A)
+
+2
+
+if
+
+\text{blockId}+1<N
+
+then
+
+3
+
+\mathbf{Dispatch}(T_{\phi},A)
+
+4
+
+processor::start()
+
+5
+
+else
+
+6
+
+if
+
+warpID==0
+
+then
+
+7
+
+scheduler::start()
+
+8
+
+else
+
+9
+
+subscriber::start(
+T_{\phi}
+,
+G_{\phi}
+,
+O
+,
+X
+)
+
+10
+
+end if
+
+11
+
+end if
+
+12
+
+end
+
+13
+
+14
+
+Algorithm 1
+
+FlashDMoE Distributed MoE Fused Kernel
+
+Figure 7
+:
+DMoE Functional Dependencies Expressed as a Chain of Actor Interactions
+.
+We denote
+S_{b}
+,
+S_{h}
+, and
+P
+as the
+Subscriber, Scheduler and Processor actors, respectively. For any actor
+a\in\{S_{b},\>S_{b},\>P\}
+,
+
+a^{i}
+identifies an actor on GPU
+i
+. We define
+D^{j}_{i}
+as the operator,
+where GPU
+j
+dispatches packets of tiles to GPU
+i
+,
+This diagram expresses task dependencies at the granularity of a tile, namely
+
+GEMM_{0}
+,
+GEMM_{1}
+, combine and communication produce an output tile.
+Notifications occur as signals propagated through shared memory (subscriber
+\leftrightarrow
+scheduler) or
+global memory (scheduler
+\leftrightarrow
+processor or inter-GPU communication). Note one-sided
+inter-GPU transfers (packet or single tile) are
+coupled
+with a signal to
+notify
+S_{b}^{j}
+on the receiving GPU
+j
+of the message’s delivery.
+
+Actor-based model.
+
+The design of FlashDMoE is based on the actor model of concurrent
+computation
+[
+27
+,
+28
+,
+29
+]
+.
+We implement this model by specializing GPU thread blocks and warps into three distinct actor roles:
+(1)
+Processor
+(§
+E.1
+), (2)
+Subscriber
+(§
+E.3
+),
+and (3)
+Scheduler
+(§
+E.2
+).
+The Processor performs compute (GEMMs and element-wise operations) and tile communication.
+We use CUTLASS
+[
+17
+]
+as the underlying infrastructure for high-performance
+BLAS routines and NVSHMEM for kernel-initiated communication
+[
+16
+]
+.
+The Subscriber and Scheduler perform administrative functions.
+Specifically, the Scheduler assigns computational tasks to available thread blocks.
+Our key innovation is making the Scheduler both
+multithreaded
+,
+enabling high scheduling throughput, and
+work-conserving
+, ensuring consistently high GPU SM utilization.
+On the other hand, the Subscriber decodes
+tile packets
+from peer GPUs to task descriptors
+(§
+3.1
+).
+Of the
+N
+thread blocks on a GPU, we specialize
+N-1
+to adopt the
+Processor
+role.
+We specialize the last block as the Operating System (OS).
+Within this block, we specialize three warps for the
+Subscriber
+role and
+one warp for the
+Scheduler
+role.
+This split of thread blocks across actors is intentional: our goal is to use few resources for administrative
+tasks while reserving bulk of the resources for performing MoE computation tasks.
+Figure
+6
+summarizes the
+FlashDMoE architecture and its constituent actors, while Algorithm
+1
+gives a very close translation of the
+system in code.
+Note that
+A\in\mathbb{R}^{S\times H}
+is the input token matrix;
+
+O\in\mathbb{R}^{S\times H}
+the output matrix;
+and
+X\in\mathbb{R}^{E\times H\times D}
+is a 3-D tensor of expert weights,
+where
+E
+denotes the number of local experts for the executing GPU,
+H
+is the embedding dimension,
+
+D
+is the FFN intermediate dimension and
+S
+is the sequence length.
+
+T_{\phi}\in\left(\mathbb{R}^{2}\right)^{E\times C}
+
+is a routing table data structure, where
+T_{\phi}\left(e,c\right)=(i,w)
+indicates that token
+i
+at slot
+c
+
+dispatches to expert
+e
+.
+w
+is the combine weight (Equation
+2
+) and
+C
+is expert capacity.
+The tuple structure of
+T_{\phi}
+is an implementation detail.
+G_{\phi}\in\mathbb{R}^{S\times E}
+captures
+the affinity scores produced by the gate (Equation
+3
+).
+
+Figure 8
+:
+GPU Memory Hierarchy
+.
+The inverted pyramid (left) shows the load/store access latency
+[
+30
+,
+31
+,
+32
+]
+.
+The table above outlines the capacity for different memory tiers (for A100 GPUs).
+The shared memory and register capacity are static configurations for FlashDMoE.
+The right figure shows accessibility scopes: on-chip
+registers
+
+are scoped to a thread; on-chip
+shared memory
+is visible to all threads in a block;
+and off-chip
+global memory
+is accessible by all threads on device.
+
+Inter-actor interactions in FlashDMoE.
+
+FlashDMoE decomposes MoE computation and communication at the granularity of a tile, a statically sized partition of a tensor,
+to achieve parallel execution and efficient overlap of tasks.
+Each tile maps to a discrete unit of work encapsulated by a
+task descriptor
+.
+The
+Subscriber
+decodes these task descriptors from the remote tile packets it receives.
+Concurrently, the
+Scheduler
+receives notifications about available tasks and dispatches them for execution
+to
+Processor
+actors that perform computations defined by these tasks,
+namely the feed-forward network (FFN) and expert-combine operations.
+Figure
+7
+show the chain of actor interactions, demonstrating how FlashDMoE enforces DMoE functional dependencies.
+
+Determining tile dimensions in FlashDMoE.
+
+Selecting appropriate tile dimensions in FlashDMoE is crucial to ensure efficient GPU utilization.
+An undersized tile underutilizes the GPU,
+while excessively large tiles create register pressure,
+causing performance-degrading register spills to local memory.
+After careful parameter sweeps,
+we choose tile dimensions of (128, 64).
+Our key insights are: increasing tile width significantly raises the register usage per thread,
+potentially triggering costly spills;
+increasing tile height without adjusting thread count increases workload per thread, harming performance.
+Raising the thread count per block beyond our fixed value of 128 threads reduces the number of concurrent blocks,
+negatively affecting SM occupancy.
+Larger thread-block sizes also increase overhead from intra-block synchronization (
+__syncthreads()
+barriers),
+further degrading performance.
+Thus, our chosen tile dimensions balance register usage, shared-memory constraints,
+and GPU occupancy to deliver optimal performance.
+
+3.1
+Task Abstraction for Computation
+
+Computational operators.
+
+The FFN operator is a standard position-wise feed-forward network widely used in Transformer architectures
+[
+5
+]
+, composed of two linear transformations separated by a nonlinear activation
+\phi
+(e.g., GELU or ReLU):
+
+\small\textrm{FFN}(x)=W_{2}\cdot\phi(xW_{1}+b_{1})+b_{2}
+
+(1)
+
+Here,
+W_{1}
+and
+W_{2}
+represent learnable weight matrices, and
+b_{1}
+and
+b_{2}
+are biases.
+The expert-combine operation, used in architectures like GShard
+[
+33
+]
+and DeepSeek
+[
+1
+]
+, merges outputs from multiple experts by computing a weighted combination based on their affinity scores:
+
+\small\mathcal{C}_{i}=\sum\limits_{j=1}^{k}g_{i,e}
+
+(2)
+
+\small\mathbf{h}_{i}=\sum\limits_{j=1}^{k}\frac{g_{i,e}}{\mathcal{C}_{i}}\cdot\mathbf{h}_{i}^{k}
+
+(3)
+
+In these equations,
+i\in{0,S-1}
+represents an input token index,
+e=E_{i,k}
+identifies the
+k
+-th expert selected for token
+i
+, and
+g_{i,e}
+is the affinity score indicating how relevant expert
+e
+is for token
+i
+.
+
+Unified task abstraction.
+
+We unify the FFN and combine operations under a common abstraction called a
+task
+. Tasks provide a uniform interface for communicating tile-level work among Subscribers, Schedulers, and Processors. Formally, a task descriptor
+t\in\mathcal{T}
+is defined as a tuple:
+
+\small t=(\mathcal{M},\star,\phi)
+
+where
+\mathcal{M}
+is a set of metadata (
+e.g.,
+device ID, tile index),
+\star
+is a binary tensor operation (specifically, matrix multiplication
+\cdot
+or Hadamard product
+\odot
+), and
+\phi
+is an element-wise activation function (e.g., ReLU or identity).
+
+We define a task
+t
+operating on input tensors
+A
+,
+B
+,
+D
+, producing output tensor
+C
+, as follows:
+
+\small\mathcal{F}_{t}(A,B,C,D)\coloneqq C\leftarrow\phi\left(A\star_{t}B+D\right)
+
+(4)
+
+The operator
+\star_{t}
+(instantiated from
+\star
+) may behave differently depending on the task metadata
+\mathcal{M}
+, and the result of
+A\star_{t}B
+is accumulated into
+D
+. We provide an example of task metadata in §
+D
+.
+
+In practice, we implement each task defined by Equation
+4
+as a
+single fused
+
+__device__
+
+decorated function which the
+Processor
+(Algorithm
+2
+) invokes at runtime.
+Fusion for
+t
+entails applying
+\phi
+and the succeeding addition operation to registers
+storing the results of the binary operator
+\star_{t}
+.
+To illustrate its flexibility, we show how the FFN and expert-combine operations can be expressed
+using this task framework.
+Note that we omit the matrix multiplication symbol (
+\cdot
+) for simplicity.
+Also,
+\phi_{1}
+can be any activation function, while
+\phi_{2}
+is the identity function.
+The FFN is expressed as:
+
+\displaystyle\small t_{1}=(\mathcal{M},\cdot,\phi_{1}),\hskip 9.24994ptt_{2}=(\mathcal{M},\cdot,\phi_{2}),
+
+\displaystyle\small\mathcal{F}_{t_{1}}(A,B_{1},C_{1},D_{1})\coloneqq C_{1}\leftarrow\phi_{1}\left(AB_{1}+D_{1}\right),
+
+\displaystyle\small\mathcal{F}_{t_{2}}(C_{1},B_{2},C_{2},D_{2})\coloneqq C_{2}\leftarrow\phi_{2}\left(C_{1}B_{2}+D_{2}\right).
+
+Whereas, the expert-combine operation is formalized as:
+
+\displaystyle\small t_{3}=(\mathcal{M},\odot,\phi_{2}),
+
+\displaystyle\small\mathcal{F}_{t_{3}}(A,S,C,C)\coloneqq C\leftarrow\phi_{2}\left(A\odot S+C\right).
+
+3.2
+Symmetric Tensor Layout for Inter-GPU Communication
+
+(a)
+
+Symmetric Tensor Layout across 2 Expert-parallel Processes
+.
+
+(b)
+
+State machine for DMA (top) and RDMA (bottom) communication.
+
+Within a single GPU device, the actors in FlashDMoE communicate through the GPU’s memory subsystem (see Figure
+8
+).
+Specifically, the Scheduler and Subscriber actors exchange data via fast shared memory, while other actor pairs
+communicate through global memory.
+For communication across multiple devices, FlashDMoE uses
+device-initiated communication
+,
+leveraging the one-sided PGAS (Partitioned Global Address Space) programming model
+[
+34
+]
+.
+However, achieving scalable and correct one-sided memory accesses in PGAS without costly synchronization
+is a known challenge
+[
+1
+,
+35
+]
+.
+We address this challenge with a provably correct and scalable solution: a symmetric tensor layout
+L
+,
+supporting fully non-blocking memory accesses.
+We define L as:
+
+L\in\mathbb{R}^{P\times R\times B\times E\times C\times H}
+
+where:
+P
+is the expert parallel world size,
+R
+identifies communication rounds (
+i.e.,
+two rounds,
+one for token dispatch and one for combine),
+B
+is number of staging buffers,
+
+E
+is the number of local experts,
+C
+is the upscaled expert capacity (§
+3.2.1
+)
+and
+H
+is the token embedding dimension.
+Our core insight to enable non-blocking communication is
+temporal buffering
+.
+Specifically, we overprovision memory for the underlying token matrix by at least
+2\cdot r
+times, where
+r
+
+is the number of communication rounds in the dependency graph, and the factor of
+2
+accounts for
+separate buffers for incoming and outgoing data within each communication round.
+For MoE models, we have
+2\cdot r=4
+.
+This modest increase in memory usage eliminates the need for synchronization during one-sided data transfers.
+Figure
+9(b)
+illustrates how cells within this symmetric tensor layout are indexed
+and used for Direct Memory Access (DMA) and Remote DMA (RDMA) operations.
+As Theorem
+3.1
+reinforces,
+this indexing scheme over
+L
+is the underlying mechanism that allows for fully non-blocking accesses eliding
+synchronization because all accesses are write
+conflict-free
+.
+See§
+C
+for the proof.
+
+Theorem 3.1
+.
+
+The symmetric tensor layout
+L
+is write-write conflict-free.
+
+To construct
+L
+, we start from the original token buffer
+T\in\mathbb{R}^{S\times H}
+, where
+S
+is the
+sequence length and
+H
+is the token embedding dimension.
+We first reorganize the sequence dimension
+S
+into three sub-dimensions representing the expert capacity (
+C
+),
+local expert slots (
+E
+), and the expert parallel world size (
+W
+), st:
+
+C\cdot E\cdot W=C\cdot E^{\prime}=S^{\prime},\quad\text{where}\quad S^{\prime}\geq S\text{ and }E^{\prime}\geq E_{W}
+
+In the typical case of uniform expert distribution (illustrated in Figure
+9(a)
+),
+we have
+S^{\prime}=S
+and
+E^{\prime}=E_{W}
+, where
+E_{W}
+is the total number of experts in the model.
+Thus, the size of the token buffer is
+Size(T)=S^{\prime}\cdot H
+.
+In Figure
+9(a)
+, each cell labeled
+E_{i}
+(with
+i\in\{0,\ldots,3\}
+) is a matrix of size
+(C,H)
+.
+Extending prior work
+[
+33
+,
+11
+]
+, we introduce additional temporal dimensions
+
+R
+(communication rounds) and
+B
+(staging buffers).
+Each communication round has two fixed staging slots: one for outgoing tokens and another for incoming tokens.
+Each slot, indexed by dimension
+P
+, forms a tensor of shape
+(S^{\prime},H)
+.
+Therefore, the tensor size
+Size(L)
+is generally at least four times the original token buffer size,
+becoming exactly four times larger in the case of uniform expert distribution. Empirically, we find:
+
+Size(L)\approx 4\cdot Size(T)
+
+3.2.1
+In-place Padding for Payload Efficiency
+
+Due to the dynamic and uneven distribution of tokens in MoE dispatch
+[
+36
+]
+, GPUs commonly
+receive fewer tokens than their predefined expert capacity.
+Current MoE frameworks
+[
+10
+]
+typically pad these buffers with null tokens before computation,
+unnecessarily increasing communication payloads and degrading performance.
+In contrast, we propose
+in-place padding
+, performing padding directly within the local
+symmetric tensor buffers and thus eliminating excess network communication.
+
+As we show in Figure
+9(a)
+as a reference, each cell
+E_{i}
+is sized according to the expert capacity
+C
+.
+We further align this capacity to ensure divisibility by the tile block size
+bM=128
+,
+guaranteeing safe and aligned memory reads by Processor threads consuming remote tokens.
+This in-place padding strategy slightly increases the memory footprint of
+L
+, as described below:
+
+Size(L)\approx\begin{cases}4\cdot Size(T),&\frac{S}{E}\geq bM\\[4.30554pt]
+4\cdot\frac{bM\cdot E}{S}\cdot Size(T),&\text{otherwise}\end{cases}
+
+4
+Experiments
+
+We implement (§
+G
+) and evaluate FlashDMoE and evaluate across
+five metrics:
+Forward Latency
+(§
+4.2
+),
+
+GPU Utilization
+(§
+4.3
+),
+
+Overlap Efficiency
+(§
+4.4
+),
+
+Throughput
+(§
+4.5
+), and
+Expert Scalability
+(§
+4.6
+).
+We run experiments on a server with 8 NVIDIA H100 80G GPUs interconnected via NVLink,
+125 GB of RAM, and 20 vCPUs. We used PyTorch 2.6.0, CUDA 12.8, and Ubuntu 22.04.
+All experiments use MoE transformer models configured with 16 attention heads,
+an embedding dimension of 2048, and an FFN intermediate size of 2048.
+We apply Distributed Data Parallelism (DDP) and Expert Parallelism for all experiments.
+We execute only the forward pass over a single MoE layer and measure the average runtime
+of 32 passes after 32 warmup passes.
+We use top-2 routing with a capacity factor of 1.0.
+We compare FlashDMoE against several state-of-the-art MoE systems:
+(1)
+Comet
+
+[
+11
+]
+,
+(2)
+FasterMoE
+
+[
+13
+]
+,
+(3)
+Megatron-CUTLASS
+
+[
+37
+]
+, and
+(4)
+Megatron-TE
+: Megatron-LM with Transformer Engine
+[
+38
+]
+.
+Comet relies on
+cudaMemcpyPeerAsync
+
+[
+39
+]
+, while FasterMoE and Megatron-LM use NCCL exclusively for communication.
+We also evaluate FlashDMoE on a multi-node environment and discuss our findings in §
+F
+.
+
+4.1
+Desiderata
+
+In our experiments, we observe Comet exhibiting anomalously bad performance values at 8 GPUs,
+so we exclude their results from evaluations at 8 GPUs and only include for results at
+\leq
+
+4 GPUs.
+
+Note
+we evaluate FlashDMoE using FP32 precision whereas all baselines use FP16.
+We do so because (1) no baseline supports FP32 and (2) time constraints prevent us from tuning our system
+to peak performance at FP16.
+Most importantly, this precision discrepancy disadvantages FlashDMoE by doubling the
+communication and computation precision,
+making our results a conservative lower bound
+.
+Yet, as we show in the succeeding sections, FlashDMoE outperforms all baselines.
+
+4.2
+Forward Latency
+
+(a)
+
+4 H100s
+
+(b)
+
+8 H100s
+
+Figure 10
+:
+Forward Latency as the
+Number of Tokens
+per GPU increases.
+
+We first measure the forward latency of FlashDMoE across different sequence lengths on both 4 and 8 GPU setups
+(Figure
+10
+).
+FlashDMoE consistently outperforms all baselines,
+with especially notable improvements at longer sequence lengths.
+On 4 GPUs, it achieves up to
+4.6
+x speedup over Megatron-TE at 16K tokens,
+and
+2.6
+x over FasterMoE.
+The gains are even more pronounced at 8 GPUs
+where FlashDMoE maintains low latency, exhibiting up to
+6.4
+x speedup over baselines that
+degrade steeply due to increasing communication costs as token buffers increase proportionally.
+These results highlight FlashDMoE’s ability to scale token throughput without suffering from the communication
+penalties that plague other implementations.
+
+4.3
+GPU Utilization
+
+Figure 11
+:
+Comparison of SM utilization, defined as the ratio of cycles in which SMs
+have at least one warp in flight
+to the total number of cycles
+[
+40
+]
+.
+Values represent the average SM utilization over 100 iterations.
+All experiments use T = 8K and E = 64 on two A100s
+
+To quantify GPU efficiency, we measure Streaming Multiprocessor (SM) utilization during the forward pass (Figure
+11
+).
+FlashDMoE achieves 93.17% average SM utilization,
+over
+9
+x higher than FasterMoE (9.67%),
+6.8
+x higher than DeepEP+Megatron-LM (13.55%)
+
+4
+x higher than Megatron-TE (59.11%), and
+
+2.2
+x higher than Comet (42.31%).
+This improvement stems from our fully fused kernel architecture and
+fine-grained pipelining of compute and communication tasks.
+By eliminating idle gaps due to kernel launches and enabling in-kernel task scheduling,
+FlashDMoE ensures SMs remain busy with productive work throughout execution.
+
+4.4
+Overlap Efficiency
+
+(a)
+
+Latency as Number of GPUs increases.
+
+(b)
+
+Weak scaling efficiency.
+
+Figure 12
+:
+Forward Latency as the
+Number of Tokens
+per GPU increases. We define Overlap Efficiency
+O_{e}
+
+to be
+O_{e}=T(2)/T(N_{G})
+, where
+T(N_{G})
+is the latency at
+N_{G}
+GPUs and
+T(2)
+is the latency at 2 GPUs.
+
+We evaluate the extent to which FlashDMoE overlaps communication and computation by measuring weak scaling efficiency
+as the number of GPUs increases (Figure
+12(b)
+).
+We note that most baselines fail to execute at a single GPU, hence why we use 2 GPUs as the reference point.
+We observe that Megatron-CUTLASS and Megatron-TE degrade significantly,
+with overlap efficiency dropping below 0.5 at
+\geq 4
+GPUs. FlashDMoE gives up to
+3.88
+x and
+
+4
+x higher efficiency at 4 and 8 GPUs, respectively.
+Figure
+12(a)
+further illuminates this efficiency, as FlashDMoE shows stable forward latency growth,
+whereas baselines Megatron-CUTLASS and Megatron-TE experience approximately linear
+latency amplification while FasterMoE exhibits sublinear scaling.
+We attribute this suboptimal performance to straggler effects and exposed communication.
+In contrast, FlashDMoE demonstrates uniform latency as expected since the workload per
+GPU is fixed in this weak scaling experiment.
+These results further corroborate that FlashDMoE’s actor-based design and asynchronous data movement
+achieve near-ideal overlap, even at scale.
+
+4.5
+Throughput
+
+Figure 13
+:
+Throughput as the amount of GPUs increases. We compute throughput as
+\frac{T*N_{G}}{latency}
+, where
+
+N_{G}
+is the number of GPUs.
+
+Throughput, measured in tokens per second (MTokens/s), reflects end-to-end system efficiency.
+As shown in Figure
+13
+, FlashDMoE scales linearly with GPU count,
+reaching 17.7 MTokens/s at 8 GPUs.
+This is over
+5.7
+x higher than FasterMoE and
+4.9
+x higher than Megatron-TE and Megatron-CUTLASS.
+Notably, these results are achieved despite
+FlashDMoE operating entirely in FP32,
+while baselines use FP16
+.
+This indicates that FlashDMoE’s design eliminates throughput bottlenecks not by
+exploiting lower precision, but by maximizing hardware utilization and eliminating host-driven inefficiencies.
+
+4.6
+Expert Scalability
+
+(a)
+
+4 H100s
+
+(b)
+
+8 H100s
+
+Figure 14
+:
+Forward Latency as the
+Number of experts
+increases.
+
+We analyze how FlashDMoE scales with increasing number of experts at fixed sequence length (T = 16K).
+Note that for the discussed plots, the number of experts on the x-axis is the
+total number across all GPUs
+.
+Each GPU gets 1/8th of this value.
+As seen in Figure
+14
+, FlashDMoE maintains
+low, uniform
+latency, as desired,
+even as the number of experts grows from 8 to 128.
+In contrast, baselines exhibit superlinear latency increases due to increased kernel launch overheads.
+FlashDMoE outperforms these baselines by up to
+4
+X at 4 H100s and
+6.6
+X at 8 H100s, both at 128 experts.
+FlashDMoE ’s payload-efficient communication and scheduler-driven
+in-kernel dispatching allow it to sustain expert parallelism
+without incurring the communication and orchestration penalties seen in other systems.
+These results reinforce FlashDMoE’s scalability for ultra-sparse MoE configurations.
+
+4.7
+Memory Overhead
+
+We measure the GPU memory required for the symmetric tensor
+L
+and runtime bookkeeping state of FlashDMoE.
+Memory overhead depends primarily on the tile size, expert capacity (EC), and the number of experts (
+E
+).
+Table
+3
+summarizes memory overhead under various configurations, confirming that FlashDMoE maintains a modest and predictable memory footprint.
+
+Table 3
+:
+Memory overhead of FlashDMoE (tile size
+bM=128
+),
+Size(T)=\text{Tokens}*4KB
+).
+
+Tokens
+
+Experts
+
+EC
+
+max(bM, EC)
+
+Bookkeeping (MB)
+
+Size(L)
+
+(MB)
+
+Total (MB)
+
+4K
+
+16
+
+256
+
+256
+
+64.57
+
+64.00
+
+128.57
+
+4K
+
+32
+
+128
+
+128
+
+64.55
+
+64.00
+
+128.55
+
+4K
+
+64
+
+64
+
+128
+
+128.90
+
+128.01
+
+256.91
+
+4K
+
+128
+
+32
+
+128
+
+257.96
+
+256.02
+
+513.98
+
+8K
+
+16
+
+512
+
+512
+
+128.95
+
+128.01
+
+256.95
+
+8K
+
+32
+
+256
+
+256
+
+128.90
+
+128.01
+
+256.91
+
+8K
+
+64
+
+128
+
+128
+
+128.90
+
+128.01
+
+256.91
+
+8K
+
+128
+
+64
+
+128
+
+258.15
+
+256.02
+
+514.17
+
+16K
+
+16
+
+1024
+
+1024
+
+257.89
+
+256.02
+
+513.90
+
+16K
+
+32
+
+512
+
+512
+
+257.79
+
+256.02
+
+513.81
+
+16K
+
+64
+
+256
+
+256
+
+257.80
+
+256.02
+
+513.81
+
+16K
+
+128
+
+128
+
+128
+
+258.53
+
+256.02
+
+514.54
+
+5
+Limitations and Future Work
+
+Despite the performance gains and architectural innovations of FlashDMoE, there are several limitations
+worth acknowledging—both practical and conceptual—that open the door to future research.
+
+•
+
+Programming complexity.
+Developing fully fused, persistent kernels is a non-trivial engineering task.
+While FlashDMoE proves the feasibility and benefit of such kernels,
+their construction demands deep expertise in GPU architectures,
+synchronization and distributed protocols, and memory hierarchies.
+This high barrier to entry limits adoption.
+Future work may consider compiler-level abstractions or DSLs to democratize this technique.
+
+•
+
+FP16 support and shared memory access patterns.
+
+Although modern GPUs natively support half-precision computation,
+adapting
+FlashDMoE
+to FP16 is non-trivial for the Processor’s computational operators.
+Specifically, our manually tuned swizzle shared memory layouts are not the most efficient
+template parameters for CUTLASS’ Collective Mainloop operator which we use to implement our in-device GEMMs.
+This suboptimal configuration degrades memory throughput as shown in §
+H
+.
+Overcoming this for Ampere GPUs and below would require careful investigation of optimal layouts, but
+for Hopper GPUs and above, we anticipate using the builder interface that CUTLASS provides in our future improvements.
+
+•
+
+Lack of backward pass and training support.
+While this work focuses on inference,
+enabling training requires fusing backward computation and gradient communication into the kernel.
+Supporting this entails non-trivial changes to both memory bookkeeping and task descriptor definitions.
+Nevertheless, it remains an exciting direction for extending this system to
+fully support end-to-end training.
+
+6
+Conclusion
+
+This work introduces FlashDMoE,
+the first system to fuse the entire Mixture-of-Experts (MoE)
+operator into a single, persistent GPU kernel.
+We show that prevailing MoE implementations
+suffer from two critical inefficiencies:
+(1) CPU-managed synchronous communication that leads to underutilized
+interconnects and (2) fragmented execution via multiple GPU kernels,
+introducing overhead and synchronization delays.
+
+In contrast, FlashDMoE embraces a model of
+GPU autonomy by embedding computation, communication, and scheduling within a unified kernel.
+It leverages actor-style concurrency,
+warp specialization, and asynchronous (R)DMA to
+achieve fine-grained communication–computation overlap.
+
+Our evaluation demonstrates up to
+6
+\times
+speedup
+
+over state-of-the-art systems, up to
+9
+\times
+improved GPU utilization, and
+
+5.7
+\times
+increased throughput for Distributed MoE.
+FlashDMoE challenges the dominant execution paradigms in distributed deep learning
+and presents a compelling template for building future GPU-native systems.
+
+While several limitations remain, programming complexity and lack of FP16 support, this
+work lays the groundwork for a new era of
+in-kernel distributed computation
+.
+Future systems may build upon this foundation to enable kernel fusion for
+entire training pipelines, ushering in a design shift from CPU orchestration to
+fully autonomous GPU execution.
+
+7
+Acknowledgements
+
+This research is supported by NSF Award #2444537 and ACE, one of the seven centers in JUMP 2.0,
+a Semiconductor Research Corporation (SRC) program sponsored by DARPA.
+This work also used resources of the
+National Energy Research Scientific Computing Center,
+a DOE Office of Science User Facility supported by the Office of Science of the U.S.
+Department of Energy under Contract No. DE-AC02-05CH11231 using NERSC award ASCR-ERCAP0030076.
+We acknowledge and thank Dr. Giulia Guidi for providing access to these NERSC supercomputing resources.
+
+NeurIPS Paper Checklist
+
+1.
+
+Claims
+
+Question: Do the main claims made in the abstract and introduction accurately reflect the paper’s contributions and scope?
+
+Answer:
+[Yes]
+
+2.
+
+Limitations
+
+Question: Does the paper discuss the limitations of the work performed by the authors?
+
+Answer:
+[Yes]
+
+3.
+
+Theory assumptions and proofs
+
+Question: For each theoretical result, does the paper provide the full set of assumptions and a complete (and correct) proof?
+
+Answer:
+[N/A]
+
+4.
+
+Experimental result reproducibility
+
+Question: Does the paper fully disclose all the information needed to reproduce the main experimental results of the paper to the extent that it affects the main claims and/or conclusions of the paper (regardless of whether the code and data are provided or not)?
+
+Answer:
+[Yes]
+
+5.
+
+Open access to data and code
+
+Question: Does the paper provide open access to the data and code, with sufficient instructions to faithfully reproduce the main experimental results, as described in supplemental material?
+
+Answer:
+[Yes]
+
+6.
+
+Experimental setting/details
+
+Question: Does the paper specify all the training and test details (e.g., data splits, hyperparameters, how they were chosen, type of optimizer, etc.) necessary to understand the results?
+
+Answer:
+[N/A]
+
+7.
+
+Experiment statistical significance
+
+Question: Does the paper report error bars suitably and correctly defined or other appropriate information about the statistical significance of the experiments?
+
+Answer:
+[Yes]
+
+Justification: All reported results in the evaluation section were obtained as the average of 150 executions.
+
+8.
+
+Experiments compute resources
+
+Question: For each experiment, does the paper provide sufficient information on the computer resources (type of compute workers, memory, time of execution) needed to reproduce the experiments?
+
+Answer:
+[Yes]
+
+9.
+
+Code of ethics
+
+Question: Does the research conducted in the paper conform, in every respect, with the NeurIPS Code of Ethics
+https://neurips.cc/public/EthicsGuidelines
+?
+
+Answer:
+[Yes]
+
+10.
+
+Broader impacts
+
+Question: Does the paper discuss both potential positive societal impacts and negative societal impacts of the work performed?
+
+Answer:
+[N/A]
+
+Justification: We do not foresee immediate social or ethical impacts, but we acknowledge that increased compute efficiency could amplify access to large-scale models, which raises general considerations around prevalent issues such as environmental cost of training, and responsible downstream use. We recommend that users of our system consider these factors when integrating it into broader ML applications.
+
+11.
+
+Safeguards
+
+Question: Does the paper describe safeguards that have been put in place for responsible release of data or models that have a high risk for misuse (e.g., pretrained language models, image generators, or scraped datasets)?
+
+Answer:
+[N/A]
+
+12.
+
+Licenses for existing assets
+
+Question: Are the creators or original owners of assets (e.g., code, data, models), used in the paper, properly credited and are the license and terms of use explicitly mentioned and properly respected?
+
+Answer:
+[Yes]
+
+13.
+
+New assets
+
+Question: Are new assets introduced in the paper well documented and is the documentation provided alongside the assets?
+
+Answer:
+[Yes]
+
+14.
+
+Crowdsourcing and research with human subjects
+
+Question: For crowdsourcing experiments and research with human subjects, does the paper include the full text of instructions given to participants and screenshots, if applicable, as well as details about compensation (if any)?
+
+Answer:
+[N/A]
+
+15.
+
+Institutional review board (IRB) approvals or equivalent for research with human subjects
+
+Question: Does the paper describe potential risks incurred by study participants, whether such risks were disclosed to the subjects, and whether Institutional Review Board (IRB) approvals (or an equivalent approval/review based on the requirements of your country or institution) were obtained?
+
+Answer:
+[N/A]
+
+16.
+
+Declaration of LLM usage
+
+Question: Does the paper describe the usage of LLMs if it is an important, original, or non-standard component of the core methods in this research? Note that if the LLM is used only for writing, editing, or formatting purposes and does not impact the core methodology, scientific rigorousness, or originality of the research, declaration is not required.
+
+Answer:
+[N/A]
+
+Appendix A
+Related Work
+
+Computation-Communication Overlap and Kernel Fusion.
+
+To reduce the communication overheads of synchronization in distributed DNN training, many research efforts have been focused on
+increasing the overlap of computation and communication.
+For generic Transformer-based models without MoE layers,
+many works
+[
+41
+,
+42
+,
+43
+,
+44
+,
+45
+,
+46
+,
+47
+,
+48
+,
+49
+]
+
+have provided insights and techniques to
+partition and schedule computation and communication operations, aimed at
+finer-grained overlapping.
+To address the challenges posed by
+AllToAll
+communication and
+expert parallelism in MoE training, Tutel
+[
+50
+]
+and FasterMoE
+[
+13
+]
+
+overlap
+AllToAll
+with expert computation.
+Lancet
+[
+51
+]
+additionally enables both non-MoE computation in
+forward pass and weight gradient computation in backward pass to be overlapped with
+AllToAll
+.
+Despite overlapping, the performance of these approaches is
+limited in practice due to blocking synchronous collective communication with barriers.
+In contrast, FlashDMoE fundamentally
+eliminates these inefficiencies with
+asynchronous, device-initiated data transfers overlapped with tiled computation
+all
+within a single kernel
+.
+FlashDMoE further differentiates itself from SOTA works like COMET
+[
+11
+]
+and DeepEP
+[
+1
+]
+,
+which also use this form of kernel-initiated communication but at a coarse-grained granularity
+and without complete kernel fusion.
+
+Appendix B
+Motivation Plots
+
+(a)
+
+ECDF
+
+(b)
+
+Raw Distribution
+
+(c)
+
+ECDF
+
+(d)
+
+Raw Distribution
+
+Figure 15
+:
+Straggler effect of synchronous
+AllToAll
+.
+M\times N
+A100 or V100 denotes
+
+N
+GPUs within a node across
+M
+nodes.
+Every GPU communicates with every other GPU per
+AllToAll
+step.
+We capture the distribution of delay induced by stragglers across many steps.
+
+Actual Time
+
+t_{a}
+denotes the fastest kernel execution time across all GPUs,
+conversely
+Total Time
+
+t
+is the maximum recorded step time, while
+
+Delay
+is the maximum difference between
+t
+and
+t_{a}
+. Note
+Delay
+is idle time.
+
+Appendix C
+Proof of Theorem
+3.1
+
+We begin with two necessary definitions vital to the proof.
+
+Definition C.1
+.
+
+Define a write as
+w(p_{s},p_{t},i)
+, where
+p_{s}
+is the source process and
+i
+is an ordered tuple
+indicating the index coordinates for
+L
+residing on the target process
+p_{t}
+.
+A write-write conflict occurs when there exist at least two distinct, un-synchronized, concurrent writes
+
+w_{1}(p_{s_{1}},p_{t_{1}},i_{1})
+and
+w_{2}(p_{s_{2}},p_{t_{2}},i_{2})
+, such that
+
+p_{t_{1}}=p_{t_{2}}
+and index coordinates
+i_{1}=i_{2}
+but
+p_{s_{1}}\neq p_{s_{2}}
+
+Definition C.2
+.
+
+For any source process
+p_{s}
+, a valid index coordinate
+i=(p*,r,b,e,c)
+satisfies the following:
+
+1.
+
+For inter-device writes, it must hold that
+p*=p_{s}
+and
+b=1
+.
+Note this also applies to self-looping writes
+w(p_{t},p_{t},i)
+.
+
+2.
+
+For any write
+w(p_{s},p_{t},i)
+, if
+b=0
+, then
+p_{s}=p_{t}
+.
+This rule describes intra-device staging writes.
+
+We restate Theorem
+3.1
+and outline its proof below.
+
+Theorem C.1
+.
+
+The symmetric tensor layout
+L
+is write-write conflict-free.
+
+Proof.
+
+As is the case for typical physical implementations,
+assume that each index coordinate
+i
+maps to a distinct memory segment in
+L
+.
+Next, we show by contradiction that no write-write conflicts can exist when accessing
+L
+using
+valid
+
+i
+.
+For simplicity, we only include the index coordinates when describing a write.
+Assume that there exist at least two writes
+w_{1}(p_{s_{1}},p_{t_{1}},i_{1}),\>w_{2}(p_{s_{2}},p_{t_{2}},i_{2})
+
+with
+p_{t_{1}}=p_{t_{2}}
+and valid destination coordinates
+
+i_{1},i_{2}
+, where
+i_{1}=i_{2}
+lexicographically and both are unpacked below.
+
+i_{1}=(p_{1},r_{1},b_{1},e_{1},c_{1}),\>i_{1}=(p_{2},r_{2},b_{2},e_{2},c_{2})
+
+Note that for the message staging state, even though
+i_{1}=i_{2}
+the resultant memory segments reside in
+different physical buffers resident in
+p_{s_{1}}
+and
+p_{s_{2}}
+respectively.
+Therefore, for this state, there are no conflicts as intra-process writes always have distinct
+c_{j}
+
+coordinates, where
+j\in\{0,C-1\}
+.
+For inter-process transfers, we have two cases.
+
+Case 1:
+p_{s_{1}}=p_{s_{2}}
+
+Here,
+w_{1}
+and
+w_{2}
+are identical operations.
+This contradicts the definition of a conflict, which requires that
+p_{s_{1}}\neq p_{s_{2}}
+.
+In practice, such repeat writes never even occur.
+
+Case 2:
+p_{s_{1}}\neq p_{s_{2}}
+
+To ensure validity for
+i_{1}
+and
+i_{2}
+, it is the case that
+p_{1}=p_{s_{1}}
+and
+p_{2}=p_{s_{2}}
+.
+However, this implies that
+i_{1}\neq i_{2}
+yielding a contradiction as desired.
+∎
+
+Appendix D
+Task Implementation
+
+Figure 16
+:
+Task Struct
+.
+\text{TaskType}\in\{GEMM_{0},\>GEMM_{1},\>Combine\}
+
+Appendix E
+Actors
+
+E.1
+Processor
+
+begin
+
+1
+
+tQ\leftarrow\mathbf{GetTQ}()
+
+2
+
+signal\leftarrow 0
+
+3
+
+//
+shared memory variables
+
+4
+
+task\leftarrow\{\}
+
+5
+
+interrupt\leftarrow\textnormal{{False}}
+
+6
+
+complete\leftarrow\textnormal{{False}}
+
+7
+
+while
+
+interrupt==
+
+False
+
+do
+
+8
+
+if
+
+warpId==0
+
+then
+
+9
+
+if
+
+threadId==0
+
+then
+
+10
+
+\mathbf{awaitTaskFromScheduler}(interrupt,\>signal)
+
+11
+
+\mathbf{FencedNotifyRQ}(ready)
+
+12
+
+end if
+
+13
+
+\mathbf{syncwarp}()
+
+14
+
+\mathbf{warpReadTQ}(tQ,\>signal,\>task)
+
+15
+
+end if
+
+16
+
+\mathbf{syncthreads}()
+
+17
+
+if
+
+interrupt==
+
+False
+
+then
+
+18
+
+switch
+
+task.Type
+
+do
+
+19
+
+case
+
+GEMM_{0}
+
+do
+
+20
+
+//
+fused GEMM, epilogue and async tile staging
+
+21
+
+\mathbf{fGET}(GEMM_{0},\>task)
+
+22
+
+if
+
+threadId==0
+
+then
+
+23
+
+complete\leftarrow\mathbf{NotifyTileCompletion}()
+
+24
+
+end if
+
+25
+
+\mathbf{syncthreads}()
+
+26
+
+if
+
+complete==\textnormal{{True}}
+
+then
+
+27
+
+\mathbf{NotifySchedulerNextGEMM}(tQ)
+
+28
+
+end if
+
+29
+
+end case
+
+30
+
+case
+
+GEMM_{1}
+
+do
+
+31
+
+//
+fused GEMM, epilogue and async tile transfer
+
+32
+
+\mathbf{fGET}(GEMM_{1},\>task)
+
+33
+
+end case
+
+34
+
+case
+
+Combine
+
+do
+
+35
+
+\mathbf{combine}(task)
+
+36
+
+end case
+
+37
+
+end switch
+
+38
+
+end if
+
+39
+
+end while
+
+40
+
+end
+
+41
+
+42
+
+Algorithm 2
+
+Processor Actor
+: executed by a block
+
+E.2
+Scheduler
+
+begin
+
+1
+
+scheduled\leftarrow 0
+
+2
+
+tTB\leftarrow 0
+
+3
+
+tqState\leftarrow\{\}
+
+4
+
+pTDB\leftarrow\mathbf{GetProcessorDoorbell}()
+
+5
+
+sTDB\leftarrow\mathbf{GetSubscriberDoorbell}()
+
+6
+
+taskBound\leftarrow\mathbf{GetTaskBound}()
+
+7
+
+tTB\leftarrow\mathbf{AtomicLoad}(taskBound)
+
+8
+
+//
+circular buffer ready queue
+
+9
+
+rQ\leftarrow\{\}
+
+10
+
+//
+Populate ready queue with Processor ids
+
+11
+
+\mathbf{PopulateRQ}(rQ)
+
+12
+
+while
+
+scheduled<tTB
+
+do
+
+13
+
+lt\leftarrow 0
+
+14
+
+do in parallel
+
+15
+
+\text{Sweep doorbells and populate observed task counts into }tqState
+
+16
+
+\text{Aggregate locally observed task counts into }lt
+
+17
+
+end
+
+18
+
+19
+
+qS,\>taskTally\leftarrow 0
+
+20
+
+//
+qS is the inclusive output
+
+21
+
+\mathbf{WarpInclusiveSum}(lt,qS,tasktally)
+
+22
+
+while
+
+tasktally>0
+
+do
+
+23
+
+\text{Repopulate }rQ\text{ with ready processor ids}
+
+24
+
+do in parallel
+
+25
+
+\text{Starting at }rQ[qS]\text{, signal processors about task indices from }tqState
+
+end
+
+26
+
+27
+
+end while
+
+28
+
+if
+
+threadId==0
+
+then
+
+29
+
+tTB\leftarrow\mathbf{AtomicLoad}(taskBound)
+
+30
+
+end if
+
+31
+
+tTB\leftarrow\mathbf{WarpBroadcast}(tTB)
+
+end while
+
+32
+
+\mathbf{InterruptSubscribers}()
+
+33
+
+\mathbf{InterruptProcessors}()
+
+34
+
+end
+
+35
+
+36
+
+Algorithm 3
+
+Scheduler Actor
+: executed by one warp
+
+E.3
+Subscriber
+
+Input:
+
+T_{\phi}\in\left(\mathbb{R}^{2}\right)^{E\times C}
+,
+G_{\phi}\in\mathbb{R}^{S\times E}
+
+O\in\mathbb{R}^{S\times H}
+,
+X\in\mathbb{R}^{E\times H\times D}
+
+begin
+
+1
+
+interrupt\leftarrow\mathbf{GetSharedInterrupt}()
+
+2
+
+flags\leftarrow\mathbf{GetSymmetricFlags}()
+
+3
+
+tQ\leftarrow\mathbf{GetTQ}()
+
+4
+
+//
+Predefined upper bound on the number of tasks.
+
+5
+
+//
+We modulate this value to the actual task count computed
+
+6
+
+//
+dispatch signals received from peer GPUs
+
+7
+
+taskBound\leftarrow\mathbf{GetTaskBound}()
+
+8
+
+while
+
+\mathbf{AtomicLoad}(interrupt)==
+
+False
+
+do
+
+9
+
+//
+dispatch flags
+
+10
+
+do in parallel
+
+11
+
+Visit dispatch flags
+
+12
+
+Atomically retrieve signal
+
+13
+
+if
+
+Signal is set and flag is not visited
+
+then
+
+14
+
+Mark visited
+
+15
+
+\mathbf{SelfCorrectTaskBound}(taskBound,Signal)
+
+16
+
+Enforce memory consistency before consuming packet
+
+17
+
+\text{Decode packet into a set of }GEMM_{0}\text{ task descriptors using }X
+
+18
+
+\text{Write task descriptors to }tQ
+
+19
+
+Notify Scheduler of decoded tasks
+
+20
+
+end if
+
+21
+
+end
+
+22
+
+23
+
+Advance flags by number of dispatch flags length
+
+24
+
+Atomically retrieve signal
+
+25
+
+//
+combine signals
+
+26
+
+do in parallel
+
+27
+
+Visit combine flags: one per tile
+
+28
+
+if
+
+Signal is set and flag is not visited
+
+then
+
+29
+
+Mark visited
+
+30
+
+Enforce memory consistency before consuming packet
+
+31
+
+\text{Decode packet into a set of }combine\text{ task descriptors using }T_{\phi},\>G_{\phi},O
+
+32
+
+\text{Write task descriptors to }tQ
+
+33
+
+Notify Scheduler of decoded tasks
+
+34
+
+end if
+
+35
+
+end
+
+36
+
+37
+
+end while
+
+38
+
+end
+
+39
+
+40
+
+Algorithm 4
+
+Subscriber Actor
+: executed by three warps
+
+Appendix F
+Multi-Node Evaluation
+
+F.1
+Setup
+
+In this experiment, we seek to evaluate FlashDMoE in the multi-node setting.
+We use 4 nodes, where each node comprises 4 A100 GPUs fully interconnected via NVLink.
+Across nodes, each GPU uses a single NIC providing 25 GB/s of bandwidth.
+We set the number of experts to be
+16
+and assign each GPU to host only one,
+so the number of local experts is
+1
+.
+Note that we define MIV formally as follows:
+
+MIV=\frac{Tokens}{Experts}*local\_{experts}*precision*hidden\_size*2*n_{rg}
+
+where
+n_{rg}
+is the number of remote peers and the multiplicative
+factor of
+2
+accounts for communication rounds (dispatch and combine).
+
+n_{rg}=12
+for this experiment.
+
+F.2
+Results
+
+Figure 17
+:
+Multi-node Latency evaluation.
+Embbeding dimension is
+1024
+and FFN intermediate size is
+4096
+.
+We define Maximal Incast Volume (MIV) as the worst case upper bound for data volume that a
+NIC receives in a single incast occurence.
+
+We observe a sublinear increase in latency as we scale the number of tokens.
+However, we observe at
+Tokens>2048
+, that the application fails to terminate
+due to failure to receive expectant messages.
+We hypothesize this failure to be due to buffer overflow at the networking hardware layer as is common for applications
+that generate many and large messages
+[
+18
+]
+like our system.
+We note that this failure is addressable by tuning hardware configurations
+[
+52
+]
+but we consider
+this exploration as an exercise orthogonal to this work.
+
+Appendix G
+Implementation
+
+Table 4
+:
+Implementation metrics of FlashDMoE.
+
+Metric
+
+Value
+
+Total lines of code (CUDA/C++)
+
+6820
+
+Kernel stack frame size
+
+0 B
+
+Spill stores (per thread)
+
+0
+
+Spill loads (per thread)
+
+0
+
+Shared memory usage (per block)
+
+46 KB
+
+Registers per thread
+
+255
+
+Max active blocks per SM
+
+2
+
+Compilation time
+
+53 seconds
+
+Binary size
+
+29 MB
+
+Appendix H
+FP16 Memory Throughput
+
+(a)
+
+Memory subsystem throughput for FP16
+
+(b)
+
+Memory subsystem throughput for FP32
+
+Figure 18
+:
+Here, we report the total A100 memory throughput for both FP16 (top) and FP32 (bottom) variants of FlashDMoE.
+Notably, the FP16 implementation issues approximately
+2\times
+
+more shared memory instructions compared to its FP32 counterpart
+under identical workloads.
+We attribute this inefficiency to
+suboptimal shared memory layouts in FlashDMoE when
+operating on half-precision data.
+While this bottleneck is addressable through improved layout strategies,
+we leave its resolution to future work due to time constraints.
+

@@ -1,0 +1,1246 @@
+Inference-Time Hyper-Scaling with KV Cache Compression
+Adrian Łańcucki † Konrad Staniszewski † Piotr Nawrot ⋄ ∗ Edoardo M. Ponti † ⋄ † NVIDIA ⋄ University of Edinburgh
+
+Abstract
+Inference-time scaling trades efficiency for increased reasoning accuracy by generating longer or more parallel sequences. However, in Transformer LLMs, generation cost is bottlenecked by the size of the key–value (KV) cache, rather than the number of generated tokens. Hence, we explore inference-time hyper-scaling : by compressing the KV cache, we can generate more tokens within the same compute budget and further improve the accuracy of scaled inference. The success of this approach, however, hinges on the ability of compression methods to preserve accuracy even at high compression ratios. To make hyper-scaling practical, we introduce Dynamic Memory Sparsification (DMS), a novel method for sparsifying KV caches that only requires 1K training steps to achieve 8 × \times compression, while maintaining better accuracy than training-free sparse attention. Instead of prematurely discarding cached tokens, DMS delays token eviction, implicitly merging representations and preserving critical information. We demonstrate the effectiveness of inference-time hyper-scaling with DMS on multiple families of LLMs, showing that it boosts accuracy for comparable inference runtime and memory load. For instance, we enhance Qwen-R1 32B by an average of 9.1 points on AIME 24, 7.6 on GPQA, and 9.6 on LiveCodeBench across compute budgets.
+
+
+
+1
+Introduction
+
+Scaling inference-time compute—employed in models such as OpenAI’s o1
+(
+OpenAI et al. 2024
+)
+or DeepSeek’s R1
+(
+Guo et al. 2025
+)
+—trades off increased inference time and memory for higher reasoning accuracy in large language models (LLMs). Models reason by generating intermediate steps that explore the problem before reaching an answer. Adjusting the depth and breadth of this exploration—known as sequential and parallel scaling, respectively
+(
+Muennighoff et al. 2025
+)
+—controls the inference-time compute budget
+(
+Yao et al. 2023
+;
+Uesato et al. 2022
+;
+Wang et al. 2023
+;
+Lightman et al. 2024
+)
+.
+
+Despite its success, scaling inference-time compute is fundamentally bottlenecked in Transformer LLMs by the number of tokens from the key–value (or KV) cache that are attended to during auto-regressive generation. This cache grows linearly with respect to the length and number of reasoning chains, as the new key–value representations are appended to it. Hence, it can easily exhaust the memory of the accelerator and slow down each generation step, as attention is memory-bound: its cost is dominated by the time needed to retrieve the cache from memory.
+Fortunately, several methods can mitigate these issues during post-training or inference.
+These rely on training-free heuristics to sparsify the KV cache
+(
+Oren et al. 2024
+;
+Li et al. 2024
+)
+, selectively retrieve subsets of tokens
+(
+Tang et al. 2024
+)
+, or retrofit LLMs with the ability to choose whether to merge or append items to the cache
+(
+Nawrot et al. 2024
+)
+.
+
+Figure 1
+:
+Average absolute improvement of DMS over the original LLMs during inference-time scaling on reasoning tasks within the same KV cache budget, which is a proxy for runtime and memory load.
+
+In this work, we investigate for the first time whether efficient attention methods enhance inference-time scaling. In principle, by exploring more concurrent reasoning threads or longer threads for the same memory or runtime budget, efficient models can achieve higher-quality predictions than their original counterparts. However, this hinges upon the crucial assumption that efficient attention does not degrade the model’s reasoning abilities, which unfortunately is often the side effect of training-free sparsification methods
+(
+Zhang et al. 2023a
+;
+Oren et al. 2024
+)
+. On the other hand, KV cache compression during post-training usually better preserves the model’s quality, but also demands costly retrofitting procedures
+(
+Nawrot et al. 2024
+)
+.
+
+In order to overcome these limitations, as a second main contribution, we propose Dynamic Memory Sparsification (DMS), a new method that combines the best of both worlds by retrofitting LLMs to sparsify the KV cache through an inexpensive procedure. We thus demonstrate that sparsification—rather than more complex token merging proposed in Dynamic Memory Compression
+(
+Nawrot et al. 2024
+, DMC;)
+—is sufficient to retain performance at high compression ratios if the model is made aware of the eviction decisions a certain number of steps in advance. This, in turn, allows us to retrofit LLMs with KV cache compression in a much more sample-efficient way than DMC, achieving 8
+\times
+compression with only 1K training steps. On the other hand, the superior performance of DMS highlights the benefits of retrofitting LLMs over training-free heuristics.
+
+We evaluate inference-time scaling capabilities of efficient attention (including DMS) on reasoning datasets such as MATH-500
+(
+Hendrycks et al. 2021b
+)
+and AIME 2024 for math, GPQA Diamond
+(
+Rein et al. 2024
+)
+for hard sciences, and LiveCodeBench
+(
+Jain et al. 2025
+)
+for coding. We find that DMS significantly improves the Pareto frontiers across various model sizes and datasets, outperforming vanilla LLMs in both memory reads (which is a proxy for runtime) and peak memory use. Notably, DMS consistently dominates other baselines for efficient attention, which we also verify on a broader set of tasks outside of inference-time scaling. DMS variants even surpass the corresponding vanilla LLMs on long-context tasks, such as needle-in-a-haystack and variable state tracking
+(
+Hsieh et al. 2024
+)
+, while achieving higher efficiency.
+Overall, this validates the effectiveness of efficient attention—unlocked by DMS—for inference-time scaling, which improves the reasoning capabilities of models under any given inference-time budget.
+
+2
+Background
+
+2.1
+Inference-time Scaling
+
+Inference-time scaling allows a model to ‘think longer or more broadly’ about a problem to enhance the quality of its solution, by leveraging extra compute during generation
+(
+Du et al. 2024
+;
+Madaan et al. 2023
+;
+Yao et al. 2023
+)
+.
+In practice, when presented with a prompt
+\mathbf{x}
+, a Large Language Model
+f_{\text{LLM}}
+can explore
+n
+chains of reasoning
+[\mathbf{z}_{1},\dots,\mathbf{z}_{n}]
+to generate corresponding answers
+[{\mathbf{y}}_{1},\dots,{\mathbf{y}}_{n}]
+. While some strategies involve guiding this exploration through a Process Reward Model
+(
+Li et al. 2023
+;
+Feng et al. 2023
+;
+Lightman et al. 2024
+;
+Uesato et al. 2022
+;
+Wang et al. 2024
+;
+Snell et al. 2024
+, PRM;)
+by scoring each reasoning step, recent systematic comparisons established that simpler PRM-free strategies such as majority voting
+(
+Wang et al. 2025b
+)
+remain the most competitive.
+
+Hence, scaling can be easily achieved in two ways: increasing the maximum length for chains of reasoning (known as
+sequential
+scaling) or increasing the number of chains (known as
+parallel
+scaling). These two quantities can be controlled to determine a ‘token budget’ for inference-time computation
+(
+Muennighoff et al. 2025
+)
+, which directly translates into a proportional memory load and runtime. In fact, in Transformer LLMs, the key–value cache grows linearly with the number of generated tokens. Crucially, the KV cache is stored in VRAM on GPU accelerators, contributing significantly to the overall memory load and limiting scalability. At the same time, retrieving the KV cache through high-bandwidth memory access dominates runtime during generation. As a result, the KV cache constitutes a bottleneck for inference-time scaling, which leads to the natural question: by making the KV cache leaner and scaling to even longer sequences or more parallel ones, could we increase the downstream performance of reasoning LLMs for the same compute budget?
+
+2.2
+KV Cache Sparsity
+
+An intuitive strategy to reduce the size of the KV cache is to evict tokens, i.e., dynamically remove the key–value pairs of the least relevant tokens during inference.
+Recent methods have addressed this challenge by selectively managing tokens within a sliding window of context of size
+w
+. For instance, for each time step
+t
+, TOVA
+(
+Oren et al. 2024
+)
+evicts the token with the lowest attention weight such that
+
+i_{\text{TOVA}}=\min_{i}\sum_{h\in H}a_{h}(t)_{i}
+
+where
+a_{h}(t)_{i}
+denotes the attention weight assigned to token
+i
+by attention head
+h
+at time step
+t
+. Similarly, Heavy-Hitter Oracle
+(
+Zhang et al. 2023a
+, H20;)
+evicts the token with the lowest
+cumulative
+attention, additionally keeping a sliding window of recent tokens.
+These approaches incur minimal computational overhead due to their efficient heuristics for eviction scores, while retaining a maximum KV cache size of
+w
+and speeding up generation as a consequence.
+
+An entirely different strategy is adopted by methods like Quest
+(
+Tang et al. 2024
+)
+, which fully retains the entirety of the KV cache but only retrieves the most relevant
+pages
+(i.e., fixed-size blocks of contiguous KV items) from memory. Relevant pages are determined through a heuristic that approximates attention scores from the highest-magnitude dimensions of their KV items. While this approach accelerates generation by reducing memory transfers without permanently evicting tokens, it does not reduce memory load. In fact, to efficiently perform page selection, the method requires storing additional page representations, resulting in a slight memory overhead rather than savings.
+
+2.3
+KV Cache Compression
+
+While mitigating runtime or memory load, training-free KV cache sparsity methods often incur performance degradation at high compression ratios.
+To overcome this trade-off, Dynamic Memory Compression
+(
+Nawrot et al. 2024
+, DMC;)
+reduces KV cache size by dynamically compressing representations, potentially extracting and retaining vital information. At each timestep
+t
+, for every attention head separately, DMC models decide to either
+append
+the new key–value pair to KV cache as in standard Transformers, or
+accumulate
+it into the most recent cache entry using weighted averaging. As a result, every attention head produces a uniquely compressed KV sequence with a distinct compression ratio (CR).
+This flexibility allows the model to preserve critical information while aggressively compressing redundant representations, unlike sparse attention methods that impose uniform compression budgets
+(
+Nawrot et al. 2025
+)
+.
+
+Applying DMC requires continued training (known as ‘retrofitting’), during which
+the discrete decisions are relaxed into continuous variables via stochastic reparameterization
+(
+Louizos et al. 2018
+)
+, enabling gradient-based optimization. Although it requires a fraction of the pre-training budget, the computational cost is still significant.
+Moreover, DMC by default does not accelerate the prefilling phase, since all intermediate, partially accumulated tokens are retained.
+
+3
+Dynamic Memory Sparsification
+
+(a)
+
+DMS key cache management during inference.
+
+\begin{array}[]{cccccc}&{\bf k_{0}}&{\bf k_{1}}&{\bf k_{2}}&\dots&{\bf k_{n}}\\
+{\bf q_{0}}&0&-\infty&-\infty&\dots&-\infty\\
+{\bf q_{1}}&0&0&-\infty&&-\infty\\
+{\bf q_{2}}&0&0&0&&-\infty\\
+{\bf q_{3}}&0&0&0&&-\infty\\
+{\bf q_{4}}&\log(1\shortminus\alpha_{1})&0&0&&-\infty\\
+{\bf q_{5}}&\log(1\shortminus\alpha_{1})&\log(1\shortminus\alpha_{2})&0&&-\infty\\
+\vdots&\vdots&&&\ddots&\vdots\\
+{\bf q_{n}}&\log(1\shortminus\alpha_{1})&\log(1\shortminus\alpha_{2})&\log(1\shortminus\alpha_{3})&\dots&0\\
+\end{array}$
+
+(b)
+
+Attention mask
+M_{\alpha}
+during training.
+
+(c)
+
+During each inference step (
+left
+) the incoming key–value pair
+(\mathbf{k}_{t},\mathbf{v}_{t})
+might be selected for later eviction, based on predicted binary decisions
+\alpha^{\text{bin}}\in\{0,1\}
+(we show only a sequence of keys for clarity). The eviction takes place as soon as the pair falls out of the sliding window. During training (
+right
+), this behavior is induced with an additive attention mask. Eviction decisions are relaxed from binary to continuous
+\alpha\in[0,1]
+.
+
+TokenevictionstrategieseffectivelyreduceKVcachesize
+,
+butdegradedownstreamperformanceathigherevictionrates
+.
+Conversely
+,
+DMCoffersstrongercompressionatthecostofexpensiveretraining
+.
+Toscaleinference
+-
+timeefficiencyevenfurther
+,
+itisthereforeessentialtodevelopaKVcachecompressionmethodthatisinexpensive
+,
+easytointegrate
+,
+andmaintainsaccuracyathighcompressionratios
+.
+Tothisend
+,
+weproposeDynamicMemorySparsification
+(
+DMS
+),
+amethodofteachingpre
+-
+trainedmodelsasimple
+,
+adaptivetokenevictionpolicy
+.
+Assuch
+,
+itcombinestheadvantagesofevictionandtrainedcompression
+,
+withsignificantlyhigherdataefficiencythanDMC
+.
+
+3.1
+Multi-Head Self-Attention
+
+We start from LLMs with vanilla multi-head self-attention. Formally,
+let
+\mathbf{h}_{1:T}\in\mathbb{R}^{T\times d}
+represent the input sequence of hidden states to a Transformer layer, where
+T
+denotes the number of tokens, and
+d
+is the hidden dimension.
+Multi-Head Self-Attention (henceforth, simply ‘attention’) divides the hidden states into
+n_{h}
+attention heads, each processed independently to capture distinct input relationships.
+For a single attention head, the model applies distinct linear projections using weight matrices
+W_{q},W_{k},W_{v}\in\mathbb{R}^{(d/n_{h})\times d}
+, obtaining queries, keys, and values:
+
+q
+_1:T = W_q
+h
+_1:T,
+k
+_1:T = W_k
+h
+_1:T,
+v
+_1:T = W_v
+h
+_1:T.
+
+The attention weights and output vector for the
+i
+-th token are computed as:
+
+a_ij =
+1
+_j ≤i
+
+exp(
+q
+
+i
+
+⊤
+
+k
+
+j
+
+/
+
+d
+
+h
+
+)
+
+∑
+
+t=1
+
+i
+
+exp(
+q
+
+i
+
+⊤
+
+k
+
+t
+
+/
+
+d
+
+h
+
+)
+
+,
+o
+_i = ∑_j=1^ia_ij
+v
+_j,
+
+where
+\mathbf{1}
+denotes the indicator function and constrains the token dependencies to be autoregressive. Finally, the outputs from all heads are concatenated and projected by a matrix
+W_{o}\in\mathbb{R}^{d\times d}
+to yield the output.
+
+3.2
+Retrofitting Models with DMS
+
+To integrate DMS into pre-trained models, we adapt the retrofitting strategy from DMC, introducing two crucial modifications. First, whereas DMC weights and aggregates tokens, DMS simply evicts them. Second, we separate the time of eviction decisions from the time of their execution: when eviction is predicted for a token, the model is given time to integrate information from the token scheduled for eviction before it is actually removed. Below we describe the procedure for a single attention head, though the same process is applied across all KV heads independently.
+
+Given an input hidden vector to an attention layer
+\mathbf{h}_{t}
+at inference time step
+t
+, DMS predicts a binary eviction decision
+\alpha_{t}
+which controls the eviction of
+(\mathbf{k}_{t},\mathbf{v}_{t})
+.
+To maintain differentiability during training,
+\alpha_{t}
+is learned through stochastic reparametrization with a Gumbel-sigmoid distribution:
+
+\alpha_{t}\sim\text{Gumbel-sigmoid}(\mathbf{h}_{t}\mathbf{w}^{\top}+b,\tau)\in[0,1],
+
+(1)
+
+where
+\mathbf{w}\in\mathbb{R}^{d}
+is a vector of trainable weights initially set to
+\mathbf{w}=[0,\ldots,0]^{\top}
+.
+We set a low temperature
+\tau
+to encourage discrete eviction decisions and
+b\mkern 1.5mu{=}\mkern 1.5mu-5
+in order to offset the logits and initiate training with
+\alpha_{t}\approx 0
+, preventing eviction early in training.
+Empirically, this configuration prevents initial loss spikes, which might cause catastrophic forgetting
+(
+Nawrot et al. 2024
+)
+.
+
+During training, a sequence of eviction decisions
+\alpha_{1:T}
+is used to construct a mask
+M_{\alpha}\in(-\infty,0]^{T\times T}
+(Figure
+3
+), which is added to unnormalized attention scores
+QK^{\top}
+. It selectively modulates token visibility:
+-\infty
+fully masks a token, 0 indicates no masking, and small negative values have a partial effect.
+It follows that evicting a particular
+\mathbf{k}_{i}
+automatically means evicting the corresponding
+\mathbf{v}_{i}
+.
+
+Delayed Eviction via Sliding Window
+
+Immediate eviction can harm the model’s abilities by prematurely discarding useful context. To mitigate this, we propose delaying the execution of eviction decisions. Specifically, the eviction decision
+\alpha_{t}
+is made at timestep
+t
+, but the token selected for eviction remains available until a future timestep
+t+w
+. This delay creates a sliding window of size
+w
+and is implemented through the construction of
+M_{\alpha}
+.
+
+Previous work indicates that decoder-only models heavily attend to recent tokens
+(
+Xiao et al. 2024
+;
+Jiang et al. 2024
+)
+. Consequently, delayed eviction enables the model to extract relevant information from the eviction candidates before their removal, even if those tokens are recent. In contrast, immediate eviction of recent tokens has a negative impact. We confirm this empirically in
+Section
+
+5.3
+, demonstrating that immediate eviction leads to rapid performance degradation for all tested sliding window sizes, whereas delayed eviction maintains stable training and substantially improves sample efficiency, dramatically reducing the number of training tokens needed to achieve a given CR.
+
+Training Objective
+
+During training we follow DMC and apply a one-sided L1 loss term which forces the model to match the average value of predicted
+\alpha
+for a given input to the target compression
+\alpha^{\star}
+, i.e.,
+\mathcal{L}_{\text{aux}}=\max\left(\alpha^{\star}L\,H\,T-\sum_{l\in L}\sum_{h\in H}\sum_{t\in T}\alpha_{lht},0\right)
+, where
+L,H,T
+denote the number of layers, KV attention heads, and sequence length, respectively. Over the course of training, the target compression
+\alpha^{\star}
+is linearly annealed from 0 to
+\left(1-\frac{1}{\text{CR}}\right)
+.
+We train the model using a logit distillation loss
+\mathcal{L}_{\text{D}}
+loss
+(
+Hinton et al. 2015
+)
+, which is added to the auxiliary loss
+\mathcal{L}_{\text{aux}}
+:
+\mathcal{L}=\mathcal{L}_{\text{D}}+\mathcal{L}_{\text{aux}}.
+
+Since we do not enforce any constraints on compression for individual attention heads, they adopt possibly different compression ratios and produce KV sequences of possibly different lengths.
+
+Performance Considerations
+
+The overhead of DMS on the attention mechanism comes solely from constructing and applying the additive attention mask, which never needs to be materialized. For each attention head, it can be compactly passed as a vector of eviction decisions
+\alpha_{1:T}
+, and is implementable with existing tools
+(
+Wang et al. 2025a
+;
+Dong et al. 2024
+)
+.
+Implementation-wise, a neuron is re-purposed from
+\mathbf{q}_{t}
+or
+\mathbf{k}_{t}
+to predict
+\alpha_{t}
+instead of adding a parameter vector
+\mathbf{w}
+for every attention head
+(
+Nawrot et al. 2024
+)
+. Hence, no extra parameters are added.
+
+3.3
+Inference
+
+Figure
+2(a)
+shows the inference time operation of DMS. The decision variables are rounded to the nearest integer
+\alpha^{\text{bin}}_{t}\mkern 1.5mu{=}\mkern 1.5mu\lfloor\text{sigmoid}(\mathbf{h}_{t}\mathbf{w}^{\top}+b)\rceil\in\{0,1\}
+. If
+\alpha^{\text{bin}}_{t}\mkern 1.5mu{=}\mkern 1.5mu1
+, then the
+(\mathbf{k}_{t},\mathbf{v}_{t})
+pair needs to be evicted at time
+t+w
+. The sparsity introduced by DMS can also be leveraged during the prefilling phase to eliminate unnecessary computation
+(
+Wang et al. 2025a
+)
+.
+
+Performance-wise, DMS does not introduce any new read/write operations on the KV cache, since the evicted tokens could be simply overwritten by incoming ones, under the assumption that the keys are stored in the KV cache with positional information. PagedAttention
+(
+Kwon et al. 2023
+)
+facilitates storing the sparsified KV cache in memory, where pages are allocated to individual attention heads. This formulation enables our reuse of existing, efficient kernels that support PagedAttention.
+
+4
+Experimental Setup
+
+Models and Baselines
+
+To evaluate inference-time scaling through KV cache compression, we primarily focus on reasoning models of different sizes distilled from DeepSeek R1 reasoning traces
+(
+Guo et al. 2025
+)
+, including Qwen 2.5 1.5B, 7B, and 32B. In addition, as a sanity check on other families of models and for ablations on method design, we test the accuracy of efficient attention methods also on Llama 3.2 1B Instruct
+(
+Grattafiori et al. 2024
+)
+.
+We retrofit all these models with DMS and compare them against the original models, DMC, and training-free KV cache sparsification methods described in
+Section
+
+2.2
+: Token Omission via Attention
+(
+Oren et al. 2024
+, TOVA;)
+, Heavy-Hitter Oracle
+(
+Zhang et al. 2023a
+, H2O;)
+, and Quest
+(
+Tang et al. 2024
+)
+.
+1
+1
+
+1
+
+Our baseline implementations closely follow the publicly available reference implementations.
+
+Crucially, all the LLMs included in the experiments use Grouped Query Attention
+(
+Ainslie et al. 2023
+, GQA;)
+, hence KV tokens are shared among multiple query heads, which exacerbates the destructive effects of token eviction.
+
+Logit Distillation and Retrofitting
+
+In contrast to conventional retrofitting methods employing standard language modeling loss
+(
+Nawrot et al. 2024
+)
+, we retrofit all models through logit distillation
+(
+Hinton et al. 2015
+)
+. In particular, the original LLM acts as the teacher and the DMS-retrofitted one as the student. As previously observed in other settings
+(
+Sreenivas et al. 2024
+;
+Minixhofer et al. 2025
+)
+, we found that logit distillation provides greater robustness to shifts in training data (since the original pre-training and post-training mixtures are rarely public) and is especially beneficial for fragile LLMs with lower parameter counts. We provide information on the training data for distillation in
+Appendix
+
+C
+.
+
+The retrofitting process is inspired by DMC
+(
+Nawrot et al. 2024
+)
+.
+The amount of data required for equipping LLMs with DMS depends directly on the context length of retrofitted models and the target KV cache compression ratio: higher compression ratios necessitate larger datasets. Specifically, we employ a linear training schedule that runs for 100 training steps for each unit of compression ratio:
+\text{CR}(t)=\frac{t}{100}+1
+.
+Unless otherwise stated, we train DMS models with a sliding window—and equivalently an eviction delay—of 256 tokens.
+
+5
+Results
+
+5.1
+Inference Time Hyper-Scaling
+
+Figure 2
+:
+Inference-time scaling results comparing exact-match performance (
+y
+-axis) and KV cache reads as a measure of runtime (
+x
+-axis). We evaluate Qwen-R1-distilled models at different scales (columns) and 4 datasets (rows). Point colors indicate results for DMS (green), vanilla models (purple), and the state-of-the-art sparse attention baseline, Quest (yellow). Colored lines indicate the respective Pareto frontier. Annotations indicate the scaling strategy as a L-W-CR tuple in terms of sequence length L (times 1024 tokens), width W (number of sampled reasoning threads), and compression ratio CR. The horizontal black line shows the performance reported by
+Guo et al. 2025
+for the vanilla model based on a 32-1-1 configuration. From the plots, it emerges that not only DMS achieves the best Pareto frontier, but that in general, KV cache compression is an effective strategy for improving inference-time scaling.
+
+Figure 3
+:
+Inference-time scaling results comparing exact-match performance (
+y
+-axis) and peak tokens in memory (
+x
+-axis). We refer to
+Figure
+
+2
+for full details. These results clearly indicate that KV cache compression methods (and especially DMS) incur a substantially reduced number of peak tokens in memory compared to vanilla LLMs, achieving higher performance for comparable memory needs.
+
+Our main goal is to determine if KV cache compression increases downstream performance by effectively leveraging a larger ‘token budget’ for an equivalent runtime and memory load compared with vanilla Transformers.
+We run our experiments for inference-time hyper-scaling on a selection of datasets that require advanced reasoning capabilities, following
+Snell et al. 2024
+and
+Guo et al. 2025
+: specifically, AIME 24 and MATH 500
+(
+Hendrycks et al. 2021a
+)
+for math problems, GPQA Diamond
+(
+Rein et al. 2024
+)
+for physics, chemistry, and biology problems, and LiveCodeBench
+(
+Jain et al. 2025
+)
+for coding. As a metric for performance, we use exact match after mapping the output to a unified math representation (for MATH 500 and AIME 24) or one of the 4 available choices (for GPQA Diamond). For LiveCodeBench, we report pass@all, i.e., if any of the generated sequences pass the tests.
+
+As metrics for the effective budget in terms of time and memory, we focus on two metrics: (i)
+KV cache token reads
+, which represent the total number of items in the KV cache attended to in each generation step, summed across steps. Therefore, it reflects the runtime efficiency, as KV cache loading from memory is the main bottleneck during generation, contributing a share of the inference latency that increases with the sequence length
+(
+Tang et al. 2024
+;
+Nawrot et al. 2025
+)
+. For instance, as detailed in Appendix
+G
+, for a batch size of 256 and for the range of sequence lengths considered in our experiments (8K–32K), this share exceeds 90% of the latency in Qwen-R1 1.5B and 80% for Qwen-R1 7B. Secondly, (ii)
+peak tokens in memory
+, which represents the maximum KV cache size, critical for memory-constrained hardware, such as GPUs or edge devices.
+
+To establish a variety of trade-offs between downstream performance and compute, we run experiments with varying budget configurations in terms of maximum sequence
+length
+(L), number of parallel reasoning chains or
+width
+(W), and
+compression ratio
+(CR).
+Hence, each configuration can be defined by a tuple L-W-CR, where CR is 1 for vanilla models.
+By identifying the Pareto frontier for each method, we can determine which ones offer superior performance for the same budget. We report the results for each efficiency metric separately: KV cache memory reads in
+Figure
+
+2
+and peak memory usage in
+Figure
+
+3
+. For simplicity, as baselines, we report only the state-of-the-art training-free method in terms of accuracy–speedup (Quest) and accuracy–memory (TOVA), respectively.
+
+From
+Figure
+
+2
+, we observe that KV cache compression methods generally yield superior Pareto frontiers compared to vanilla LLMs, across model sizes and datasets. Specifically, the best-performing method in each dataset–size combination substantially improves the scores at comparable memory transfer budgets (proportional to runtime). Averaging Pareto frontier margins across budgets, as detailed in
+Appendix
+
+E
+
+Table
+
+5
+and summarized in
+Figure
+
+1
+, we find average gains for DMS of 11.5 for AIME 24, 2.3 for MATH 500, 5.5 for GPQA Diamond, and 8.3 for LiveCodeBench. Variability across datasets primarily reflects their saturation levels; for instance, models achieve very high performance on MATH 500 even with limited budgets. Notably, performance gains from DMS decrease with increasing model scale on MATH 500, yet increase with scale on GPQA Diamond and LiveCodeBench. Similar trends emerge for the ‘peak tokens in memory’ metric shown in
+Figure
+
+2
+and summarized in
+Table
+
+6
+. Overall, these findings indicate that KV cache compression exhibits more favorable scaling properties than dense attention, highlighting its potential for advancing the reasoning capabilities of current LLMs.
+
+Moreover, comparing DMS with other KV cache compression methods, it emerges how its Pareto frontier clearly dominates the best baselines for both efficiency metrics, namely Quest for KV cache memory reads and TOVA for peak tokens in memory (
+Figures
+
+3
+and
+2
+).
+This is even more remarkable considering that Quest sacrifices memory efficiency, fully preserving the KV cache, in order to mitigate accuracy degradation—and yet DMS manages to offer a better runtime–accuracy trade-off.
+Datasets like MATH 500, where Quest’s Pareto frontier mostly overlaps with Vanilla at all scales, illustrate that gains from larger token budgets can be eaten away, unless performance is retained even at high CRs. DMS meets this desideratum in a data-efficient way, thus offering
+inexpensive hyper-scaling with existing LLMs.
+
+Zooming in on specific results, we can assess which L-W-CR configurations tend to lie on the Pareto frontier for DMS. For most tasks, these consist of a combination of sequential and parallel scaling, hinting at the necessity to use both for inference-time scaling.
+
+5.2
+DMS for General-purpose LLMs
+
+Table 1
+:
+Evaluation of Llama 3.2 1B Instruct on a broader array of tasks, reflecting different combinations of KV cache compression methods and compression ratios (CR). We note that due to full-dense attention prefill, Quest is equivalent to vanilla on MMLU and HellaSwag. The DMS model used in this comparison was trained with a sliding window of just 16 tokens.
+
+CR
+
+1
+\times
+
+2
+\times
+
+3
+\times
+
+4
+\times
+
+Method
+
+Vanilla
+
+H2O
+
+TOVA
+
+Quest
+
+DMC
+
+\overset{\text{win=16}}{\text{DMS}}
+
+H2O
+
+TOVA
+
+Quest
+
+DMC
+
+\overset{\text{win=16}}{\text{DMS}}
+
+H2O
+
+TOVA
+
+Quest
+
+DMC
+
+\overset{\text{win=16}}{\text{DMS}}
+
+GSM8K
+
+47.0
+
+44.0
+
+45.0
+
+45.1
+
+31.9
+
+46.9
+
+32.9
+
+40.1
+
+44.7
+
+6.4
+
+46.5
+
+14.7
+
+20.2
+
+39.9
+
+3.6
+
+42.3
+
+MMLU
+
+47.9
+
+45.7
+
+43.4
+
+47.9
+
+34.9
+
+48.0
+
+37.6
+
+38.1
+
+47.9
+
+26.3
+
+45.2
+
+32.7
+
+35.2
+
+47.9
+
+25.6
+
+40.2
+
+HellaS
+
+43.4
+
+42.9
+
+42.8
+
+43.4
+
+42.2
+
+43.3
+
+42.1
+
+42.5
+
+43.4
+
+40.0
+
+43.3
+
+41.3
+
+41.8
+
+43.4
+
+39.4
+
+43.4
+
+NIAH
+
+96.4
+
+34.0
+
+65.2
+
+95.8
+
+0.0
+
+97.8
+
+17.2
+
+40.2
+
+95.6
+
+1.8
+
+93.6
+
+13.4
+
+28.0
+
+95.8
+
+0.0
+
+96.8
+
+VT
+
+55.8
+
+27.4
+
+56.2
+
+53.0
+
+0.0
+
+63.2
+
+17.6
+
+45.2
+
+50.4
+
+0.2
+
+69.2
+
+12.6
+
+33.8
+
+49.6
+
+4.0
+
+67.6
+
+Moreover, we aim to establish whether DMS is effective beyond inference-time scaling settings, so that a model retrofitted with DMS can be reliably deployed as a general-purpose LLM. To this end, we first compare DMS with respect to vanilla models for equivalent generated token lengths (rather than actual compute budget). We focus again on the same models and datasets as
+Section
+
+5.1
+. From
+Tables
+
+7
+,
+8
+and
+9
+, it emerges that DMS mostly preserves the original accuracy at CR 4
+\times
+and yields minimal degradations (~3.5 points on average) at CR 8
+\times
+.
+
+Next, we benchmark DMS on a broader set of tasks, as a way to ensure that its sparse prefilling does not affect performance in short generation settings: GSM8K
+(
+Cobbe et al. 2021
+)
+for grade-school math, MMLU
+(
+Hendrycks et al. 2021a
+)
+for factuality, HellaSwag
+(
+Zellers et al. 2019
+)
+for zero-shot common-sense question answering, and Needle in a Haystack
+(
+Kamradt 2023
+, NIAH;)
+and Variable Tracking
+(
+Hsieh et al. 2024
+, VT;)
+for long context processing.
+We select Llama 3.2 Instruct, which does not rely on long reasoning and is therefore compatible with short generation.
+Technical details for the experimental setup are provided in Appendices
+E
+and
+F
+.
+
+Table
+1
+compares downstream performance at 2
+\times
+, 3
+\times
+, and 4
+\times
+compression ratios.
+2
+2
+
+2
+
+While H2O and TOVA are designed for long context tasks with large sliding windows, we consciously evaluate them with short sliding windows to meet the target CRs.
+DMS stands out as the most robust method, achieving higher scores than both training-free and retrofitted baselines in most combinations of tasks and CRs, with Quest as a second-best contender. While in short-context tasks, DMS performance is close to the original LLM, in long-context tasks (such as NIAH and VT) DMS even surpasses it. We speculate this is due to overcoming limitations of dense attention over long sequences, such as over-squashing
+(
+Barbero et al. 2024
+)
+and lost-in-the-middle
+(
+Liu et al. 2024a
+)
+. Moreover, long-context performance provides evidence that—compared with DMC—DMS is more successful at extrapolating compression to lengths beyond those observed during retrofitting, albeit only up to a certain limit (see Appendix
+D
+).
+Among learned compression methods, DMC collapses quickly,
+likely due to its more challenging training objective amplified by the limited 1B model capacity.
+3
+3
+
+3
+
+Nevertheless, in Appendix
+D
+we show that, while still lagging behind, this collapse does not occur for shorter contexts and a larger non-GQA model.
+Overall, DMS emerges as a general-purpose method, whose performance retention at high compression ratios makes it suitable not only for inference-time hyper-scaling but also for short-context and long-context tasks.
+
+5.3
+Ablations for DMS and In-Depth Analysis
+
+Figure 4
+:
+GSM8K 0-shot scores
+of Llama 3.2 1B Instruct across different compression variants.
+Left:
+delayed eviction (default) with a 16-token window consistently preserves reasoning abilities of the model, while immediate eviction causes rapid degradation. The quality gap only widens as the compression gets stronger.
+Right:
+DMS requires an order of magnitude less data to train than DMC. This was also observed for Qwen 2.5 R1 models with 1.5B, 7B, and 32B parameter scales.
+
+The design choices in DMS were informed by results of small-scale experiments. We present ablations on eviction policy and data efficiency during retrofitting of the Llama 3.2 1B Instruct models. To evaluate the impact of
+delayed
+eviction, we trained additional models with
+immediate
+eviction, which aligns more closely with existing token eviction methods:
+
+Delayed eviction
+
+\alpha_{t}
+determines the eviction of
+(\mathbf{k}_{t},\mathbf{v}_{t})
+at a future time step
+t+w
+
+Immediate eviction
+
+\alpha_{t+w}
+determines the eviction of past
+(\mathbf{k}_{t},\mathbf{v}_{t})
+at time step
+t+w
+
+Both policies were tested with different sliding window sizes. Remarkably, DMS retains reasoning capabilities with a window of only 16 tokens up to a compression ratio of
+4\times
+, as shown in
+Figure
+
+4
+. Larger sliding window sizes better preserve reasoning capabilities, which is expected in a zero-shot setting. However, switching to immediate eviction drastically deteriorates scores for every tested sliding window length.
+
+Regarding data efficiency, the right panel of
+Figure
+
+4
+shows how scores vary when retrofitting with different training token budgets. Crucially, DMS achieves higher scores than DMC while using
+8\times
+fewer training tokens. In practice, the reasoning models described in
+Section
+
+5.1
+were trained with
+60\times
+less training data,
+4
+4
+
+4
+
+DMC was reported to require 44K training steps to reach CR8, with performance deteriorating when the amount of data is halved
+(
+Nawrot et al. 2024
+)
+.
+achieving CR
+4\times
+within 300 training steps and CR
+8\times
+within 700 steps.
+
+Finally, we measured how the CR varies for different lengths of the sequences generated through DMS (
+Figure
+
+5
+left). The resulting pattern closely matches that reported in
+Nawrot et al. 2024
+. The model sparsifies less than the target CR in early parts of a sequence, but even more aggressively than specified beyond 10K tokens. This behavior stems from the training objective and from the tendency of the conditional entropy rate of natural-language text to decrease as the context length grows. In
+Figure
+
+5
+(right), we also observe that early layers are compressed to a smaller degree than later layers.
+
+Figure 5
+:
+Left:
+The measured compression ratio
+for Qwen-R1 7B, trained with DMS CR
+4\times
+, while processing AIME 24, MATH 500, and GPQA Diamond problem instances. Right:
+Average per-head compression
+learned by the model, as a percentage of retained tokens sorted for every layer.
+
+6
+Related Work
+
+KV cache size reduction
+
+The challenge of KV cache reduction has garnered significant interest in recent years, with approaches falling into three main categories: attention sparsification, quantization, and decomposition.
+In addition to the sparse attention baselines considered in
+Section
+
+2.2
+,
+Landmark Attention
+(
+Mohtashami and Jaggi 2023
+)
+and Native Sparse Attention
+(
+Yuan et al. 2025
+)
+create representations for each KV cache chunk and retrieve only the most important chunks for attention computation, effectively reducing the amount of data transferred from the device HBM memory. Compared to these methods, DMS not only accelerates inference but also reduces memory load and allows for dynamically selecting different compression ratios across layers and heads based on the input. Moreover, DMS improves on other retrofitting methods, such as DMC
+(
+Nawrot et al. 2024
+)
+, both in terms of data efficiency and downstream accuracy.
+
+Another strategy for KV cache size reduction is quantization, exemplified by methods such as KIVI
+(
+Liu et al. 2024b
+)
+and KVQuant
+(
+Hooper et al. 2024
+)
+, which
+quantize keys per channel and values per token.
+Finally, KV cache reduction can be achieved via SVD-based decomposition. LoRC
+(
+Zhang et al. 2024
+)
+directly reduces the ranks of key and value matrices, whereas Eigen Attention
+(
+Saxena et al. 2024
+)
+moves the attention computation into a truncated space induced by SVD. While being less expressive than DMS as they assume uniform compression, both quantization and decomposition are orthogonal to DMS and can be potentially combined with it to further improve efficiency.
+
+Inference-time scaling
+
+Research on inference-time scaling has so far mostly assumed an equivalence between compute budget and generated tokens, in terms of sequence length or parallel samples
+(
+Brown et al. 2024
+;
+Zhang et al. 2023b
+;
+Wang et al. 2023
+)
+. This budget can be allocated adaptively to the complexity of the task
+(
+Snell et al. 2024
+)
+or forced to meet an amount pre-defined by the user
+(
+Muennighoff et al. 2025
+)
+. To the best of our knowledge, our work is the first to fully disentangle generated tokens from the effective compute (runtime and peak memory load) when reasoning in the discrete language space.
+In fact, we
+show how KV cache compression methods can effectively expand the token budget for the same compute budget.
+A separate family of strategies are based on latent space reasoning
+(
+Geiping et al. 2025
+)
+, which add a recurrent block on top of Transformer LLMs; however, this effectively requires a separate architecture rather than boosting existing LLMs, and it remains unclear whether these scale similarly to reasoning in the discrete token space.
+
+While in this work we opt for verifier-free scaling strategies, adopting the recommendations of
+Wang et al. 2025b
+, inference-time scaling can rely on process reward models (PRMs) to verify intermediate reasoning steps. This allows effective self-critique loops and re-ranking candidate solutions
+(
+Uesato et al. 2022
+;
+Lightman et al. 2024
+;
+Liang et al. 2024
+)
+.
+Nonetheless, we remark that hyper-scaling can be extended to PRM strategies, too. In particular, the verifier’s complexity is quadratic in the sequence length; to complement the benefits of KV cache compression of the LLM, the PRM would need to be accelerated by prefilling-time sparse attention methods, such as MInference
+(
+Jiang et al. 2024
+)
+. We leave this possible direction to future work.
+
+7
+Conclusions
+
+We introduce inference-time
+hyper-scaling
+: by compressing the key–value cache of Transformer LLMs via sparse attention, we improve downstream reasoning accuracy by enabling longer token sequences or more parallel sequences at the same compute budget—in terms of runtime or memory—compared to the original LLM. A fundamental requirement of inference-time hyper-scaling is to increase efficiency without sacrificing accuracy. To achieve this, we propose Dynamic Memory Sparsification (DMS), a novel, trainable KV cache reduction method that delays eviction decisions, while remaining highly data-efficient. Empirically, we observe large gains on benchmarks involving advanced math, scientific problems, and coding, demonstrating the effectiveness of hyper-scaling. Overall, our approach provides an inexpensive strategy for converting LLMs into more effective reasoners, pushing inference-time scaling to new frontiers.
+
