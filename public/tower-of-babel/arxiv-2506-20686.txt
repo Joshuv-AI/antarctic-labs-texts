@@ -1,0 +1,3866 @@
+MegaFold: System-Level Optimizations for Accelerating Protein Structure Prediction Models
+Hoa La 1 §, Ahan Gupta §, Alex Morehead, Jianlin Cheng, Minjia Zhang
+
+Abstract
+Protein structure prediction models such as AlphaFold3 (AF3) push the frontier of biomolecular modeling by incorporating science-informed architectural changes to the transformer architecture. However, these advances come at a steep system cost, introducing: compute- and memory-intensive operators, 2D attention mechanisms, and retrieval-augmented data pipelines, which collectively hinder the scalability of AF3 training. In this work, we present MegaFold, a cross-platform system to accelerate AF3 training. MegaFold tackles key bottlenecks through ahead-of-time caching to eliminate GPU idle time from the retrieval-augmented data pipeline, Triton-based kernels for memory-efficient EvoAttention on heterogeneous devices, and deep fusion for common and critical small operators in AF3. Evaluation on both NVIDIA H200 and AMD MI250 GPUs shows that MegaFold reduces peak memory usage of AF3 training by up to 1.23 × \times and improves per-iteration training time by up-to 1.73 × \times and 1.62 × \times respectively. More importantly, MegaFold enables training on 1.35 × \times longer sequence lengths compared to PyTorch baselines without running out-of-memory, significantly improving the scalability of modern protein folding models. We open source our code at https://github.com/Supercomputing-System-AI-Lab/MegaFold/ .
+
+
+
+\textsuperscript{1}
+\textsuperscript{1}
+footnotetext:
+Work done while interning at UIUC
+§
+§
+footnotetext:
+Equal contribution
+
+I
+Introduction
+
+Recent advancements in protein structure prediction have been driven by breakthroughs in deep learning models such as AlphaFold2
+[
+1
+]
+and AlphaFold3
+[
+2
+]
+.
+These models not only achieve near-experimental accuracy but also open new avenues for understanding complex biomolecular interactions
+[
+3
+,
+4
+,
+5
+,
+6
+,
+7
+,
+8
+]
+. In particular, AlphaFold3 (AF3) takes a major step forward by generalizing structure prediction to protein-protein, protein-DNA/RNA, protein-ligand, and protein–ion interactions by incorporating template structures and experimental data, making a shift towards science-informed model design.
+
+However, AF3 introduces significant system-level challenges. The model employs a retrieval-augmented preprocessing pipeline that incorporates evolutionary context information, novel 2D attention mechanisms, and a diffusion-based output module. These innovations, while biologically motivated, create execution bottlenecks that limit the training efficiency and scalability of AF3 on modern GPUs. Our profiling of a popular open-source AF3 implementation
+[
+9
+]
+(explained in Section
+III
+) uncovers that AF3’s science-informed architecture leads to new system performance bottlenecks such as out-of-memory error when scaling sequence lengths and sub-optimal training speed. Moreover, a root cause analysis shows that these challenges are hard to be resolved through prior training frameworks and optimizations such as Megatron-LM
+[
+10
+]
+, DeepSpeed
+[
+11
+]
+, and FlashAttention
+[
+12
+]
+, which are designed for canonical transformer architectures used in LLMs. Concretely, the key challenges in training AF3 are as follows.
+
+First, the AF3 training pipeline incurs expensive CPU-side data preprocessing. Unlike LLMs whose data pipeline often includes solely of input reading and tokenization, AF3 training pipelines include heavy processing of searching similar sequences across different species–a process known as Multiple Sequence Alignment (MSA)–to provide rich evolutionary context
+[
+1
+]
+.
+The processing is conducted on the CPU, which introduces significant GPU idle time and makes it a major performance bottleneck during training (Section
+III
+).
+
+Second, AF3 employs a unique yet memory-heavy 2D attention mechanism. Similar to how LLMs use transformers to learn relationships between word tokens in a sentence, AF models adapt transformers to capture interactions among amino acids or nucleic acids in a biological sequence such as protein, DNA, or RNA, through an evolutionary attention mechanism, which we term
+EvoAttention
+. However, this attention mechanism performs attention calculation between the pair-wise representation of amino-acids and injects priors through additive biases, thus operating on 2D data (amino-acid pairs) instead of 1D data as in natural language (sequences). The 2D EvoAttention has a
+O({N_{token}}^{3})
+memory complexity, leading to peak memory explosion, preventing scientists from training longer sequences (Section
+III
+). In addition, because the 2D EvoAttention is different from the standard attention mechanism in Transformers, optimizations such as FlashAttention
+[
+12
+,
+13
+,
+14
+]
+do not directly apply.
+
+Third, AF3 incurs prolonged execution from many small but frequent and memory-bound operators. Unlike LLMs consuming token embeddings as the only input, AF models must capture the intricate geometry of molecules, thereby requiring multiple interdependent input features (MSAs, single and pairwise representations, atom-level embeddings, etc.) This complexity results in a large number of small but memory-bound operators (e.g. layer-normalizations, linear layers, activation functions) to support its modeling capabilities. This adversarially impacts performance due to kernel launch overhead and low memory-bandwidth utilization, and increases memory consumption due to many intermediate activations stored for the backward pass.
+
+Collectively, these issues constrain training AF3 models to short protein lengths and cause elongated training times (e.g., 11 days on 128 GPUs
+[
+15
+]
+despite being a moderate
+\sim
+500M parameter model).
+Motivated by these challenges, we develop MegaFold, a novel system that enhances the efficiency and scalability of training protein structure prediction models, such as AF3. MegaFold achieves this by a targeted set of optimizations to mitigate the compute and memory heavy operators introduced in protein structure prediction models. It consists of an ahead-of-time cache-based data-loader (Section
+IV-A
+), memory-efficient kernels for EvoAttention (Section
+IV-B
+), and novel fusions of small but frequent AlphaFold-centric operators (Section
+IV-C
+).
+
+We implement MegaFold by extending a popular open-source PyTorch-based AF3 training system
+[
+9
+]
+, specifically designing MegaFold to be portable across GPU platforms.
+We evaluate our system on both NVIDIA H200 and AMD MI250 hardware. Our results show that MegaFold reduces the peak memory usage by up to 1.23
+\times
+, while improving per-iteration training time by up to 1.73
+\times
+and 1.62
+\times
+
+on NVIDIA and AMD hardware respectively, over existing solutions. Moreover, our optimizations enable 1.35
+\times
+longer input sequence lengths compared to the PyTorch baseline. These improvements make it more feasible to train advanced protein structure prediction models on diverse and modern GPU hardware.
+
+II
+Background
+
+In this section, we introduce key components of protein structure prediction models and contemporary techniques to train such models at scale. We contextualize our discussion to AF3
+[
+2
+]
+, the latest protein structure prediction model.
+
+II-A
+
+AlphaFold3 Architecture
+
+AlphaFold3
+[
+2
+]
+is a state-of-the-art structural biology model, which extends the capabilities of its predecessor, AlphaFold2
+[
+1
+]
+, to support not just protein folding, but also interactions among protein, DNA, RNA, and small molecules. In particular, AF3 incorporates a significantly more complex architecture and data pipeline to generalize across biomolecular systems. Fig.
+6
+illustrates the high-level architecture of AF3. Below we introduce the necessary background needed for understanding subsequent sections (Simon and Silberg
+[
+16
+]
+contains a more in-depth explanation of the AlphaFold3 architecture for the interested reader).
+
+II-A
+1
+AlphaFold3 Inputs and Data Pipeline
+
+AlphaFold3 begins by processing raw biomolecular inputs, such as proteins, DNA, and small molecules, into two main internal representations: a
+single representation
+for each token and a
+pair representation
+for token interactions. These become the key inputs to subsequent modules in AF3. The pipeline starts by decomposing each input complexes into individual atoms using tools such as RDKit
+[
+17
+]
+. Local atomic features are then aggregated to create the single representation:
+token
+[
+N_{token},h_{single}
+], where each token corresponds to a residue or molecular unit. This captures token-level features such as chemical identity and local geometrical structure. To model how these tokens interact, which is critical for accurately predicting 3D structure, AF3 also constructs a pair representation:
+token
+{}_{\text{pair}}
+[
+N_{token},N_{token},h_{pair}
+]. This is initialized using geometric priors from atomic coordinates and is further enhanced via two key modules: (1) The Multiple Sequence Alignment (MSA) module, which extracts evolutionary context information by aligning similar sequences across different species and embeds that information into pairwise features. (2) The Template module, which encodes prior structural knowledge from experimentally known complexes into pairwise features. Together, the single and pair representations serve as the primary inputs to AF3’s Pairformer module, where 1D attention operates on the single representation and 2D EvoAttention on the pair representation, which is described next.
+
+Fig. 1:
+Overview of the AlphaFold3 architecture.
+
+II-A
+2
+Pairformer Module
+
+The core model backbone of AF3 is Pairformer, which processes 2D
+token
+{}_{\text{pair}}
+data, 1D
+token
+tensors, and other auxiliary signals.
+Pairformer replaces the Evoformer from AF2 and consists of two key operators: 2D EvoAttention, and transitions. The 2D EvoAttention variant, consisting of multiple heads, resembles:
+
+Q
+
+\displaystyle=\overbrace{\texttt{Transpose}(\texttt{token${}_{\text{pair}}$$\cdot$W${}^{\text{Q}}$},[2,0,1,3])}^{\texttt{[N${}_{\text{heads}}$, N${}_{\text{token}}$, N${}_{\text{token}}$, h${}_{\text{head}}$]}}
+
+K
+
+\displaystyle=\texttt{Transpose}(\texttt{token${}_{\text{pair}}$$\cdot$W${}^{\text{K}}$},[2,0,1,3])
+
+V
+
+\displaystyle=\texttt{Transpose}(\texttt{token${}_{\text{pair}}$$\cdot$W${}^{\text{V}}$},[2,0,1,3])
+
+Bias
+
+\displaystyle=\overbrace{\texttt{Transpose}(\texttt{token${}_{\text{pair}}$$\cdot$W${}^{\text{B}}$},[2,3,0,1])}^{\texttt{[N${}_{\text{heads}}$, 1, N${}_{\text{token}}$, N${}_{\text{token}}$]}}
+
+S
+
+\displaystyle=\overbrace{\frac{\texttt{Q}\cdot(\texttt{K})^{T}}{\sqrt{d_{h}}}}^{\texttt{[N${}_{\text{heads}}$, N${}_{\text{token}}$, N${}_{\text{token}}$, N${}_{\text{token}}$]}}\oplus\texttt{Bias}
+
+P
+
+\displaystyle=\texttt{Softmax(S)}
+
+\displaystyle O
+
+\displaystyle=\texttt{P}\cdot\texttt{V}
+
+Where the
+W
+{}^{\text{Q}}
+,
+W
+{}^{\text{K}}
+, and
+W
+{}^{\text{V}}
+are
+[h
+{}_{\text{token}}
+, N
+{}_{\text{heads}}
+, h
+{}_{\text{head}}
+]
+-sized tensors, and
+W
+{}^{\text{B}}
+is a
+[h
+{}_{\text{token}}
+, N
+{}_{\text{head}}
+, 1]
+-sized tensor.
+\oplus
+is pairwise addition with an implicit broadcast of the
+Bias
+tensor across the first
+dimension (0-based indexing). In contrast to self-attention on 1D textual data,
+S
+produces
+O({N_{token}}^{3})
+sized logits, inhibiting scalable training at large token counts. On the other hand, the transition operator is the counterpart of the feed-forward layer in LLMs. However, it consists of a layer-normalization followed by a two layer feed-forward network with an intermediate swiglu activation function, rather than root-mean-square normalizations like in modern LLMs.
+
+II-A
+3
+Diffusion-based Structure Decoder
+
+The diffusion-based structure decoder is the last step in an AF3 training iteration. It consumes the information from the Pairformer module, and conditions the generation of the output - the 3D coordinates of individual atoms in the input complex - on these tensors through a denoising decoder.
+The denoising decoder consists of attention operations on the atomic, atomic-pairwise, token, and token-pairwise representations of the original input augmented with the processed Pairformer outputs with cross-attention between representations through adaptive layer-normalizations as well as transition operators. To improve robustness and learning signal, the diffusion module also includes heavy data augmentation (e.g., by 48x), which augments ground-truth 3D coordinates with random rotations and translations.
+
+II-B
+
+Limitations of Existing System Optimizations
+
+Fig. 2:
+Program trace of a training iteration in the steady state with sequence length 384 and batch size 1.
+
+A wide range of compiler and runtime optimizations have been developed for training large-scale Transformer models. These includes customized attention kernels, such as FlashAttention
+[
+12
+,
+13
+,
+14
+]
+, which employs an online stable softmax
+[
+18
+]
+, tiling, and kernel fusion to reduce memory consumption.
+However, FlashAttention operates on 1D textual tokens and fuses only matrix multiplications, whilst the EvoAttention mechanism operates on 2D pairwise data with additive learned biases that are broadcasted over attention logits. Therefore, EvoAttention breaks compatibility with FlashAttention and other memory-efficient attention kernels.
+Megatron-LM
+[
+10
+]
+and DeepSpeed
+[
+11
+]
+introduce advanced parallel training strategies such as tensor slicing parallelism (TP), pipeline parallelism (PP)
+[
+19
+]
+, and ZERO-style Data Parallelism
+[
+20
+]
+. However, most of these parallel strategies target either models with large parameter counts or models with huge intermediate activation tensors, whilst AF models are small
+\sim
+500M parameter models that produce many smaller intermediate activation tensors.
+
+Prior work have also investigated optimizations for AF-style models. FastFold
+[
+15
+]
+proposes a novel sequence-parallel strategy: Dynamic Axial Parallelism (DAP) alongside several kernel optimizations for long-sequence AF-2 training that consist of the Evoformer module
+[
+1
+]
+. DAP partitions the activations across one of the sequential axis’ of the 2D tensor,
+token
+{}_{\text{pair}}
+, inserting necessary communication collectives when data needs to be exchanged between devices. Additionally, they introduce optimized kernels for the softmax and layernorm operator as well as communication-computation overlapping optimizations.
+However, most methods focused on AF2 models with limited investigation of AF3.
+Scale-fold
+[
+20
+]
+introduces additional optimizations for AF-2 that includes: data-loading optimizations to reduce load imbalances, and optimized fused kernels in Triton for layer-normalizations and attention layers. However, it is not open-sourced and targets only NVIDIA hardware.
+Different from prior efforts, MegaFold builds upon a widely used open-source AF3 implementation and makes it an efficient, cross-platform system for reproducible research.
+
+III
+Performance Characterization
+
+Although AF models represent a big step in protein structure prediction, existing implementations such as
+[
+9
+,
+21
+]
+rely on un-optimized PyTorch operators and present significant challenges for scalably training AF models. We characterize three issues by analyzing one of the widely used open-source AlphaFold3 implementation
+[
+9
+]
+. Unless otherwise noted, all experiments are conducted with batch size 1 and sequence length 384.
+
+Fig. 3:
+End-to-End memory breakdown of a single iteration of AF-3 training. The numbers indicate the total sum of the: Model Weights, Gradients, Optimizer states (top number), and Activation Memory (bottom number).
+
+Data Preprocessing Induced GPU Idling-Time
+
+Despite AF3 operating on relatively short biomolecular complex lengths due to its large memory consumption (explained in Section
+III
+), the data-loading and preprocessing stages on the CPU consume a non-trivial portion of execution time per-iteration. This is primarily because of the processing of MSA and template structures to augment the input complex with more evolutionary and structural information. We quantify this effect by profiling an iteration of the training loop using Nsight-profile, NVIDIA’s CPU-GPU profiler, as shown in Fig.
+2
+. In the steady state, the preprocessing stage occurring on the CPU induces periods during which the GPU is stalled, waiting for inputs. Moreover, the number of MSAs differs between input complexes, resulting in a large variance in runtime for the data-loading and pre-processing stage, consuming anywhere between 2-60s per iteration. Finally, unlike conventional PyTorch dataloaders used in vision and LLM training, which can overlap data loading with compute, AF3’s heavy preprocessing has limited overlap due complex data dependencies and lack of asynchronous execution support.
+
+Observation-1:
+Extensive data preprocessing leads to substantial GPU idle time. The lack of system-level support for overlapping further exacerbates this inefficiency.
+
+Memory-heavy Layers
+
+AF3 has a moderate parameter count (
+\sim
+500M), yet it incurs significant activation memory during training, forcing researchers to train models on short input context lengths, limiting the protein size a model can operate on. We quantify this effect by measuring the end-to-end memory consumption of AF3 across various sequences in Fig.
+3
+,
+breaking down memory consumption into four categories: model weights, activation memory, gradients and optimizer states. The collective sum of the model weights, gradients and optimizer states amounts to 4.08GB whilst the activation memory produced can be as great as 107.4GB, consuming 96% of end-to-end memory.
+
+Fig. 4:
+Memory breakdown of the activations produced in a single AF3 training iteration across various sequence lengths with a batch size of one. Examples of other operators are: triangle update and outer-products.
+
+Figure
+4
+further shows the breakdown of the activation memory across various sequence lengths.
+The two most memory-heavy operators: EvoAttention and Transition, produce more than 60% of the activations per iteration as each operator frequently appears in both the Pairformer trunk and diffusion based structure decoder.
+Moreover, the most memory-heavy operator: EvoAttention, rapidly produces more activations with longer sequence lengths, producing
+\sim
+6GB of activations at a sequence length of 64, which increases to
+\sim
+44.5 at a sequence length of 192. This corresponds to a 7.4
+\times
+increase in activation memory with a mere 3
+\times
+increase in sequence length as a result of the cubic complexity of EvoAttention. This poses a great challenge for scalable training at
+long
+-sequence lengths, limiting the protein size a model can operate on.
+Moreover, while optimizations, such as FlashAttention
+[
+12
+]
+, help reduce the activation memory of conventional attention, they cannot be easily adapted to mitigate this issue due to the additive broadcasted bias term in the forward pass of EvoAttention which also results in an extra reduction in the backward pass.
+
+Observation-2:
+Despite AF3’s moderate model size, significant activation memory is produced during training due to EvoAttention’s cubic dependence on input sequence lengths,
+posing a challenge for long-sequence training.
+
+Fig. 5:
+Kernel launch counts of common compute operators in a single training iteration of AF3 and a size-equivalent BLOOM-560M LLM. AF3 and BLOOM-560M use different activation functions.
+
+Excessive Kernel Launch Overhead
+
+Despite AF3’s moderate model size, AF3 invokes a massive number of small compute kernels per training step, such as matrix-multiplications (e.g. linear-layers) and activation functions (e.g. sigmoids) that are often memory-bound. We quantify this by profiling commonly launched compute kernels in a single training iteration of AF3 and comparing this to a size-equivalent transformer-based LLM, BLOOM-560M
+[
+22
+]
+, in Fig.
+5
+. Surprisingly, over 37,000 linear-layer kernels, 25,000 layer-normalization kernels, and 12,000 activation-function kernels are launched in a single AF3 training iteration, which is more than 100
+\times
+the kernel count of BLOOM-560M.
+
+This impacts both compute and memory significantly. Frequent kernel launches introduce overhead due to accumulated kernel launch latency from acquiring GPU hardware kernel-launch resources, while the inputs of
+each
+kernel have to be stored to compute gradients in the backward pass.
+
+Observation-3:
+AF3’s novel model architecture results in two orders of magnitude more kernel launches than size-equivalent transformers, which adversarially impacts both the training speed and memory efficiency.
+
+IV
+MegaFold Design
+
+Fig. 6:
+An overview of the MegaFold optimizations contextualised to AlphaFold 3, the latest protein structure prediction model.
+
+To address key bottlenecks in training AF-style models, MegaFold introduces a series of optimizations that reduce memory consumption and increase performance. Fig.
+6
+is an overview of how MegaFold operates in the context of AF3, the current SoTA protein structure prediction model (though our optimizations broadly apply across AF-models). First, we introduce an ahead-of-the-time cache-based data-loader in Section
+IV-A
+. Next, we introduce memory-efficient optimizations to the EvoAttention operation in Section
+IV-B
+. Finally, we introduce deep fusion optimizations to small but common AF3 operators in Section
+IV-C
+.
+
+IV-A
+
+Ahead-of-Time Cache-based Data-Loading
+
+Unlike conventional data-loading pipelines in the LLM literature, the data-loading and preprocessing stage in AF-models involves extensive CPU usage, such as RDKit-based atom construction, MSA and templates processing for input augmentation. These steps often incur significant overhead, leading to CPU-GPU imbalances and GPU idle time during training. To circumvent this, we propose an ahead-of-time cache-based data loading optimization that avoids repeating expensive deterministic preprocessing steps by precomputing the deterministic features for each protein complex and memoizing them in storage once prior to training.
+
+During training, cached deterministic features can be retrieved through fast lookups for further aligning with the input sequence per-iteration. We illustrate the default training loop and the modifications our optimization introduces in listing
+1
+.
+
+⬇
+
+1
+
+def
+
+generate_cache
+(
+data
+):
+
+2
+
+cache
+
+=
+
+{}
+
+3
+
+for
+
+inp
+
+in
+
+data
+:
+
+4
+
+cache
+[
+inp
+]
+
+=
+
+(
+atom_features
+(
+inp
+),\
+
+5
+
+msa_features
+(
+inp
+))
+
+6
+
+return
+
+cache
+
+7
+
+def
+
+train_loop
+(
+data
+,
+af
+,
+opt
+,
+loss_fn
+):
+
+8
+
+""
+"Main
+
+training
+
+loop.
+
+9
+
+data:
+
+input
+
+data-source.
+
+10
+
+af:
+
+the
+
+af-model
+
+to
+
+train.
+
+11
+
+"
+""
+
+12
+
+for
+
+inp
+,
+
+out
+
+in
+
+data
+:
+
+13
+
+#
+
+Extract
+
+atom
+
+feature
+
+info
+
+14
+
+atom_feat
+
+=
+
+atom_features
+(
+inp
+)
+
+15
+
+#
+
+Extract
+
+msa
+
+feature
+
+info
+
+16
+
+msa_feat
+
+=
+
+msa_features
+(
+inp
+)
+
+17
+
+p_atom_feat
+,
+p_msa_feat
+
+=
+
+preprocess
+(
+atom_feat
+,
+
+18
+
+msa_feat
+)
+
+19
+
+tokenize_repr
+
+=
+
+tokenize
+(
+p_atom_feat
+,
+
+20
+
+p_msa_feat
+)
+
+21
+
+output
+
+=
+
+loss_fn
+(
+af
+(
+tokenize_repr
+),
+
+output
+)
+
+22
+
+output
+.
+backward
+()
+
+23
+
+opt
+.
+step
+()
+
+24
+
+def
+
+cached_train
+(
+data
+,
+af
+,
+opt
+,
+loss_fn
+,
+
+cache
+):
+
+25
+
+""
+"Main
+
+training
+
+loop.
+
+26
+
+data:
+
+input
+
+data-source.
+
+27
+
+af:
+
+the
+
+af-model
+
+to
+
+train.
+
+28
+
+"
+""
+
+29
+
+for
+
+inp
+,
+
+out
+
+in
+
+data
+:
+
+30
+
+atom_feat
+,
+
+msa_feat
+
+=
+
+cache
+[
+inp
+]
+
+31
+
+p_atom_feat
+,
+p_msa_feat
+
+=
+
+preprocess
+(
+atom_feat
+,
+
+32
+
+msa_feat
+)
+
+33
+
+tokenize_repr
+
+=
+
+tokenize
+(
+p_atom_feat
+,
+
+34
+
+p_msa_feat
+)
+
+35
+
+output
+
+=
+
+loss_fn
+(
+af
+(
+tokenize_repr
+),
+
+output
+)
+
+36
+
+output
+.
+backward
+()
+
+37
+
+opt
+.
+step
+()
+
+38
+
+#
+
+Stage
+
+1:
+
+Populate
+
+cache.
+
+39
+
+cache
+
+=
+
+generate_cache
+(
+data
+)
+
+40
+
+#
+
+Stage
+
+2:
+
+train.
+
+41
+
+cached_train
+(
+data
+,
+
+af
+,
+
+opt
+,
+
+loss
+,
+
+cache
+)
+
+Listing 1:
+Main training loop.
+
+Default Training Loop
+
+An AF3 training loop (lines 12-23 in listing
+1
+) consists of three stages. In the first stage (lines 14-16), the input is analyzed and valuable atomic level features, such as the atom shape of the input complex, are constructed (line 14). Moreover, MSA files are parsed and tokenized to extract MSA features (line 16). Since the first stage utilizes expensive RDKit library functions and typically processes long MSAs, and subsequent operations depend on its output, it becomes a bottleneck during each training step. In the second stage (line 17-20), the atomic and MSA features undergo further preprocessing in the
+preprocess
+function (lines 17-18) like randomly cropping them to sequence lengths of 384 and tokenizing them into a standard representation (lines 19-20). Finally, in the third stage (lines 21-23), the tokenized representation is fed into the model (line 21) and one step of gradient descent is taken (lines 22-23).
+
+Optimized Training Loop
+
+Notably, certain steps of the first stage produce deterministic outputs given an input complex, enabling them to be pre-computed ahead of time and cached. For example, constructing RDKit atoms and converting raw MSA files to features can be cached. We pre-process this stage ahead of time and populate a
+cache
+that maps each input complex in our dataset to its atomic and MSA-features in the
+generate_cache
+function (lines 1-6). This function is called once prior to training, and enables us to modify the original training-loop to replace the expensive atom feature generation and MSA retrieval steps with faster cache lookups (line 30). The remaining non-deterministic operations that cannot be cached like randomly cropping inputs, are processed in each step within the
+preprocess
+function (lines 31-32).
+
+IV-B
+
+Memory-Efficient EvoAttention for Heterogeneous Devices
+
+AF3’s EvoAttention mechanism operates on 2D inputs, which results in cubic memory complexity with respect to input sequence lengths. This inhibits scalably training AF-models on longer proteins and biomolecular complexes.
+To enhance the memory-efficiency of AF training, we develop a custom fused EvoAttention operator (listing
+2
+) in Triton
+[
+23
+]
+, a DSL for programming GPUs belonging to various vendors, including
+both
+NVIDIA and AMD (more information in Appendix
+A
+).
+Our fused operator avoids materializing large intermediate attention logits in memory and instead incrementally materializes them in fast scratchpad memory during the forward pass, recomputing them on-the-fly to calculate gradients in the backward pass. This eliminates writing the intermediate cubic logits to memory.
+Unlike FlashAttention
+[
+12
+]
+which operates only on the
+Q
+,
+K
+&
+V
+tensors, our fused EvoAttention operator additionally operates on a
+Bias
+tensor which requires a broadcast in the forward pass and a reduction in the backward pass. In the forward pass, thread-blocks need to resolve how to correctly index the
+Bias
+tensor and in the backward pass, special care must be taken in how to store reduced values in scratchpad memories as increasing pressure on these caches reduces the occupancy of a kernel, adversely impacting runtime performance.
+
+⬇
+
+1
+
+#
+
+Omit
+
+indexing
+
+on
+
+batch/head/hid.
+
+dim
+
+for
+
+brevity
+
+2
+
+def
+
+fused_attn_fwd
+(
+Q
+,
+K
+,
+V
+,
+mask
+,
+bias
+):
+
+3
+
+""
+"Launched
+
+with
+
+thread-blocks
+
+of
+
+size:
+
+[by,
+
+bx]
+
+4
+
+Q,
+
+K,
+
+V:
+
+[b,
+
+heads,
+
+N,
+
+N,
+
+d]
+
+tensor.
+
+5
+
+mask:
+
+[b,
+
+N,
+
+N]
+
+tensor.
+
+6
+
+bias:
+
+[b,
+
+heads,
+
+N,
+
+N]
+
+tensor.
+
+7
+
+"
+""
+
+8
+
+i
+
+=
+
+tl
+.
+program_id
+(0)
+
+9
+
+li
+,
+
+mi
+
+=
+
+[0]*
+by
+,
+
+[-
+inf
+]*
+by
+
+10
+
+qi
+
+=
+
+Q
+[
+i
+*
+by
+:(
+i
++1)
+by
+,
+
+:]
+
+11
+
+oi
+
+=
+
+zeros
+((
+by
+,
+
+d
+))
+
+12
+
+for
+
+j
+
+in
+
+range
+(
+N
+/
+bx
+):
+
+13
+
+s
+
+=
+
+tl
+.
+matmul
+(
+qi
+,
+
+k
+[
+j
+*
+bx
+:(
+j
++1)
+bx
+,:].
+T
+)+\
+
+14
+
+bias
+[
+i
+*
+by
+:(
+i
++1)
+by
+,
+j
+*
+bx
+:(
+j
++1)
+bx
+]
+
+15
+
+mij
+
+=
+
+tl
+.
+maximum
+(
+mi
+,
+tl
+.
+max
+(
+s
+,1))
+
+16
+
+s
+
+-=
+
+mij
+
+17
+
+p
+
+=
+
+tl
+.
+exp
+(
+s
+)
+
+18
+
+lij
+
+=
+
+tl
+.
+sum
+(
+s
+,
+
+axis
+=-1)
+
+19
+
+alpha
+
+=
+
+tl
+.
+exp
+(
+mi
+-
+mij
+)
+
+20
+
+li
+,
+
+mi
+
+=
+
+li
+*
+alpha
++
+lij
+
+,
+
+mij
+
+21
+
+oi
+
+=
+
+oi
+
+*
+
+alpha
+
++
+
+\
+
+22
+
+tl
+.
+matmul
+(
+p
+,
+v
+[
+j
+*
+bx
+:(
+j
++1)
+bx
+,
+
+:])
+
+23
+
+return
+
+oi
+,
+
+li
+,
+
+mi
+
+24
+
+def
+
+fused_attn_bwd
+(
+dO
+,
+Q
+,
+K
+,
+V
+,
+bias
+,
+l
+,
+m
+,
+D
+,
+O
+):
+
+25
+
+D
+
+=
+
+preprocess
+(
+dO
+,
+O
+)
+
+26
+
+dk
+,
+
+dv
+
+=
+
+dv_dk
+(
+dO
+,
+Q
+,
+K
+,
+V
+,
+bias
+,
+l
+,
+m
+,
+D
+)
+
+27
+
+dBias
+
+=
+
+zeros
+(
+bias
+.
+shape
+)
+
+28
+
+dq
+
+=
+
+dq_dbias
+(
+dO
+,
+Q
+,
+K
+,
+V
+,
+bias
+,
+l
+,
+m
+,
+D
+,
+dBias
+)
+
+29
+
+return
+
+dq
+,
+
+dk
+,
+
+dv
+,
+
+dbias
+
+30
+
+#
+
+Stage
+
+1,
+
+compute:
+
+(1)dv,
+
+(2)dP,
+
+(3)dS,
+
+(4)dk
+
+31
+
+def
+
+dv_dk
+(
+dO
+,
+Q
+,
+K
+,
+V
+,
+bias
+,
+l
+,
+m
+,
+D
+):
+
+32
+
+j
+
+=
+
+tl
+.
+program_id
+(0)
+
+33
+
+dk
+
+=
+
+dv
+
+=
+
+zeros
+((
+bx
+,
+
+d
+))
+
+34
+
+kj
+,
+
+vj
+
+=
+
+k
+[
+j
+*
+bx
+:(
+j
++1)*
+bx
+,
+
+:],
+
+\
+
+35
+
+v
+[
+j
+*
+bx
+:(
+j
++1)*
+bx
+,
+
+:]
+
+36
+
+for
+
+i
+
+in
+
+range
+(
+N
+/
+by
+):
+
+37
+
+qiT
+
+=
+
+q
+[
+i
+*
+by
+:(
+i
++1)*
+by
+,
+
+:].
+T
+
+38
+
+mi
+,
+
+di
+
+=
+
+m
+[
+i
+*
+by
+:(
+i
++1)*
+by
+],
+
+D
+[
+i
+*
+by
+:(
+i
++1)*
+by
+]
+
+39
+
+dOi
+
+=
+
+dO
+[
+i
+*
+by
+:(
+i
++1)*
+by
+,
+
+:]
+
+40
+
+sT
+
+=
+
+tl
+.
+matmul
+(
+kj
+,
+
+qiT
+)
+
++
+
+\
+
+41
+
+bias
+[
+j
+*
+bx
+:(
+j
++1)*
+bx
+,
+i
+*
+by
+:(
+i
++1)*
+by
+]
+
+42
+
+pT
+
+=
+
+tl
+.
+exp
+(
+sT
+-
+mi
+)
+
+43
+
+dv
+
++=
+
+tl
+.
+matmul
+(
+pT
+,
+
+dOi
+)
+
+44
+
+dpT
+
+=
+
+tl
+.
+matmul
+(
+v
+,
+
+dOi
+.
+T
+)
+
+45
+
+dST
+
+=
+
+pT
+
+*
+
+(
+dpT
+
+-
+
+di
+)
+
+46
+
+dk
+
++=
+
+tl
+.
+matmul
+(
+dST
+,
+
+qiT
+.
+T
+)
+
+47
+
+return
+
+dk
+,
+
+dv
+
+48
+
+#
+
+Stage
+
+2,
+
+compute:
+
+(1)dS,
+
+(2)dbias,
+
+(3)dq
+
+49
+
+def
+
+dq_dbias
+(
+dO
+,
+Q
+,
+K
+,
+V
+,
+bias
+,
+l
+,
+m
+,
+D
+,
+dBias
+):
+
+50
+
+i
+
+=
+
+tl
+.
+program_id
+(0)
+
+51
+
+dq
+
+=
+
+zeros
+((
+by
+,
+
+d
+))
+
+52
+
+qi
+
+=
+
+Q
+[
+i
+*
+by
+:(
+i
++1)
+by
+,
+
+:]
+
+53
+
+doi
+
+=
+
+dO
+[
+i
+*
+by
+:(
+i
++1)*
+by
+,
+
+:]
+
+54
+
+mi
+,
+
+di
+
+=
+
+m
+[
+i
+*
+by
+:(
+i
++1)*
+by
+],
+
+D
+[
+i
+*
+by
+:(
+i
++1)*
+by
+]
+
+55
+
+for
+
+j
+
+in
+
+range
+(
+N
+/
+bx
+):
+
+56
+
+kjT
+,
+
+vjT
+
+=
+
+K
+[
+j
+*
+bx
+:(
+j
++1)
+bx
+,
+
+:].
+T
+,
+
+\
+
+57
+
+V
+[
+j
+*
+bx
+:(
+j
++1)*
+bx
+,
+
+:].
+T
+
+58
+
+s
+
+=
+
+tl
+.
+matmul
+(
+qi
+,
+
+kjT
+)
+
++
+
+\
+
+59
+
+bias
+[
+i
+*
+by
+:(
+i
++1)*
+by
+,
+j
+*
+bx
+:(
+j
++1)*
+bx
+]
+
+60
+
+p
+
+=
+
+tl
+.
+exp
+(
+s
+-
+mi
+)
+
+61
+
+dp
+
+=
+
+tl
+.
+matmul
+(
+doi
+,
+
+vjT
+)
+
+62
+
+ds
+
+=
+
+p
+*(
+dp
+-
+di
+)
+
+63
+
+tl
+.
+atomic_add
+(
+dbias
+,
+
+ds
+)
+
+64
+
+dq
+
++=
+
+tl
+.
+matmul
+(
+ds
+,
+
+kjT
+.
+T
+)
+
+65
+
+return
+
+dq
+
+Listing 2:
+Memory-Efficient Fused EvoAttention.
+
+Forward Pass
+
+The forward pass is shown as the
+fused_attn_fwd
+function in listing
+2
+and table
+I
+. It is launched with 2-D thread-blocks of size:
+[b
+y
+, b
+x
+]
+, with each thread-block scheduled to compute one “chunk” (consisting of multiple rows) of the output tensor
+o
+.
+However, the fused operator involves a reduction in the softmax operation, which normalizes the attention logits prior to being multiplied by the
+values
+tensor. In order to compute the softmax of the attention logits, an entire row needs to be computed, but a single thread-block will aim to directly compute the final output,
+o
+, by
+incrementally
+computing the attention logits in scratchpad memories, requiring the need for an online softmax like in
+[
+18
+]
+.
+To achieve this, thread-blocks will keep track of certain metadata that will be used to correctly rescale the output
+o
+. Our kernel proceeds with each thread-block first initializing the
+li
+and
+mi
+metadata, the running sum and maximum values (the metadata required for correct rescaling) as
+0
+and
+-inf
+respectively (line 9), and extracts its respective queries (line 10) that it operates on. Next, an inner loop traverses over the keys and values, each iteration loading
+b_{x}
+of each, and computes: (1) the query-key-transpose product, adding the relevant bias terms (line 13-14). Note that the
+bias
+term is appropriately indexed to sum with the correct attention logits, mimicking broadcasting on the fly. (2) Subtracts the running maximum from the attention logits (line 16), updating the
+li
+and
+mi
+metadata (line 20).
+Finally, multiplying the attention logits with the values, updating the
+oi
+tensor (line 21-22), which exploits the properties of the online softmax in
+[
+18
+]
+. Fig.
+7
+illustrates our fused algorithm, demonstrating a thread-block’s access patterns over the
+Q
+,
+K
+&
+V
+tensors as well as the rows of the attention logits a block computes.
+
+Fig. 7:
+Fused EvoAttention’s forward pass on a 2D input tensor. Green boxes represents what each thread-block computes in scratchpad memories whilst yellow boxes represent the access patterns of the queries, keys, values & bias tensors.
+
+TABLE I:
+EvoAttention’s forward and backward passes.
+
+Forward Pass
+
+Backward Pass (given
+\texttt{dO}=\frac{\partial\mathcal{L}}{\partial\texttt{O}}
+)
+
+\displaystyle\begin{aligned} \texttt{S}&=\texttt{QK${}^{\texttt{T}}$}+\texttt{Bias${}_{\texttt{bcast}}$}\\
+\texttt{P}&=\texttt{Softmax(S)}\\
+\texttt{O}&=\texttt{PV}\end{aligned}
+
+\displaystyle\begin{aligned} \texttt{dV}&=\texttt{P${}^{\texttt{T}}$}\texttt{dO}\\
+\texttt{dP}&=\texttt{dOV${}^{T}$}\\
+\texttt{dS}&=\texttt{P$\odot$(dP}-\underbrace{\texttt{dO${}^{T}$O}}_{\texttt{D}})\\
+\texttt{dK}&=\texttt{Q${}^{T}$dS}\\
+\texttt{dBias}&=\sum_{\texttt{bcast-axis}}\texttt{dS}\\
+\texttt{dQ}&=\texttt{dS K}\\
+\end{aligned}
+
+Backward Pass
+
+Our backward pass is shown as the
+fused_attn_bwd
+function in listing
+2
+and table
+I
+. It proceeds in two stages due to the different parallel strategies required in computing the gradient tensors. The first kernel computes the
+dV
+&
+dK
+tensors (lines 31-47), whilst the second kernel computes
+dQ
+&
+dBias
+(lines 49-65). In particular, computing the
+dBias
+tensor involves a reduction across the broadcasted axes (see table
+I
+). We directly reduce partially computed tiles of
+dBias
+via
+atomic_add
+to global memory. Doing so mitigates the need to hold partially reduced values in scratchpad memories and avoids impacting the occupancy of our kernel at the cost of a smaller increased contention of global memory.
+
+IV-C
+
+DeepFusion for Common AlphaFold Operators
+
+Beyond the expensive EvoAttention, AF3 launches many frequently-invoked small operators during training (as described in Section
+III
+). This adversarially impacts both memory and compute as the inputs to each kernel must be stored for the backward pass and each kernel launch introduces non-negligible overhead. To address these issues, we introduce DeepFusion, a set of fused Triton kernels for frequent operators in AF3, including LayerNorm, linear-layers, and Swiglu activations. In AF-models these operators are most commonly composed in the transition layer (explained in Section
+II
+).
+We fuse the LayerNorm with the first linear-layer, and independently fuse the Swiglu activation (which is usually implemented via multiple kernel launches).
+
+⬇
+
+1
+
+def
+
+transition_fwd
+(
+token
+,
+
+eps
+,
+
+w
+,
+
+b
+,
+
+W
+1
+,
+
+W
+2
+):
+
+2
+
+mean
+,
+
+rstd
+
+=
+
+mean_var
+(
+token
+,
+
+eps
+)
+
+3
+
+o
+1
+
+=
+
+fused_ln_linear_fwd
+(
+token
+,
+
+eps
+,
+
+mean
+,
+
+\
+
+4
+
+rstd
+,
+
+w
+,
+
+b
+,
+
+W
+1
+)
+
+5
+
+o
+2
+
+=
+
+fused_swiglu_fwd
+(
+o
+1
+)
+
+6
+
+return
+
+o
+
+=
+
+matmul
+(
+o
+2
+,
+
+W
+2
+)
+
+7
+
+def
+
+transition_bwd
+(
+dO
+,
+
+w
+,
+
+b
+,
+
+W
+1
+,
+
+W
+2
+):
+
+8
+
+...
+
+=
+
+fused_swiglu_bwd
+(...)
+
+9
+
+do
+1
+
+=
+
+...
+
+#
+
+Omit
+
+computing
+
+earlier
+
+gradients
+
+10
+
+c1
+
+=
+
+c2
+
+=
+
+zero_init
+((
+M
+,1))
+
+11
+
+dW
+1
+,
+
+dw
+,
+
+db
+,
+
+c1
+,
+
+c2
+,
+
+wdy
+
+=
+
+\
+
+12
+
+dW
+1
+_dw_db_dc1_dc2
+(...)
+
+13
+
+dtokenp
+
+=
+
+dtokenp
+(...)
+
+14
+
+def
+
+mean_var
+(
+token
+,
+
+eps
+):
+
+15
+
+row
+,
+
+k
+
+=
+
+token
+[
+tl
+.
+program_id
+(0)],
+
+\
+
+16
+
+token
+.
+shape
+(-1)
+
+17
+
+mean
+
+=
+
+tl
+.
+sum
+(
+row
+,
+
+axis
+=-1)
+
+/
+
+k
+
+18
+
+var
+
+=
+
+tl
+.
+sum
+((
+row
+-
+mean
+)**2,
+
+axis
+=0)
+
+/
+
+k
+
+19
+
+rstd
+
+=
+
+1/
+tl
+.
+sqrt
+(
+var
++
+eps
+)
+
+20
+
+return
+
+mean
+,
+
+rstd
+
+21
+
+def
+
+fused_ln_linear_fwd
+(
+token
+,
+
+eps
+,
+
+mean
+,
+
+rstd
+,
+
+w
+,
+
+b
+,
+
+W
+1
+):
+
+22
+
+m
+,
+
+n
+
+=
+
+swizzle
+(
+tl
+.
+program_id
+(0))
+
+23
+
+o2
+
+=
+
+zeros
+((
+bm
+,
+
+bn
+))
+
+24
+
+for
+
+k
+
+in
+
+range
+(
+K
+/
+bk
+);
+
+#
+
+K
+
+is
+
+the
+
+hid.
+
+dimension
+
+25
+
+#
+
+Load
+
+(bm,
+
+bk)-sized
+
+chunk
+
+26
+
+x
+
+=
+
+token
+[
+m
+*
+bm
+:(
+m
++1)*
+bm
+,
+
+k
+*
+bk
+:(
+k
++1)*
+bk
+]
+
+27
+
+wi
+,
+
+bi
+
+=
+
+w
+[
+k
+*
+bk
+:(
+k
++1)*
+bk
+],
+
+b
+[
+k
+*
+bk
+:(
+k
++1)*
+bk
+]
+
+28
+
+#
+
+Load
+
+(bk,
+
+bn)-sized
+
+chunk
+
+29
+
+y
+
+=
+
+W
+1
+[
+k
+*
+bk
+:(
+k
++1)*
+bk
+,
+n
+*
+bn
+:(
+n
++1)*
+bn
+]
+
+30
+
+\hat{x}
+
+=
+
+((
+x
+
+-
+
+mean
+)
+
+*
+
+rstd
+)
+
+*
+
+wi
+
++
+
+bi
+
+31
+
+o2
+
++=
+
+tl
+.
+matmul
+(
+\hat{x}
+,
+
+y
+)
+
+#
+
+(bm,bk)x(bk,bn)
+
+32
+
+return
+
+o2
+
+33
+
+#
+
+computes
+
+dw,
+
+db,
+
+c1
+
+and
+
+c2
+
+34
+
+def
+
+dW
+1
+_dw_db_dc1_dc2
+(
+dO2
+,
+
+dW
+1
+,
+
+token
+,
+
+mean
+,
+
+rstd
+,
+
+w
+,
+
+b
+,
+
+W
+1
+,
+
+c1_ptr
+,
+
+c2_ptr
+):
+
+35
+
+m
+,
+
+k
+
+=
+
+swizzle
+(
+tl
+.
+program_id
+(0))
+
+36
+
+x
+
+=
+
+token
+[
+m
+*
+bm
+:(
+m
++1)*
+bm
+,
+
+k
+*
+bk
+:(
+k
++1)*
+bk
+]
+
+37
+
+meani
+,
+
+rstdi
+
+=
+
+mean
+[
+m
+*
+bm
+:(
+m
++1)*
+bm
+],
+
+\
+
+38
+
+rstd
+[
+m
+*
+bm
+:(
+m
++1)*
+bm
+]
+
+39
+
+xhat
+
+=
+
+(
+x
+
+-
+
+meani
+)
+
+*
+
+rstdi
+
+40
+
+yiT
+
+=
+
+tl
+.
+trans
+(
+xhat
+*
+w
+
++
+
+b
+)
+
+#
+
+Layer-norm
+
+output
+
+41
+
+dO1
+
+=
+
+zero_init
+((
+bm
+,
+
+bk
+))
+
+42
+
+for
+
+n
+
+in
+
+range
+(
+N
+/
+bn
+):
+
+#
+
+N
+
+is
+
+the
+
+ffn
+
+hid.
+
+dim
+
+43
+
+dO2
+
+=
+
+dO2
+[
+m
+*
+bm
+:(
+m
++1)*
+bm
+,
+n
+*
+bn
+:(
+n
++1)*
+bn
+]
+
+44
+
+dW1
+
+=
+
+matmul
+(
+yiT
+,
+
+dO2
+)
+
+45
+
+tl
+.
+atomic_add
+(
+dW
+1
+[
+k
+*
+bk
+:(
+k
++1)*
+bk
+,
+
+\
+
+46
+
+n
+*
+bn
+:(
+n
++1)*
+bn
+],
+
+dW1
+)
+
+47
+
+W
+1
+T
+
+=
+
+W
+1
+[
+k
+*
+bk
+:(
+k
++1)*
+bk
+,
+n
+*
+bn
+:(
+n
++1)*
+bn
+].
+T
+
+48
+
+dO1
+
++=
+
+matmul
+(
+dO2
+,
+
+W
+1
+T
+)
+
+49
+
+wdy
+
+=
+
+dO1
+
+*
+
+w
+
+50
+
+tl
+.
+atomic_add
+(
+c1_ptr
+,
+
+sum
+(
+xhat
+
+*
+
+wdy
+,
+
+dim
+=1)/
+K
+)
+
+51
+
+tl
+.
+atomic_add
+(
+c2_ptr
+,
+
+sum
+(
+wdy
+,
+
+dim
+=1)/
+K
+)
+
+52
+
+tl
+.
+atomic_add
+(
+dw_ptr
+,
+
+sum
+(
+dO1
+
+*
+
+xhat
+,
+
+dim
+=0))
+
+53
+
+tl
+.
+atomic_add
+(
+db_ptr
+,
+
+sum
+(
+dO1
+,
+
+dim
+=0))
+
+54
+
+return
+
+wdy
+
+55
+
+#
+
+computes
+
+dtokenp
+
+56
+
+def
+
+dtokenp
+(
+c1
+,
+
+c2
+,
+
+wdy
+,
+
+token
+,
+
+mean
+,
+
+rstd
+):
+
+57
+
+i
+
+=
+
+tl
+.
+program_id
+(0)
+
+58
+
+xi
+
+=
+
+token
+[
+i
+]
+
+#
+
+Block
+
+operates
+
+on
+
+a
+
+row.
+
+59
+
+c1i
+,
+
+c2i
+,
+
+meani
+,
+
+rstdi
+,
+
+wdyi
+
+=
+
+c1
+[
+i
+],
+
+c2
+[
+i
+],
+
+\
+
+60
+
+mean
+[
+i
+],
+
+rstd
+[
+i
+],
+
+wdy
+[
+i
+]
+
+61
+
+xhati
+
+=
+
+(
+xi
+-
+meani
+)
+
+*
+
+rstdi
+
+62
+
+dtokenpi
+
+=
+
+(
+wdyi
+
+-
+
+(
+c1i
+
+*
+
+xhati
+
++
+
+c2i
+))
+
+*
+
+rstdi
+
+63
+
+return
+
+dtokenpi
+
+Listing 3:
+Fused Transition layer.
+
+TABLE II:
+Comparison of unfused Layer-Normalization (LN) & Linear Layer compared to its DeepFusion equivalent in a training iteration (including both forward and backward passes). R+W denotes the cumulative number of reads and writes to global memory and Activs. denotes the Activations stored to global memory.
+N
+,
+D
+denote the sequence length, hidden dimension of the incoming tensors, respectively while
+D
+{}_{\text{lin}}
+denotes the linear layer’s hidden dimension.
+
+Bottleneck
+
+R+W
+
+Activs.
+
+Kernels
+
+LN
+
+Memory
+
+N
+(
+5D+8
+)
++2D
+
+N
+(
+D+2
+)
+
+4
+
+Linear
+
+Compute
+
+N
+(
+3D+3D
+{}_{\text{lin}}
+)
+
++
+3DD
+{}_{\text{lin}}
+
+ND
+{}_{\text{lin}}
+
+3
+
+DeepFusion
+
+Compute
+
+N
+(
+2D
+{}_{\text{lin}}
++3D+8
+)
+
++
+D
+(
+2D
+{}_{\text{lin}}
++2
+)
+
+N
+(
+2+D
+{}_{\text{lin}}
+)
+
+4
+
+Fused layer-norm & linear-layer
+
+There are three key traits of the layer-norm and linear-layers in AF3 that motivate this fusion, which we illustrate using table
+II
+. (1) Layer-normalizations (LN) are memory bound, whilst linear-layers are compute bound resulting in a fusion enhancing the reuse of inputs. (2) The input activations to each kernel need to be stored for the backwards pass. However, the LN and linear-layers oftentimes operate on quadratic pairwise token representations,
+token
+{}_{\text{pair}}
+, a large tensor. Fusing LN and linear-layers will avoid persisting an extra
+token
+{}_{\text{pair}}
+sized tensor to global memory. (3) Fusion can reduce the number of kernel launches, and consequently the number of reads/writes to global memory, each of which are expensive. Nevertheless designing a fused kernel that achieves all these benefits is non-trivial since both register and shared-memory usage may increase, adversarially impacting occupancy, a huge performance determinant. DeepFusion carefully manages this tradeoff to get the best of both worlds.
+
+We next describe the fusion. The computations involved are shown in listing
+3
+. For readers who are unfamiliar with layer-norm and linear layers used in AF3, please refer to Appendix
+B
+for a detailed description of their computations.
+
+Forward pass.
+Two kernels are launched in the forward pass (lines 2-6 in listing
+3
+).
+The first kernel,
+mean_var
+(lines 14-20), computes the mean and variance for each row of the input
+token
+tensor. Each thread-block is responsible for computing the expectation and variance of a single row in
+token
+, with
+M
+thread-blocks launched (
+M
+being the number of rows in
+token
+). The second kernel (lines 21-32) computes the final output,
+o
+{}_{\texttt{2}}
+, with each thread-block computing a single
+[b
+{}_{\texttt{m}}
+, b
+{}_{\texttt{n}}
+]
+-sized tile of
+o
+{}_{\texttt{2}}
+. Each thread-block proceeds by first zero-initializing a
+[b
+{}_{\texttt{m}}
+, b
+{}_{\texttt{n}}
+]
+-sized tile, where its local answer of
+o
+{}_{\texttt{2}}
+will be computed (line 23). Next, an inner-loop (lines 24-31) first loads a chunk of the input
+token
+tensor (line 26), LayerNorm (LN) parameters (line 27), and linear-layer weights (line 29). Using these loaded values to compute the LayerNorm output (line 30) and then finally multiply these normalized values with the linear-layer weights (line 31). Structuring the forward pass in this manner, as opposed to computing everything in a single kernel, reduces shared-memory pressure as fewer intermediate values need to be stored in shared-memory and results in good occupancy. Moreover, it avoids storing a
+token
+{}_{\text{pair}}
+sized tensor to global memory, achieving the best of both worlds: reducing memory whilst increasing speed.
+
+Similarly, our backward pass launches two kernels (lines 34-63 in listing
+3
+). The first kernel computes the gradients of linear-layer weights, the weights of the LayerNorm parameters, as well as extra
+c1
+,
+c2
+, and
+wdy
+data, intermediate variables required to compute the gradients of the
+token
+{}_{\texttt{p}}
+tensor (the mathematical formulae for these intermediate values are described in table
+III
+in Appendix
+B
+). The second kernel then consumes these data to finally compute the gradients of the
+token
+{}_{\texttt{p}}
+tensor.
+
+Fused Swiglu
+
+The Swiglu activation computes
+t[:,h/2:]*sigmoid(t[:, h/2:])*t[:, :h/2]
+where
+t
+is the
+token
+{}_{\texttt{p}}
+tensor and
+h
+is the hidden dimension of the
+token
+{}_{\texttt{p}}
+tensor. We compute the Swiglu activation with launching one kernel for the forward pass, and one kernel for the backward pass, scheduling each thread-block to compute one row of the output.
+
+Fused Transition Layer
+
+The transition layer finally stitches together the fused LayerNorm and linear-layer, fused Swiglu activation, and an independent second linear-layer (lines 1-13).
+
+V
+Evaluation
+
+In this section, we evaluate MegaFold with a comprehensive set of experiments. We demonstrate its effectiveness in both reducing memory usage and accelerating AlphaFold3 in Section
+V-B
+with detailed breakdowns on the impact of each optimization in Section
+V-C
+.
+
+V-A
+
+Methodology
+
+Software & Hardware
+
+We evaluate MegaFold and all the baselines on NVIDIA H200-141GB and AMD MI250-64GB GPUs. All experiments use PyTorch 2.7.0, Triton 3.2.0 with CUDA 11.8 on NVIDIA and ROCm 6.3 on AMD GPUs.
+
+Setup
+
+We implement MegaFold in AlphaFold3-PyTorch
+[
+9
+]
+with Triton
+[
+23
+]
+. Unless otherwise specified, we report single-GPU results to isolate kernel/runtime optimization effects. Multi-GPU scalability results are presented in Section
+V-D
+.
+We use a batch size of 1 with activation-checkpointing (AC)
+[
+24
+]
+enabled for both MegaFold and the baselines. Without AC, it is not possible to train AF3 even at moderate sequence lengths (e.g., 196 residues), as memory usage exceeds GPU capacity. The details of how we apply AC are in Appendix
+C
+.
+We conduct all our experiments on AF3 as this is the latest protein structure prediction model by using the same optimizer and hyperameters as described in
+[
+2
+]
+, although our optimizations generically apply to AF2 & AF1.
+
+V-B
+
+Main Results
+
+(a)
+
+(b)
+
+(c)
+
+Fig. 8:
+End-to-End comparison of a training iteration (averaged over 100 iterations of training) between MegaFold and different compiler backends. Fig.
+8a
+shows the peak memory consumption of AF3 training on NVIDIA H200, whilst Fig.
+8b
+and Fig.
+8c
+show the per-iteration end-to-end execution time on NVIDIA H200 and AMD MI250 hardware respectively.
+
+We first evaluate how MegaFold affects the peak memory consumption and per-iteration training time on NVIDIA and AMD hardware. We compare MegaFold with PyTorch eager-mode & the Pytorch-Inductor compiler backends. We specifically choose these baselines as popular off-the-shelf AF-3 implementations use Pytorch eager-mode, whilst PyTorch-2 introduces Pytorch-Inductor
+[
+25
+]
+, which automatically fuses deep-learning operators.
+We conduct our comparisons on sequence lengths within the range
+[128, 768]
+in increments of 128 on NVIDIA hardware, and in
+[128, 448]
+on AMD hardware as the AMD chips have smaller GPU memory than the NVIDIA chips.
+
+Trainability
+
+We measure the peak memory consumption of different systems in Fig.
+8a
+. Notably, only MegaFold enables training on sequence lengths of 640 & 768, whilst PyTorch runs out of memory, increasing the trainability of AF-models on longer sequence-lengths. Moreover, on sequence lengths that both MegaFold and PyTorch can train on, MegaFold reduces memory-consumption by 1.12
+\times
+on average.
+
+Speed
+
+We measure the per-iteration end-to-end training time (from data-loading, to taking a step of gradient descent) in Fig.
+8b
+& Fig.
+8c
+for NVIDIA and AMD GPU respectively. On the sequence lengths that both MegaFold and PyTorch eager-mode can train on, MegaFold reduces per-iteration training time by 1.69
+\times
+and 1.58
+\times
+on NVIDIA and AMD hardware respectively. Similarly, against Pytorch inductor, MegaFold reduces per-iteration training time by 1.7
+\times
+and 1.54
+\times
+on NVIDIA and AMD hardware respectively, validating MegaFold’s performance across different hardware.
+
+MegaFold enhances both the trainability and speed of AF-3 training through a targeted set of optimizations. On one hand, the ahead-of-time cache-based data-loader avoids complex retrieval steps during each iteration and reduces GPU idle time. On the other hand, the memory-efficient EvoAttention operator and DeepFusions avoid: (1) expensive loads/stores to global memory, and (2) storing intermediate activations to global memory, reducing peak memory consumption whilst simultaneously reducing per-iteration training time. Surprisingly, Pytorch-Inductor does not improve either peak memory consumption or training speed compared to Pytorch eager-mode as the complex control flow and operators in AF-3 introduce several graph breaks, with no ability to fuse kernels across graphs, resulting in similar code-generation to Pytorch eager-mode.
+
+V-C
+
+Breakdown Analysis
+
+We evaluate the impact of MegaFold’s optimizations on each component of AF3: data-loading and preprocessing (DLP),
+Pairformer, and diffusion modules by breaking down the per-component memory consumption and iteration times in Fig.
+9
+using a sequence length of 512 on an NVIDIA H200 GPU.
+
+Fig. 9:
+Breakdown of the per-component memory consumption (left) and forward iteration time (right) for PyTorch eager-mode and MegaFold for a batch size of 1 and a sequence length of 512. DLP refers to the data-loading and preprocessing stage as explained in Section
+II
+.
+
+Impact of optimizations on per-component memory-consumption
+
+We breakdown the per-component memory-consumption of MegaFold compared against PyTorch eager-mode (baseline) in Fig.
+9
+(left). Overall, MegaFold reduces the memory consumption of each component of AF3. However, MegaFold optimizations significantly reduces the memory consumption of the structured diffusion module by 1.38
+\times
+, with a less marked impact on the PairFormer trunk despite containing the expensive cubic EvoAttention mechanism. This occurs due to the interplay of activation checkpointing (AC) and data-augmentation. AC releases many of the large logits per layer while data-augmentation increases the batch size of the diffusion module by 48x compared to the PairFormer trunk, magnifying the impact of MegaFold optimizations compared to the PairFormer trunk in this setting.
+
+Impact of optimizations on per-component forward iteration speed
+
+We breakdown the per-component forward pass iteration time of MegaFold compared against PyTorch eager-mode (baseline) in Fig.
+9
+(right). MegaFold reduces the per-iteration time for each component of AF3 with the most pronounced impact on the data-loading and preprocessing (DLP) stage, reducing runtime by 3.34
+\times
+, as it avoids expensive preprocessing steps on the CPU. Moreover, there is a significant impact on the PairFormer module, reducing per-iteration time by 1.81
+\times
+. Since the EvoAttention mechanism in the PairFormer trunk produces cubic logits, it is the most compute heavy operator MegaFold optimizes and accordingly results in a significant reduction in the PairFormer trunk’s runtime. Nevertheless, there is still a significant impact on the iteration time of the diffusion module, with MegaFold reducing per-iteration time by 1.23
+\times
+due to many calls to DeepFusion operators (some of which operate on quadratic pairwise token representations) and quadratic EvoAttention operators.
+
+Fig. 10:
+Left shows the maximum sequence length prior to out-of-memory while Right shows per-iteration training time averaged over 100 iterations for the baseline (PyTorch) and MegaFold with different optimizations enabled on an NVIDIA H200.
+A
+enables the data-loading caches,
+B
+additionally enables fused EvoAttention,
+C
+additionally enables layer-normalization and linear layer fusion, and
+D
+additionally enables the full transition layer fusion.
+
+Impact of various optimizations on Trainability & Speed
+
+Finally, we toggle different optimizations of MegaFold to demonstrate the end-to-end impact of AF3 trainability and speed in Fig.
+10
+on a NVIDIA H200. In Fig.
+10
+(left) we measure the maximum permissible sequence length PyTorch eager-mode (baseline) can train on compared to MegaFold. Overall, MegaFold enables a sequence length extension of 1.35
+\times
+over PyTorch eager-mode, a noticeable increase. Moreover, the data-loading optimization does not adversarially impact memory consumption, and both the fused EvoAttention and DeepFusions have an equally pronounced impact on extending the input sequence length, with a 1.14
+\times
+and 1.12
+\times
+extension respectively. The data-loading optimization does not impact memory consumption as the additional cache generated would have been computed at the data-loading and preprocessing stages regardless. On the other hand, the EvoAttention and DeepFusions cut down the number of activations stored in main memory, reducing peak memory consumption and enabling training on longer input contexts.
+In Fig.
+10
+(right) we measure the per-iteration time for PyTorch eager-mode (baseline) compared to MegaFold. Overall, MegaFold reduces per-iteration training time by 1.43
+\times
+over PyTorch eager-mode with the data-loading caches having the most pronounced impact on accelerating training, reducing per-iteration time by 1.24
+\times
+. This arises due to the data-loading stage constituting a significant portion of runtime due to retrieval augmentation and intensive CPU preprocessing (as seen in Section
+III
+) with our caching mechanism avoiding some of these expensive operations, minimizing CPU processing time.
+
+Data-Loading cache size and generation time
+
+MegaFold’s ahead-of-time cache-based data-loading has an offline cache generation stage which computes the deterministic features for each input. For 127,234 input complexes the offline cache generation takes 48 hours and 395GB of disk space.
+
+V-D
+
+Multi-GPU results
+
+Fig. 11:
+Weak scaling results comparing per-iteration training time of PyTorch (Eager Mode) and MegaFold on 2, 4 and 8 NVIDIA H200 GPUs. We set the global batch size to the number of GPUs and the sequence length to 384.
+
+To evaluate whether MegaFold’s optimization translate to distributed training settings, we conduct a scalability study of MegaFold using 2, 4, and 8 GPUs. Since AF3’s model size is relatively small (
+\sim
+500M parameters), we compare the baseline PyTorch eager-mode implementation with MegaFold using PyTorch Distributed Data Parallel (DDP) as the multi-GPU training strategy. We use a per-GPU batch size of 1 and a fixed sequence length of 384.
+Fig.
+11
+shows that MegaFold delivers consistent speedups across all GPU configurations. Compared to the baseline, MegaFold achieves per-iteration speedups of 1.40
+\times
+, 1.42
+\times
+, 1.46
+\times
+on 2, 4, 8 GPUs respectively. These improvements indicate that MegaFold’s data pipeline optimizations are effective even in distributed settings and do not incur extra communication overhead.
+
+VI
+Related Work
+
+Automated Fusion Strategies.
+
+Mirage
+[
+26
+]
+is a tensor-algebra superoptimizer that can automatically fuse code. However, the operators and optimizations mainly target LLMs. For example, Mirage currently does not support the layer-normalization operator, a core and frequently launched operator in protein structure prediction models.
+NVFuser
+[
+27
+]
+is an automatic kernel fuser from NVIDIA, but it operates only on custom CUDA kernels. Finally, TVM
+[
+28
+]
+, TensorRT
+[
+29
+]
+, OpenVINO
+[
+30
+]
+, AITemplate
+[
+31
+]
+& IPEX
+[
+32
+]
+are systems that produce optimized code for a variety of deep-neural networks however only target inference, with no support for the backward pass in training.
+
+Custom Kernel Libraries.
+Liger
+[
+33
+]
+is a collection of hand-written kernels in Triton that target LLMs, but it does not implement optimizations for protein structure prediction such as a fusion of EvoAttention on 2-D data with additive biases. FlashInfer
+[
+34
+]
+is a collection of kernels that target LLM serving and inference, and does not apply to training. DeepSpeed-Evoformer
+[
+35
+]
+are custom kernels that target the EvoFormer operator in AF2, however their kernels are written in CUDA and do not apply to diverse hardware. Finally, TransformerEngine
+[
+36
+]
+and xFormers
+[
+37
+]
+are libraries with high-performance kernels that target the transformer architecture, with support for quantization, sparse attention and tensor core support. However they do not support the novel operators in AF3 such as EvoAttention.
+
+VII
+Conclusion
+
+In this paper, we present MegaFold, a system that accelerates AlphaFold3 training by underpinning and addressing key performance bottlenecks in data loading, memory, and fine-grained operator execution. Through a combination of ahead-of-time cache-based data loading, Triton-based memory-efficient EvoAttention, and DeepFusion for common AF operators, MegaFold achieves significant memory savings and speedups on both NVIDIA and AMD GPUs. Our results highlight the importance of optimizations for biomolecular structure prediction model training and point towards broader opportunities to optimize emerging scientific AI workloads.
+
+Appendix A
+Triton
+
+Triton is an embedded domain-specific-language in python that allows users to program GPUs with code-generation support for diverse hardware (such as NVIDIA and AMD GPUs), removing the need to rewrite kernels in separate vendor specific DSLs such as CUDA and ROCm. Triton operates on the thread-block level, allowing users to specify how work should decompose across thread-blocks. The Triton compiler then makes a decision on how work is decomposed within the threads constituent to a block. All our code-listings are written in this perspective, detailing the decomposition of work across thread-blocks.
+
+Appendix B
+Computations of LayerNorm & Linear Layer
+
+We illustrate the computations involved in the forward and backward pass of a layer-norm & linear-layer in table
+III
+. The
+c
+{}_{\text{1}}
+and
+c
+{}_{\text{2}}
+variables are intermediate values that are used to compute the gradients of the input tokens.
+
+TABLE III:
+LayerNorm & Linear layer forward and backward passes.
+
+Forward Pass
+
+Backward Pass (given
+\texttt{dO}=\frac{\partial\mathcal{L}}{\partial\texttt{O${}_{\texttt{2}}$}}
+)
+
+\displaystyle\begin{aligned} \texttt{O${}_{\texttt{1}}$}&=\underbrace{\frac{\texttt{token${}_{\text{p}}$}-\mathbb{E}[\texttt{token${}_{\text{p}}$}]}{\sqrt{\texttt{Var}(\texttt{token${}_{\text{p}}$})+\epsilon}}}_{\hat{\texttt{token${}_{\text{p}}$}}}\odot\texttt{w + b}\\
+\texttt{O${}_{\texttt{2}}$}&=\texttt{O${}_{\texttt{1}}$W${}_{\texttt{1}}$}\\
+\end{aligned}
+
+\displaystyle\begin{aligned} \texttt{dW${}_{\texttt{1}}$}&=\texttt{O${}_{\texttt{1}}$${}^{\texttt{T}}$dO${}_{\texttt{2}}$}\\
+\texttt{dO${}_{\texttt{1}}$}&=\texttt{dO${}_{\texttt{2}}$W${}_{\texttt{1}}$${}^{\texttt{T}}$}\\
+\texttt{dw}&=\texttt{dO${}_{\texttt{1}}$}\odot\hat{\texttt{token${}_{\text{p}}$}}\\
+\texttt{db}&=\sum_{\texttt{dimension=0}}\texttt{dO${}_{\texttt{1}}$}\\
+\texttt{d}\texttt{token${}_{\text{p}}$}&=\frac{1}{\texttt{Var}(\texttt{token${}_{\text{p}}$})}\bigg(\texttt{dO${}_{\texttt{1}}\odot$w}-\texttt{c${}_{\texttt{1}}$}\odot\hat{\texttt{token${}_{\text{p}}$}}-\texttt{c${}_{\texttt{2}}$}\bigg)\\
+\texttt{c${}_{\texttt{1}}$}&=\frac{1}{\texttt{N${}_{\texttt{token}}$}}\sum_{\texttt{dimension}=1}\hat{\texttt{token${}_{\text{p}}$}}\odot(\texttt{dO${}_{\texttt{1}}$}\odot\texttt{w})\\
+\texttt{c${}_{\texttt{2}}$}&=\frac{1}{\texttt{N${}_{\texttt{token}}$}}\sum_{\texttt{dimension}=1}\texttt{dO${}_{\texttt{1}}$}\odot\texttt{w}\end{aligned}
+
+Appendix C
+Activation Checkpointing Setup
+
+Given the large activations memory produced during AF3 training, activation-checkpointing (AC) must be enabled otherwise it is not possible to train AF3 on moderate sequence lengths. AC is systematically applied to every sub-layer within each layer in AF3 modules. Using the terminology in
+[
+2
+]
+, we apply AC to the following:
+
+•
+
+MSA module: AC is applied on each OuterProductMean, MSAPairWeightedAveraging, Transition, and PairwiseBlock sub-layer
+
+•
+
+Template module: AC is applied on each PairwiseBlock sub-layer
+
+•
+
+Pairformer module: AC is applied on each PairwiseBlock, AttentionPairBias, and Transition sub-layer
+
+•
+
+Diffusion module: AC is applied on each AttentionPairBias, Transition sub-layer
+
+When AC is applied, all intermediate activations within the sub-layer are discarded during the forward pass, and only the input tensors are retained. In the backward pass, since the intermediate activations have been discarded, an additional forward pass is performed using the retained inputs to recompute necessary activations for gradient calculations. AC accordingly makes a trade-off between speed and memory, sacrificing speed for reduced peak memory consumption. On the other hand, our optimizations achieve the best of both worlds: faster training speeds with reduced peak memory consumption.
+
+Appendix D
+Implementation Validation
+
+Fused kernels often modify reductions and may change the numerical stability of operators
+[
+44
+]
+. Therefore, to verify the correctness of our optimizations, we train MegaFold & a PyTorch eager-mode implementation of AF3 for 120 iterations with a sequence length of 384 using the Protein Data Bank
+[
+49
+]
+, plotting the training loss at each step in Fig.
+12
+. MegaFold matches the per-step training loss of the baseline, indicating that our optimizations do not sufficiently impact AF3’s convergence.
+
+Fig. 12:
+Comparing training loss between MegaFold and PyTorch eager-mode of AF3 across 120 steps.
+
+*
+
