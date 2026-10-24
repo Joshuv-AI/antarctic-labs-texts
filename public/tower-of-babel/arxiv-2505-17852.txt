@@ -1,0 +1,1118 @@
+Scaling Recurrent Neural Networks to a Billion Parameters with Zero-Order Optimization
+Francois Chaubard, Mykel J. Kochenderfer
+
+Abstract
+During inference, Recurrent Neural Networks (RNNs) scale constant in both FLOPs and GPU memory with increasing context length, as they compress all prior tokens into a fixed-size memory. In contrast, transformers scale linearly in FLOPs and, at best, linearly in memory during generation, since they must attend to all previous tokens explicitly. Despite this inference-time advantage, training large RNNs on long contexts remains impractical because standard optimization methods depend on Backpropagation Through Time (BPTT). BPTT requires retention of all intermediate activations during the forward pass, causing memory usage to scale linearly with both context length and model size. In this paper, we show that Zero-Order Optimization (ZOO) methods such as Random-vector Gradient Estimation (RGE) can successfully replace BPTT to train RNNs with convergence rates that match, or exceed BPTT by up to 19 fold, while using orders of magnitude less memory and cost, as the model remains in inference mode throughout training. We further demonstrate that Central-Difference RGE (CD-RGE) corresponds to optimizing a smoothed surrogate loss, inherently regularizing training and improving generalization. Our method matches or outperforms BPTT across three settings: (1) overfitting, (2) transduction, and (3) language modeling. Across all tasks, with sufficient perturbations, our models generalize as well as or better than those trained with BPTT, often in fewer steps. Despite the need for more forward passes per step, we can surpass BPTT wall-clock time per step using recent advancements such as FlashRNN and distributed inference.
+
+
+
+1
+Introduction
+
+While transformers
+(
+Vaswani et al. 2017
+)
+have dominated large-scale language modeling
+(
+Brown et al. 2020
+;
+Touvron et al. 2023
+;
+Zhang et al. 2022
+)
+over the past half-decade, their compute and memory requirements during inference prompt a search for alternatives for the future. During both training and inference, transformers compute pairwise attention across all
+C
+previous tokens, resulting in quadratic complexity
+\mathcal{O}(C^{2})
+in both compute and memory
+(
+Tay et al. 2020
+;
+Dao et al. 2022
+)
+. For instance, a “small” 1B-parameter Transformer with batch size
+B=2048
+, context length
+C=1\text{M}
+, and output size
+O=50{,}000
+would require 3.3 Petabytes of VRAM (or 44k H100s) assuming dense attention. If using linear attention mechanisms
+(
+Katharopoulos et al. 2020
+;
+Ahn et al. 2023
+;
+Han et al. 2024
+)
+such as Flash Attention
+(
+Dao et al. 2022
+)
+, this would still require 402TB of VRAM (or 5k H100s).
+
+Recurrent Neural Networks (RNNs), on the other hand, compress all necessary information of the past into a hidden state that is updated each time step instead of attending to all previous tokens per next token prediction. While this means the time to first token will scale linearly with the size of the prompt vs. transformers which would be constant, the time for all following tokens would be the same or faster as RNNs scale constant in FLOPs and GPU memory vs. linear and quadratic for transformers, respectively. Therefore, an equivalent 1B-parameter RNN would require only 28GB of VRAM which can fit easily on 1 single H100, or even smaller consumer GPUs,
+a savings of 14,000 times in cost per generated token
+. While this is a huge savings, it requires a method that can efficiently train large RNNs with similar capacity as modern transformers, at batch sizes and sequence lengths at or greater than 1024, as is typically required to stabilize training and provide a sufficient context window for modern transformers to predict the next token accurately.
+
+Scaling RNNs in model size, batch size, and context length using Backpropagation Through Time (BPTT) introduces a prohibitive memory bottleneck. BPTT requires storing all intermediate activations per time step for gradient computation, resulting in exploding VRAM complexity
+\mathcal{O}(BCA)
+, where
+B
+denotes the batch size, and
+A
+denotes the sum of all activations per layer for one time step as well as vanishing and exploding gradients which dilute the gradient estimate. Early efforts to train without BPTT began with
+Maeda and Wakamura 2005
+, who applied Simultaneous Perturbation Stochastic Approximation (SPSA)
+(
+Spall 1992
+)
+using Rademacher probes to train tiny RNNs (<32 hidden units) in hardware. In 2007,
+Xu et al. 2019
+used Particle Swarm Optimization (PSO) to train small Elman networks for load forecasting. In 2016,
+Rawal and Miikkulainen 2016
+evolved compact LSTM-based memory architectures using an information-theoretic objective. More recently, Gradient approximation methods such as UORO
+(
+Tallec and Ollivier 2017
+)
+, DNI
+(
+Jaderberg et al. 2017
+)
+, and e-prop
+(
+Bellec et al. 2020
+)
+attempted to train small RNNs without unrolling.
+Vicol et al. 2021
+introduced Persistent Evolution Strategies (PES) to provide unbiased estimates for long unrolls. Also, Koopman-inspired random feature networks
+(
+Bolager et al. 2024
+)
+and weight-biased perturbation methods
+(
+Fernández et al. 2024
+)
+have achieved competitive results on small-scale RNNs with Zero-Order optimization.
+
+While no work has successfully scaled RNNs to billions of parameters and long context lengths, recent advances in zero-order training for large transformers have scaled to billions of parameters giving us inspiration to try these Zero-Order methods on large RNNs, such as MeZO
+(
+Malladi et al. 2022
+)
+, LeZO
+(
+Wang et al. 2024
+)
+, and SparseMeZO
+(
+Malladi et al. 2023
+)
+. The major drawback of ZOO (and specifically RGE) is the reliance on a large number of forward passes to reduce perturbation noise to provide a sufficiently accurate gradient estimate. This wall-clock time can be intolerable if done sequentially and with legacy implementations. However, we sufficiently reduce these concerns with recent advancements in distributed training (e.g. Pytorch Distributed) and optimized CUDA kernels (specifically FlashRNN
+(
+Pöppel et al. 2024
+)
+). First, we distribute the forward passes across a cluster of GPUs to achieve equal or better wall-clock time per step compared to BPTT. Then our bottleneck on wall-clock time per step is the time it takes for a single forward pass, which can still be quite slow for long sequence lengths. Recently, FlashRNN introduced a fused CUDA and Triton implementation of traditional RNNs (LSTM, GRU, sLSTM) that optimizes memory access by caching weights in registers and shared memory, achieving up to
+50× speedup over vanilla PyTorch
+. FlashRNN also supports 40× larger hidden sizes which can enable us to scale. It is worth noting that during inference, we may be able to further reduce latency by precomputing the final hidden state of common prompts (e.g. system prompts) to avoid this repeated computation and high-latency.
+
+In this paper, we introduce a new framework on how to scale large RNNs by merging recent advancements in distributed optimization (e.g. Pytorch Distributed), fused kernel RNNs (e.g. FlashRNN), and Zero-Order Optimization to scale RNNs well to and beyond the billion parameter mark. Specifically, we investigate Random-Vector Gradient Estimation (RGE) as it has been shown that RGE can approximate the true gradient with sufficient perturbations
+(
+Spall 1992
+;
+Kiefer and Wolfowitz 1952
+;
+Duchi et al. 2015
+;
+Nesterov and Spokoiny 2017
+)
+. In RGE, given model weights
+\Theta\in\mathbb{R}^{|\Theta|}
+and loss function
+L
+, the true gradient
+\nabla L(\Theta)
+is approximated using the average of directional derivatives, calculated by perturbing the model by random probes
+p
+sampled from a distribution
+\mathcal{D}^{|\Theta|}
+. To parallelize forward passes, we implement a distributed RGE where the clean model
+\Theta
+is broadcast to multiple ranks, each assigned a seed to generate local Rademacher probes. Each worker computes their perturbed forward passes (plus and minus), and returns only a 2 scalar losses. The parameter server reconstructs the probes, estimates directional derivatives, and applies updates via Stochastic Gradient-Free Descent. This design avoids inter-rank upload of full gradient information, reducing VRAM to
+\mathcal{O}(Ba_{\max}+|\Theta|+ChunkSize)
+, where chunk size is the size of communication between ranks and can be tuned for optimal training speeds. Coupling distributed RGE and FlashRNN, we are able to match or exceed the wall-clock time per step of BPTT and Transformers with far simpler implementation to achieve scale.
+
+We apply this solver to scale to billion parameter RNNs in 3 domains. First, we compare the properties of CD-RGE compared to BPTT in a non-stochastic setting, by overfitting a DNC on a single batch and compare the number of steps to achieve near 0 loss. DNCs are notoriously hard to train as they have a complex memory matrix interaction that can be difficult for optimizers to solve which makes overfitting an interesting non-convex problem for the solver to navigate. As shown in
+Figure
+
+1
+, we find that with sufficient perturbations per step (e.g. 512), CD-RGE can achieve near 0 loss in 19x fewer steps. And we see monotonically better convergence with more perturbations per step. Second, we train LSTMs and DNCs on stochastic transduction tasks with narrow generalization (e.g. COPY, REVERSE, and ROLLING SUM) where we train with context lengths 2 to 10 randomly, and validate generalization to context lengths between 11 to 60. In all cases and model sizes, CD-RGE matched or outperformed BPTT. Finally, we extend this to a stochastic, broad generalization task, language modeling (e.g. Penn Tree Bank), where we train LSTMs and observe again that CD-RGE trained models, match or outperform BPTT trained models.
+
+The remainder of the paper proceeds as follows: we provide background on Zero-Order Optimization; detail our algorithm and distributed training framework; present empirical results on our three sets of tasks, comparing convergence rates, VRAM usage, and inference cost relative to BPTT and Transformer baselines; provide intuition as to why RGE outperforms at specific
+\varepsilon
+; prove that optimizing the finite difference is map reducible to optimizing a smoothed surrogate and therefore is an implicit regularizer; and finally, discuss broader implications for meaningfully reduced FLOPs and VRAM (and thus cost) per generated token.
+
+Our contributions are summarized as follows:
+
+•
+
+We show that Central-Difference RGE is able to efficiently train billion parameter RNNs (LSTMs and DNCs) on a single small GPU (A40 with 46GB of VRAM).
+
+•
+
+We show that Central-Difference RGE can exceed the convergence rates of BPTT by up to 19 fold, while requiring orders of magnitude less VRAM and cost compared to BPTT and similar-sized transformer.
+
+•
+
+We show that CD-RGE can distribute workloads horizontally, achieving wall-clock times per step similar to BPTT.
+
+•
+
+We open-source our code at
+https://github.com/Fchaubard/zero_order_rnn
+for reproducibility and further research.
+
+2
+Zero-Order Optimization
+
+The earliest approaches to ZOO were based on finite difference methods, dating back to the 1950s with the work of
+Kiefer and Wolfowitz 1952
+. These techniques estimate gradients by querying the objective function multiple times while perturbing the model differently each time. Two primary variants exist; forward-difference RGE (FD-RGE)
+(
+Duchi et al. 2015
+)
+and and central-difference RGE (CD-RGE)
+(
+Nesterov and Spokoiny 2017
+)
+, each with their own tradeoffs. For a give
+\theta\in
+
+FD-RGE’s directional derivative estimate is given by:
+
+\tilde{\nabla}^{+}L(\Theta)=\frac{L(\Theta+\epsilon p)-L(\Theta)}{\epsilon}p,
+
+(1)
+
+where
+\epsilon
+is a small positive scalar.
+
+CD-RGE’s directional derivative estimate is given by:
+
+\tilde{\nabla}^{\pm}L(\Theta)=\frac{L(\Theta+\epsilon p)-L(\Theta-\epsilon p)}{2\epsilon}p,
+
+(2)
+
+and is unbiased under symmetric probe distributions.
+
+Others
+(
+Spall 1992
+;
+Duchi et al. 2015
+;
+Nesterov and Spokoiny 2017
+)
+have shown that by averaging
+n_{\text{pert}}
+directional derivative estimates
+obtained from i.i.d. random probes
+p\sim\mathcal{D}^{|\Theta|}
+,
+we obtain a zeroth-order estimator
+\tilde{\nabla}L(\Theta)
+
+whose mean approaches the true gradient
+\nabla L(\Theta)
+
+as
+\epsilon\to 0
+, and whose estimation variance
+scales as
+\mathcal{O}(1/n_{\text{pert}})
+under mild moment conditions. Specifically, assuming that the loss
+L:\mathbb{R}^{|\Theta|}\!\to\!\mathbb{R}
+
+is three–times continuously differentiable with an
+L\!
+-Lipschitz gradient, and
+p\sim\mathcal{D}^{|\Theta|}
+be an i.i.d. probe with
+
+\mathbb{E}[p]=0
+and
+\mathbb{E}[pp^{\!\top}]=I
+then the following estimator properties hold for FD-RGE and CD-RGE given
+\epsilon
+perturbation size and
+n_{pert}
+perturbations:
+
+Bias of FD-RGE.
+
+\mathbb{E}\!\bigl[\tilde{\nabla}^{+}L(\Theta)\bigr]\;=\;\nabla L(\Theta)\;+\;\mathcal{O}(\epsilon).
+
+(3)
+
+Variance of FD-RGE.
+
+\mathbb{E}\!\Bigl[\bigl\|\tilde{\nabla}^{+}L(\Theta)-\nabla L(\Theta)\bigr\|_{2}^{2}\Bigr]\;=\;\mathcal{O}(\epsilon^{2})\;+\;\mathcal{O}\!\bigl(1/n_{\text{pert}}\bigr)
+
+(4)
+
+Bias of CD-RGE.
+
+\mathbb{E}[\tilde{\nabla}^{\pm}L(\Theta)]\;=\;\nabla L(\Theta)+\mathcal{O}(\epsilon^{2}).
+
+(5)
+
+Variance of CD-RGE.
+
+\mathbb{E}\!\Bigl[\bigl\|\tilde{\nabla}^{\pm}L(\Theta)-\nabla L(\Theta)\bigr\|_{2}^{2}\Bigr]\;=\;\mathcal{O}(\epsilon^{4})\;+\;\mathcal{O}\!\bigl(1/n_{\text{pert}}\bigr).
+
+(6)
+
+Thus, by increasing
+n_{pert}
+and decreasing
+\varepsilon
+we can reduce noise and more closely approximate the true gradient. We note FD-RGE is “cheaper” because we can reuse the clean query for all perturbations giving us the relation
+n_{pert}=n_{queries}-1
+. However, it incurs a larger bias term;
+\mathcal{O}(\epsilon)
+. To achieve the same
+n_{pert}
+, CD-RGE requires double the amount of queries in the limit compared to FD-RGE. However, it suppresses the bias to
+\mathcal{O}(\epsilon^{2})
+as the second order terms in the Taylor expansion cancel. Given a fixed query budget, we observe CD-RGE outperforms FD-RGE meaningfully.
+
+For choice of distribution
+D
+for our probe
+p_{i}
+, any zero-mean, isotropic noise will maintain the convergence properties above ((
+3
+) to (
+6
+)). We evaluate three such distributions on the overfitting studies: Uniform (
+U\sim[-1,1]
+), Normal (
+N(0,1)
+), and Rademacher probes (
+p_{i}\in\{-1,+1\}^{|\Theta|}
+). We observe Normal and Rademacher to be roughly equivalent in convergence rate, and Uniform slightly underperforms. Rademacher has been shown
+(
+Spall 1992
+)
+to be optimal in high
+|\Theta|
+dimensions and with large
+n_{pert}
+perturbations. Rademacher vectors exhibit constant norm across samples, unlike Gaussian probes whose squared norms follow a chi-squared distribution, introducing additional variance in our estimate. Moreover, Rademacher probes can be stored as bit vectors, yielding a 32-fold memory saving relative to 32-bit floats.
+
+The relationship between our perturbation size
+\varepsilon
+and step size
+\eta
+is critical to achieving stable convergence.
+Spall 1992
+advises to relate them to a ratio of around
+\eta/\varepsilon\approx 1e^{3}
+meaning we step 1,000 times further than we measured with our queries. While this may be appropriate in low-curvature loss functions, we find this to be very unstable in highly non-convex loss functions. This may be the nuance why so many studies determined RGE unstable when training large models from raw weights
+(
+Periyasamy et al. 2024
+;
+Qurashi et al. 2020
+;
+Malladi et al. 2022
+)
+. If we instead tie our
+\eta
+and
+\varepsilon
+to be the same, i.e.
+\eta=\varepsilon
+, all throughout training, and use the Rademacher distribution to concentrate our queries to the shell of the sphere, then we are essentially committing to taking a step of size
+\eta=\varepsilon
+at each step, then measuring at that distance all around the sphere for dips in loss, then stepping at that distance the difference-weighted average of the probes. As long as
+n_{pert}
+is sufficiently large, and
+\varepsilon
+is small enough to fit inside the target basin, we find this procedure “jumps” much farther than a typical Stochastic Gradient Descent (SGD) step, with stability and confidence, even when gradients are unavailable or unstable in the interior of the sphere (e.g. with BPTT in long-sequence RNNs for example, or large quantization errors).
+
+An added benefit of setting
+\eta=\varepsilon
+is that
+\varepsilon
+and
+\eta
+now cancel each other out to give us our final simple update equation which is more numerically stable:
+
+\Theta^{\prime}=\Theta-\frac{1}{2n_{\text{pert}}}\sum_{i=1}^{n_{\text{pert}}}(L(\Theta+\epsilon p_{i})-L(\Theta-\epsilon p_{i}))p_{i},
+
+(7)
+
+Mathematically, we can interpret finite difference methods as optimizing a smoothed surrogate for the loss:
+
+L_{\epsilon}(\Theta):=\mathbb{E}_{p\sim\mathcal{D}}[L(\Theta+\epsilon p)]
+
+(8)
+
+where
+\mathcal{D}
+is a zero-mean probe distribution such as the Rademacher or standard Normal. This formulation corresponds to a convolution of the original loss
+L
+with the scaled probe distribution:
+
+L_{\epsilon}(\Theta)=(L*\rho_{\epsilon})(\Theta),\quad\text{where }\rho_{\epsilon}(x):=\frac{1}{\epsilon^{d}}\rho\left(\frac{x}{\epsilon}\right),
+
+(9)
+
+and
+\rho
+is the probability density function of
+\mathcal{D}
+.
+This convolution replaces sharp valleys/spikes with smoother transitions. A higher
+\varepsilon
+results in more smoothing, higher bias, lower variance, while a lower
+\varepsilon
+results in less smoothing, lower bias, and higher variance.
+
+Additionally, if
+p\sim\{-1,+1\}^{d}
+(Rademacher), then
+\|p\|_{2}=\sqrt{d}
+, and we are no longer exploring the interior of the ball, only the outer shell, and the expectation becomes:
+
+L_{\epsilon}(\theta)\approx\mathbb{E}_{p\sim\mathbb{S}^{d-1}}\left[L(\theta+\epsilon p)\right]
+
+where
+\mathbb{S}^{d-1}
+denotes the unit sphere in
+\mathbb{R}^{d}
+. Thus, our finite difference formulation can be seen as implicitly optimizing a smoothed surrogate loss which is the difference weighted average probe sampled at the shell of a hypersphere of radius
+\epsilon\sqrt{d}
+.
+
+3
+Method: Distributed CD-RGE
+
+As summarized in
+Algorithm
+
+1
+, we divide our compute over
+w
+total ranks, with rank 0 designated as the parameter update rank, and ranks
+\{1,\ldots,w\}
+as worker ranks. At
+w=1
+, this becomes the sequential (local) version of the algorithm. Our training framework applies central-difference random gradient estimation with Rademacher probes (CD-RGE) in a distributed manner where rank 0 sends the most up-to-date model to all other ranks and a seed per perturbation to be used by the worker to deterministically generate each workers random Rademacher probe. Then all ranks forward pass their models. Then rank 0 receives back all scalar loss values, regenerates each probe, scales it by the finite difference, and updates the model, without ever fully instantiating any of the probes fully, just chunks at a time.
+
+Algorithm 1
+
+DIST.CDRGE_STEP
+(\theta,\varepsilon,x,n,w)\rightarrow\theta
+
+1:
+
+Input:
+parameters
+\theta\in\mathbb{R}^{d}
+, perturbation scale
+\varepsilon>0
+, input batch
+x
+,
+n
+perturbations,
+w
+ranks
+
+2:
+
+\textit{r}\leftarrow\textsc{dist.get\_rank}()
+
+3:
+
+dist.broadcast
+([\theta,x],\text{src}=0)
+
+4:
+
+if
+
+\textit{r}=0
+
+then
+
+5:
+
+Create unique seeds
+S=\{\,s_{r,m}\mid r=0,\dots,w;\;m=0,\dots,n/w\}
+
+6:
+
+Create
+L_{array}=\{\,[L_{-}=0,L_{+}=0]_{r,m}\mid r=0,\dots,w;\;m=0,\dots,n/w\}
+
+7:
+
+dist.scatter
+(S,\text{src}=0)
+
+8:
+
+for all
+
+m=1\dots(n/w)
+
+do
+
+9:
+
+\theta\leftarrow\textsc{ApplyProbe}(\theta,\;\epsilon,\;s_{r,m})
+
+10:
+
+L_{+}\leftarrow\mathcal{L}(\theta,x)
+
+11:
+
+\theta\leftarrow\textsc{ApplyProbe}(\theta,\;-2\epsilon,\;s_{r,m})
+
+12:
+
+L_{-}\leftarrow\mathcal{L}(\theta,x)
+
+13:
+
+\theta\leftarrow\textsc{ApplyProbe}(\theta,\;\epsilon,\;s_{r,m})
+
+14:
+
+dist.gather
+([L_{-},L_{+}],\text{dst}=0)
+
+15:
+
+if
+
+\textit{r}=0
+
+then
+
+16:
+
+L_{array}\leftarrow\textsc{flatten}(L_{array})
+
+17:
+
+for all
+
+i=1\dots n
+
+do
+
+18:
+
+\alpha\leftarrow\dfrac{L_{+}^{(i)}-L_{-}^{(i)}}{2n}
+
+19:
+
+\theta\leftarrow\textsc{ApplyProbe}(\theta,\;\alpha,\;s_{i})
+
+Algorithm 2
+
+\textsc{APPLYPROBE}(\theta,\alpha,s)\rightarrow\theta
+
+1:
+
+torch.manual_seed
+(s)
+
+2:
+
+for all
+
+\theta_{i}\in\theta
+
+do
+
+3:
+
+\theta_{i}\leftarrow\theta_{i}+\alpha\cdot\bigl(2\!\cdot\!\textsc{Bernoulli}(0.5;\lvert\theta_{i}\rvert)-1\bigr)
+
+This allows us to dedicate the entire GPU memory to only parameters and activations aside from a small constant sized chunk for buffer. This enables us to train our model at batch sizes, context lengths and parameter scales impracticable with BPTT on the same hardware.
+
+3.1
+Training Memory and Compute
+
+Our Zero-Order framework shifts the bottleneck from memory to compute as memory is 18x more expensive. We compare our method to training RNNs with BPTT and training transformers with backpropagation below:
+
+•
+
+Memory usage:
+We shift from
+\mathcal{O}(BCA)
+for BPTT and modern transformers (assuming fast-attention) to
+\mathcal{O}(Ba_{\max})
+, for
+B
+batch size,
+C
+context length, and
+a_{\max}
+, the largest activation across layers.
+
+•
+
+Compute cost:
+We unfortunately shift from only one forward and backward pass to
+2\cdot n_{\text{pert}}
+forward passes per step (e.g. 96 and 512). Probes are reconstructed
+4\times
+but each is fast and parallelized on the GPU. Retention of the Rademacher probe would be quite small since it can be represented as bit vector if its preferred to exchange FLOPs and time for a small additional Memory and communication overhead.
+
+•
+
+Wall-clock time per step:
+For both BPTT and CD-RGE, we must wait
+\mathcal{O}(Cn_{pert}/w)
+time for
+w
+ranks to complete their forward passes, which is the biggest disadvantage RNNs have compared to transformers, which have
+\mathcal{O}(1)
+wall-clock time per step as they parallelize across the sequence.
+
+While we increase the number of FLOPS by
+\mathcal{O}(n_{\text{pert}})
+and wall-clock time by
+\mathcal{O}(BCn_{\text{pert}}/r)
+, we reduce the VRAM by
+\mathcal{O}(C(A-a_{max}))
+which is substantial. We estimate the cost impact of this on our experiments in
+Table
+
+1
+and at much larger scales using theoretical values in
+Figure
+
+3
+.
+
+3.2
+Inference Memory and Compute Characteristics
+
+RNNs in general have far superior inference memory and compute requirements. We compare RNNs to transformers below:
+
+•
+
+Memory usage:
+We shift from
+\mathcal{O}(CA)
+for modern transformers (assuming fast-attention) to
+\mathcal{O}(a_{\max})
+, where
+a_{\max}
+is the size of the largest activation per layer.
+
+•
+
+Compute cost:
+Compute shifts from
+\mathcal{O}(C)
+FLOPs per generated token to
+\mathcal{O}(1)
+which is a dramatic improvement.
+
+•
+
+Wall-clock time for first token:
+The time to first token scales linearly for RNNs, while transformers scale constant time as transformers parallelize the compute for the first token. This is a huge benefit of transformers. However, we believe this can be ameliorated by caching off our system prompt hidden states to avoid recomputation.
+
+•
+
+Wall-clock time for all other tokens:
+RNNs will achieve the same or better performance compared to transformers as they require fewer flops and both are sequential operations after the first token.
+
+Method
+
+Metric
+
+100k
+
+1M
+
+10M
+
+100M
+
+1.1B
+
+BPTT
+
+VRAM (GB)
+
+0.8
+
+4
+
+45
+
+NaN
+
+NaN
+
+Time per step (s)
+
+0.1
+
+0.17
+
+33.7
+
+NaN
+
+NaN
+
+$ per 100k step
+
+$0.04
+
+$0.20
+
+$2.34
+
+NaN
+
+NaN
+
+CD-RGE@96 (seq)
+
+VRAM (GB)
+
+0.5
+
+1
+
+4
+
+25.3
+
+39.5
+
+Time per step (s)
+
+5.7
+
+6
+
+7.8
+
+24.3
+
+145
+
+$ per 100k steps
+
+$0.04
+
+$0.07
+
+$0.22
+
+$1.33
+
+$2.38
+
+CD-RGE@512 (seq)
+
+VRAM (GB)
+
+0.5
+
+1
+
+4
+
+25.3
+
+39.5
+
+Time per step (s)
+
+30
+
+31.1
+
+40.7
+
+132
+
+777
+
+$ per 100k steps
+
+$0.11
+
+$0.14
+
+$0.31
+
+$1.63
+
+$4.13
+
+CD-RGE@96 (dist@8)
+
+VRAM (GB)
+
+4
+
+8
+
+32
+
+202.4
+
+316
+
+Time per step (s)
+
+0.05
+
+0.06
+
+0.07
+
+0.4
+
+4.4
+
+$ per 100k steps
+
+$0.20
+
+$0.40
+
+$1.60
+
+$10.12
+
+$15.81
+
+CD-RGE@512 (dist@8)
+
+VRAM (GB)
+
+4
+
+8
+
+32
+
+202.4
+
+316
+
+Time per step (s)
+
+0.25
+
+0.29
+
+0.29
+
+1.87
+
+19.3
+
+$ per 100k steps
+
+$0.20
+
+$0.40
+
+$1.60
+
+$10.13
+
+$15.85
+
+Table 1
+:
+Actual VRAM usage (GB), time per step (s), and linearized cost estimate per 100k steps (USD) for different training strategies across increasing model sizes. All measurements assume batch size = 1024 and sequence length = 10. We compare CD-RGE at two different perturbation counts per step (96 and 512) and we compare if we do them sequentially on one GPU vs. distributed on a node with 8 GPUs (all on A40s for consistency).
+
+3.3
+Actual Training Memory, Compute, and Cost Comparisons
+
+Table
+
+1
+provides VRAM usage and average wall-clock time per step at increasing model sizes comparing BPTT, sequential CD-RGE at 96 perturbations per step, and sequential CD-RGE at 512 perturbations where we do not distribute the work load and do all foreward passes on one A40 GPU. We also compare to Distributed CD-RGE where we parallelize the forward passes over a node with 8 A40 GPUs respectively. For all runs, we use sequence length of 10 and batch size of 1024. When a batch of 1024 does not fit on the GPU, we must split the batch into micro and macrobatches to fit the microbatch into memory then loop over the macrobatches accumulating gradient. This is the case for BPTT at model size 10M, where we must use a macrobatch of 128 to fit the batch onto one GPU and in the case for CD-RGE at 1.1B where we must split the batch across 4 macrobatches. This explains the sharp uptick in time in those cases. While macrobatches could distributed as well, we save the analysis of distributed BPTT and splitting of macrobatches with CD-RGE to future research. To estimate cost, we scrape current GPU prices on leading cloud providers and regress to get an estimated cost per GB-Hr of VRAM (which we estimate to be $0.018) and an estimated cost per TFLOP-Hr (which we estimate to be $0.001). We note that memory is 18x more expensive than compute over all GPU types.
+
+First, we see that even on small sequence lengths (10) and a medium size model (10M parameters), we use 10x less memory by switching from BPTT to CD-RGE@96, 340x reduction in wall-clock time per step since the entire batch can easily fit in memory and we do not have to loop over macrobatches, and thus, we see a
+cost savings of 30x
+per training step. And as demonstrated in most of our experiments, we see a similar or improved convergence rate with these settings. Second, we note that BPTT shoots up in VRAM, quickly saturating the GPU even on our medium size model (10M) and a very short sequence length requiring us to either use macrobatches or use gradient checkpointing both of which are very slow. Next, we see that even 1.1B models at any sequence length can fit into VRAM with RGE. Finally, we note that by distributing the compute over more ranks, we can achieve faster wall-clock times easily and actually beat BPTT’s wall-clock time per step.
+
+4
+Experiments
+
+4.1
+Overfitting to a single batch
+
+To compare convergence rates in a non-stochastic, non-convex setting, we compare CD-RGE to BPTT overfitting challenge. We select DNCs as they are notoriously difficult to train. We train DNCs ranging from tiny (300k) to very large (4.3B) and measure the number of steps required to achieve near 0 loss. As shown in
+Figure
+
+1
+, CD-RGE can meaningfully outperform BPTT provided enough perturbations. In the case of smaller models, this difference could be as large as 19 times faster with CD-RGE. We average performance over 5 runs but find that convergence between runs is within
+\pm 2
+%.
+
+1M
+10M
+100M
+1B
+4.3B
+10^{1}
+10^{2}
+10^{3}
+Model Size (Parameters)
+Steps to 0 loss
+Comparing BPTT and CD-RGE Over Model Scale
+BPTT
+CD-RGE @ 8
+CD-RGE @ 96
+CD-RGE @ 512
+
+Figure 1
+:
+
+Iterations to overfit a fixed batch using BPTT versus CD-RGE on sequence length 100 at varying compute budgets. CD-RGE with 512 perturbations per step outperforms BPTT by up to 19× for small models (300k params) and 2× for larger models (270M params). BPTT cannot train models larger than 270M due to GPU memory constraints.
+
+4.2
+Transduction
+
+Now that we have shown CD-RGE can overfit to a single batch and achieve near 0 loss, we broaden to a stochastic, narrow training environment and a different model. We train LSTMs on COPY, REVERSE, and ROLLING SUM. In all cases, we provide a training context length from 1 to 10 and then measure how well the RNN can generalize to longer sequences (e.g. from 11 to 60). In
+Table
+
+2
+, we include our results choosing the best performing model over a hyperparameter sweep for BPTT and CD-RGE and observe that CD-RGE is able to match or beat almost on all tasks. Additionally, often 96 perturbations is sufficient to match or even exceed BPTT performance while 512 beats about 70% of the time. In the case of the medium size model on all tasks, BPTT quickly overfits, while CD-RGE seems to generalize better. Additionally, it is worth noting that BPTT is quite noisy while CD-RGE optimizes in a very smooth and stable way. We believe this is due to the tying of
+\varepsilon
+and
+\eta
+. If we shrink
+\varepsilon
+too small, we start to see similar instability and even divergence.
+
+Task
+
+Optimizer
+
+100k
+
+1M
+
+10M
+
+100M
+
+Copy
+
+BPTT
+
+3.40
+
+3.38
+
+3.50
+
+–
+
+CD–RGE@96
+
+3.40
+
+3.38
+
+3.37
+
+3.50
+
+CD–RGE@512
+
+3.37
+
+3.35
+
+3.36
+
+3.40
+
+Reverse
+
+BPTT
+
+3.87
+
+3.40
+
+3.48
+
+–
+
+CD–RGE@96
+
+3.35
+
+3.35
+
+3.36
+
+3.50
+
+CD–RGE@512
+
+3.30
+
+3.34
+
+3.37
+
+3.40
+
+Add
+
+BPTT
+
+1.52
+
+1.50
+
+1.75
+
+–
+
+CD–RGE@96
+
+1.56
+
+1.57
+
+1.71
+
+1.71
+
+CD–RGE@512
+
+1.56
+
+1.56
+
+1.70
+
+1.70
+
+PTB
+
+BPTT
+
+2.42
+
+2.40
+
+2.84
+
+–
+
+CD–RGE@96
+
+2.51
+
+2.51
+
+2.45
+
+2.58
+
+CD–RGE@512
+
+2.37
+
+2.50
+
+2.50
+
+2.47
+
+Table 2
+:
+Validation loss (in nats) across our transduction tasks and language modeling task on 4 different model scales (from 100k parameters to 100M parameters) comparing BPTT to CD-RGE at 96 and 512 perturbations per step. Note, we can not fit the 100M parameter model on an A40 even with batch size 1 and gradient checkpointing, so can not compare. We see that often 96 perturbations is sufficient to match or even exceed BPTT performance, while in most cases CD-RGE with 512 perturbations outperforms.
+
+4.3
+Language Modeling
+
+Finally, we broaden our experiments of CD-RGE to general language modeling. We do not aim to match state-of-the-art transformers in performance in this paper, instead only aim to show that BPTT and RGE perform similarly on the same task with the same model. We train LSTMs from 100k to 1.1B on the Penn-Treebank task
+(
+Marcus et al. 1993
+)
+to perform next token prediction, with batch size 1024 and sequence length 10 in all case. We measure that all of our model sizes are able match or exceed BPTT performance as shown in
+Table
+
+2
+.
+Figure
+
+2
+shows that we converge faster with larger model sizes, similar to the overfitting and transduction experiments. While Penn-Tree bank is a rather small dataset, so discerning generalization ability of larger RNNs is difficult and out of scope for this paper, we leave measuring of a more general scaling law for RNNs to future research. However, its clear that CD-RGE is able train larger RNNs whether a scaling law exists for LSTMs or not.
+
+100
+200
+300
+400
+500
+2
+3
+4
+5
+Training Step
+Validation Loss
+Validation Loss for BPTT and CD-RGE@512 Across Model Scales
+CD-RGE (1M)
+BPTT (10M)
+CD-RGE (10M)
+CD-RGE (1.1B)
+
+Figure 2
+:
+Validation loss trajectories for training large LSTMs on Penn-Treebank dataset on next character prediction with BPTT and CD-RGE with 512 perturbations per store across model sizes 1M, 10M, and 1.1B. As you can see, RGE provides very smooth convergence, while BPTT overfit quickly and bounces unevenly even with Adam. Both BPTT and CD-RGE at 10M converge to similar loss values. However, larger model sizes converge faster and to lower loss values suggesting more capacity will benefit larger RNNs.
+
+4.4
+Implementation Details
+
+All models use a character-level tokenizer with an input embedding dimension of 32. For CD-RGE, we use Rademacher for all probe sampling. Although we experimented with Adam-based solvers for CD-RGE, performance degraded, likely due Adam inhibiting large shifts in direction that are often beneficial with larger steps. No experiments use learning rate schedules or curriculum learning. We always hold
+\eta=\varepsilon
+throughout training for all runs. We explore
+\varepsilon,\eta\in[0.1,1\text{e}{-5}]
+and found
+\varepsilon/\eta\in[1,10]
+to be optimal. We sweep a learning rate from
+10^{-5}
+to 0.1 for all models. As batch size and number of perturbations increase, we typically must increase
+\eta
+to capture the benefit; conversely, larger models require smaller
+\varepsilon
+all else held equal. We use a layer LSTM for all LSTM and DNC runs. For LSTM experiments, we use FlashRNN kernels in mixed-precision (FP16) for both BPTT and CD-RGE training. BPTT is trained using AdamW (weight decay 0.1,
+\beta=(0.99,0.999)
+), as recommended by
+Graves et al. 2014
+, and batch size 1024. For CD-RGE, we do not use weight decay. FlashRNN does not support DNCs yet, so we use a custom PyTorch implementation. We overfit a fixed batch of length 100 that is random using a batch size of 1 and FP32 precision and take the average of 5 runs. No weight decay, momentum, or learning rate schedule is used for either solver. For all Transduction experiments, we train on input sequences of length 1 to 10 and validate on sequences of length 11 to 60 where every sample is random length and randomly sampled characters. For language modeling, all models are trained with sequence length 10 via teacher forcing, and batch size 1024.
+
+5
+Conclusion
+
+We present CD-RGE as a more scalable, memory-efficient approach for training large RNNs on long sequences. RGE sidesteps the limitations of BPTT, avoids retention of activations, while enabling strong parallelism. There are many exciting directions to take this work. As transformers take on more of human’s mental workload, their compute, memory, and energy demands scale unsustainably. The environmental footprint of our AI use can be greatly reduced by using more efficient inference algorithms. RNNs may be able to reduce this impact and Zero-Order could be the way we train them. This work is a small step towards training large, novel RNN architectures to compete directly with transformers at scale, without the need of differentiability, continuity, and activation retention requirements.
+
+6
