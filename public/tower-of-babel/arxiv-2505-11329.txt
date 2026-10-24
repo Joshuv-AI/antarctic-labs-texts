@@ -1,0 +1,1419 @@
+TokenWeave : Efficient Compute-Communication Overlap for Distributed LLM Inference Conference: ; ;
+Raja Gond, Nipun Kwatra, and Ramachandran Ramjee
+
+Abstract
+
+
+
+
+Distributed inference of large language models (LLMs) can introduce overheads of up to 20% even over GPUs connected via high-speed interconnects such as NVLink.
+Multiple techniques have been proposed to mitigate these overheads by decomposing computations into finer-grained tasks and overlapping communication with subtasks as they complete. However, fine-grained decomposition of a large computation into many smaller computations on GPUs results in overheads. Further, the communication itself uses many streaming multiprocessors (SMs), adding to the overhead.
+
+We present
+TokenWeave
+to address these challenges.
+TokenWeave
+proposes a
+Token-Splitting
+technique that divides the tokens in the inference batch into two approximately equal subsets in a wave-aware manner. The computation of one subset is then overlapped with the communication of the other.
+In addition,
+TokenWeave
+optimizes the order of the layer normalization computation with respect to communication operations and implements a novel fused AllReduce-RMSNorm kernel that carefully leverages Multimem instruction support available on NVIDIA Hopper GPUs. These optimizations allow
+TokenWeave
+to perform communication and RMSNorm using only 2-8 SMs. Moreover, our kernel enables the memory bound RMSNorm to be overlapped with the other batch’s computation, providing additional gains.
+Our evaluations demonstrate up to 29% latency gains and up to 26% throughput gains across multiple models and workloads. In several settings,
+TokenWeave
+results in better performance compared to an equivalent model with all communication removed. The source code of
+TokenWeave
+will be released soon.
+
+1.
+Introduction
+
+Figure 1
+.
+Communication overhead of AllReduce for three models vs sequence length on 8xH100 DGX (error bar shows std. dev. across 5 runs). Even with NVLink/ NVSHARP, communication overheads can be over 20%.
+
+Figure 2
+.
+Inference latency of Llama-3.3-70B on 8xH100 DGX for various sequence lengths.
+vllm-Multimem
+corresponds to vLLM with an optimized AllReduce implementation using Multimem and NVSHARP support.
+vllm-nocomm
+is a counterfactual baseline corresponding to only the computation time without any communication.
+The dotted lines represent relative performance compared to the
+vllm-Multimem
+baseline with
+TokenWeave
+providing up to 29% gains. Even at smaller sequence lengths,
+TokenWeave
+provides significant gains, e.g.
+18\%
+at
+1K
+, while prior schemes incur overheads.
+At sequence lengths
+\geq 4K
+,
+TokenWeave
+outperforms
+vllm-nocomm
+by not only recovering the complete communication overhead but also providing additional gains due to our fused AllReduce-RMSNorm kernel.
+
+Modern LLM deployments increasingly rely on distributed inference across multiple GPUs, driven by model size constraints or stringent latency requirements. Although high-speed interconnects like NVLink significantly improve communication bandwidth, substantial overheads remain. For example, in our experiments communication accounted for up to 23% of the end-to-end inference latency for Llama-3.3-70B
+(
+Grattafiori et al. 2024
+)
+and Qwen2.5-72B
+(
+Yang et al. 2024
+)
+models running on 8xH100 DGX (Figure
+1
+).
+
+Solutions to mitigate the communication overheads rely on overlapping computation with communication. Flux
+(
+Chang et al. 2024
+)
+, for instance, decomposes communication and computation operations into finer-grained tasks and fuses them into larger kernels to effectively hide communication latency. This method, however, requires complex kernel-level modifications, making it challenging to integrate into existing systems. NanoFlow
+(
+Zhu et al. 2024
+)
+divides requests into nano-batches and co-schedules operations divided at operation granularity (FFNs, attention, collectives) to overlap resource (compute, memory I/O, communication) usage. However, NanoFlow requires intricate scheduling and substantial framework changes.
+
+A fundamental challenge with decomposing a large computation into multiple smaller computations is compute efficiency on modern hardware. Modern GPUs offer a very high degree of parallelism, which makes running a large computation kernel much more efficient than running multiple smaller kernels due to wave quantization effects. This problem becomes more severe as the size of the fine-grained computations reduces. As a result, to get non-trivial gains, most current approaches rely on batches with large number of tokens (upwards of 8k), so that the size of smaller computations do not become very small. Another problem with the overlap approach is that the communication kernel itself typically requires many SMs to perform the communication efficiently. These SMs are no longer available for the overlapping computation kernel which slows down the computation and eats into gains from the overlap. Due to these issues, as of this writing, none of the open-source serving systems like vLLM
+(
+Kwon et al. 2023
+)
+, SGLang
+(
+Zheng et al. 2023
+)
+, and TensorRT-LLM
+(
+NVIDIA [n. d.]
+)
+support compute-communication overlap for inference of large models such as Llama-3.3-70B that are sharded across GPUs in a tensor-parallel manner.
+
+In this paper, we present
+TokenWeave
+, an efficient method to minimize communication overhead for LLM inference. To the best of our knowledge,
+TokenWeave
+is the first system that can significantly reduce communication overheads even in batches with moderate number of tokens. For example, as shown in Figure
+2
+with
+tokens\_in\_batch=1024
+,
+TokenWeave
+achieves latency improvements of
+18\%
+on Llama-3.3-70B on 8xH100. On the other hand, state-of-the-art communication fusion methods like TileLink
+(
+Zheng et al. 2025
+)
+, for the same setting, results in an overall hit in performance of 50+% over the non-overlapped baseline (Figure
+14
+).
+Reducing the
+tokens\_in\_batch
+requirement makes
+TokenWeave
+a viable technique to use together with modern schedulers such as Sarathi
+(
+Agrawal et al. 2024
+)
+which uses chunked prefill for efficient inference. For example, the popular vLLM
+(
+Kwon et al. 2023
+)
+serving system uses a default chunked prefill size (i.e. max_num_batched_tokens) of 2048
+(
+vLLM [n. d.]
+)
+. Even in disaggregated settings like Splitwise
+(
+Patel et al. 2024
+)
+or DistServ
+(
+Zhong et al. 2024
+)
+with
+tokens\_in\_batch\geq 4096
+, Figure
+2
+shows that
+TokenWeave
+delivers over 20% gains and outperforms an equivalent model that has all communication removed.
+
+TokenWeave
+comprises of three key techniques. First, we propose
+Token-Splitting
+, which is a coarse-grained splitting of tokens in the input batch into just
+two
+approximately equal subsets so that the computation of one split can be overlapped with communication of the other. The token-based splitting (instead of request-based) allows us to split in either the batch- or sequence- dimensions independently.
+Naïvely splitting the input tokens into two equal halves can result in overheads due to wave-quantization. Thus,
+TokenWeave
+performs
+Smart-splitting
+, a GPU wave-aware splitting which ensures that the total number of waves executed in kernels of the two subtasks is not more than the number of waves in the full computation kernel. The coarse work partitioning and
+smart-splitting
+almost completely eliminates the compute overheads due to the smaller computations.
+
+Second, while state-of-the-art models today use the more efficient RMSNorm
+(
+Zhang and Sennrich 2019
+)
+instead of LayerNorm for normalization, we find that even RMSNorm can take as much as 8% of the overall latency on H100s (Figure
+3
+). Thus, unlike previous work such as Tilelink
+(
+Zheng et al. 2025
+)
+, Flux
+(
+Chang et al. 2024
+)
+and Nanoflow
+(
+Zhu et al. 2024
+)
+that does not optimize normalization operations,
+TokenWeave
+carefully optimizes the normalization computation along with the communication operation.
+
+Figure 3
+.
+
+RMSNorm overhead for different models vs sequence length on 8xH100 DGX (error bar shows std. dev. across 5 runs). RMSNorm performed after AllReduce has non-trivial overheads and can range from
+5-9\%
+.
+
+Normalization operations are token-level operations that normalize the distribution of values along the hidden dimension and are memory-bandwidth bound. By default, on LLM serving systems like vLLM, normalization is performed after the AllReduce communication operation in most models. Logically, AllReduce can be broken into (equivalent) ReduceScatter and AllGather operations. If RMSNorm is moved in between these two operations, it does not change the mathematical function, but reduces the RMSNorm’s computational requirement by a factor of the number of GPUs in the distributed replica. However, simply breaking AllReduce into ReduceScatter and AllGather results in significant overhead that annuls the gains of the reduced RMSNorm computation, resulting in no advantage of doing such a breakup (Figure
+4
+). In
+TokenWeave
+, we design an optimized kernel that fuses communication and normalization such that it utilizes minimal number of HBM reads and writes, resulting in a very efficient implementation.
+
+Third, we leverage modern hardware features to implement communication with minimal SM use. For ReduceScatter, we leverage the Multimem instruction which offloads the reduction operation to the NVSwitch, reducing the SM requirement. For AllGather, we rely on the Multimem store instructions which reduces both memory-bandwidth and communication cost, minimizing SM requirement again. Due to the reduced computation and memory bandwidth requirements, the AllReduce-RMSNorm fused kernel can be efficiently executed with just 2-8 SMs compared to 16-20 SMs used by communication in prior work
+(
+Zhu et al. 2024
+)
+. Figure
+4
+shows up to 40% gains due to this fusion across the range of sequence lengths. An additional benefit of the fused kernel is that the memory-bandwidth bound RMSNorm operation can now also be overlapped with the computation of the other batch.
+
+Figure 4
+.
+Latency of executing a single AllReduce and RMSNorm operation for 8192 dimension hidden size, bf16 on 8xH100 DGX across varying sequence lengths for three approaches. Simple reordering of RMSNorm between ReduceScatter (RS) and AllGather (AG) is worse than performing RMSNorm after AllReduce except at high sequence lengths as the overheads of splitting AllReduce (AR) into RS and AG eat into the gains. Our fused AllReduce-RMSNorm kernel results in up to 40% gains over the entire sequence length range.
+
+We have integrated
+TokenWeave
+into the latest vLLM V1 serving framework and evaluated its performance across various models.
+We show that
+TokenWeave
+achieves up to 29% gains in overall latency compared to an optimized non-overlapped baseline across a range of batch sizes. In comparison, state-of-the-art communication overlap solution, TileLink, results in latency improvements only for batch sizes
+>=4K
+and that too with much more modest gains. Further, for various end-to-end workloads, we find that
+TokenWeave
+delivers up to 26% gains in throughput. Finally,
+TokenWeave
+is able to outperform an equivalent model with all communication removed due to its novel fused AllReduce-RMSNorm kernel that optimizes and overlaps the memory-bandwidth bound normalization operation.
+
+In summary,
+TokenWeave
+is a practical and easy to implement solution for enhancing the efficiency of LLM inference, combining simplicity of implementation with significant performance improvements. Our work makes the following key contributions:
+
+(1)
+
+Token-Splitting
+, a coarse token level splitting strategy allowing splitting over both batch- and token- dimensions that is GPU wave-aware, resulting in minimal overheads due to smaller computations.
+
+(2)
+
+A novel fused AllReduce-RMSNorm kernel that leverages modern GPU hardware capabilities to jointly optimize layer normalization and communication, thereby requiring only 2-8 SMs.
+
+(3)
+
+Implementation on the latest vLLM V1 inference system and extensive evaluation over multiple models, demonstrating improvements of up to 29% latency gains and up to 26% throughput gains.
+
+2.
+Background and Related Work
+
+A standard decoder-only Transformer
+(
+Vaswani et al. 2017
+)
+processes an input sequence through multiple transformer blocks, each composed of an Attention and a feed-forward network (FFN) layer. An RMSNorm layer is also inserted before each of the Attention and FFN layers. The FFN layer typically consists of two linear transformations with a nonlinearity like GELU
+(
+Hendrycks and Gimpel 2023
+)
+in between. The Attention layer is composed of multiple attention heads. It first performs a
+QKV-
+preprojection operation to compute a
+query
+,
+key
+and
+value
+for each of the heads, which is followed by the self-attention operation in every head, and finally a post-projection step which combines the output of all heads.
+
+2.1.
+Distributed Inference
+
+The large size of many modern LLMs requires inference to be run over multiple GPUs in order to fit the model parameters. Even if the model fits on a single GPU, distributed inference may still be required to meet the strict latency SLOs of interactive workloads. Moreover, distributed inference in many cases is more efficient as it allows for higher batch sizes by freeing up memory for the KV-cache.
+
+For distributed inference, the most common parallelism strategy is tensor-parallelism (TP). In TP, the FFN weight matrices are partitioned across GPUs — the first MLP partitioned column-wise and the second row-wise
+(
+Shoeybi et al. 2019
+)
+. Each GPU then performs computations using the local partial weight matrices. The individual outputs are then combined using an AllReduce operation to obtain the final output. For attention layers, the partitioning is done along the head dimension. Each GPU performs the
+QKV-
+preprojection and self-attention for the local heads. The output of the final post-projection matmul is finally combined across the GPUs using an AllReduce operation again.
+
+TP thus requires two AllReduce operations per transformer block which lie in the critical path. This can add significant cost to inference latency and reduce GPU efficiency. For example, as shown in Figure
+1
+, the communication cost can add an overhead of up to
+23\%
+even on an H100 DGX which have high-speed NVLink interconnects.
+
+2.2.
+Compute-Communication Overlap
+
+A common strategy for reducing communication overhead is to overlap the communication with some other computation. However, because of data dependency, the data to be communicated is ready only after the computation steps (FFN/Attention) finish. To solve this, one approach is to break the computation into smaller sub-tasks. The communication of completed sub-tasks can then be overlapped with computation of the remaining sub-tasks. Breaking into sub-tasks, however, can result in reduced compute efficiency. Modern GPUs are much more efficient at running large computation kernels due to the high degree of parallelism they offer, and breaking into smaller kernels can result in wave quantization effects where a bunch of GPU SMs may not have any work in the last computation wave. Many techniques
+(
+Wang et al. 2022
+;
+Jangda et al. 2022
+;
+Wang et al. 2024
+;
+Chang et al. 2024
+;
+Zheng et al. 2025
+)
+have been proposed to fix this via fused kernel implementations, where the communication is orchestrated from within the compute kernels as the computation of individual tiles finishes.
+
+Wang et al. 2022
+, for example, break AllReduce into a ReduceScatter and an AllGather operation. The ReduceScatter is overlapped with the previous layer computation, while AllGather is overlapped with the computation of the next layer.
+To orchestrate the overlaps, they rely on XLA and TPU support to invoke async collective APIs from within a tiled GEMM kernel. The reliance on XLA, however, has made porting to PyTorch + CUDA difficult, resulting in limited mainstream adoption.
+
+Flux
+(
+Chang et al. 2024
+)
+provides a solution similar to
+(
+Wang et al. 2022
+)
+for CUDA based implementations.
+They also break AllReduce into ReduceScatter and AllGather, and take a fused kernel approach via a CTA-level streaming scheme. Each GEMM CTA interleaves its MMA instructions with remote TMA loads and stores for sub-tiles that reside on peer GPUs. Leveraging TMA and NVSHMEM instructions on Hopper GPUs allow the communication stalls to be filled automatically by the next compute warp, enabling compute communication overlap. TileLink
+(
+Zheng et al. 2025
+)
+uses the same ideas as Flux, but pushes the implementation of fused kernel into a compiler via a Triton based implementation. This allows for much less handwritten code and allows for more optimization strategies. Both Flux and TileLink schemes, however, result in higher register and shared-memory footprints of the GEMM kernel due to the added communication. This can result in lower CTA occupancy and hurt the performance of the computation.
+
+Performance comparison of AllReduce vs ReduceScatter plus AllGather on H100 GPUs for a hidden size of 8192.
+
+Figure 5
+.
+Splitting AllReduce (AR) into ReduceScatter (RS) and AllGather (AG) can result in non-trivial overheads. Shown are the individual times and the relative performance (line plots) of these operations on 8xH100 DGX. All runs are with a hidden size of 8192 with bf16.
+
+Performance comparison of AllReduce vs ReduceScatter plus AllGather on H100 GPUs for a hidden size of 8192.
+
+Performance comparison of AllReduce vs ReduceScatter plus AllGather on H100 GPUs for a hidden size of 8192.
+
+Figure 6
+.
+
+Large collective operations are more efficient. Shown is the bandwidth for ReduceScatter (RS) on 8xH100 DGX for varying sequence length (hidden size 8192, bf16). Larger tensors result in much better bandwidth, demonstrating that splitting input into smaller parts results in overheads.
+
+Performance comparison of AllReduce vs ReduceScatter plus AllGather on H100 GPUs for a hidden size of 8192.
+
+The fused kernel approaches
+(
+Wang et al. 2022
+;
+Chang et al. 2024
+;
+Zheng et al. 2025
+;
+Hassani et al. [n. d.]
+;
+Wang et al. [n. d.]
+)
+, suffer from three problems. First, since the techniques rely on overlap within a GEMM kernel, communication overlap during non-GEMM operations like attention is not feasible. For example, the AllReduce after FFN layer is performed by overlapping the ReduceScatter portion with the second MLP, and overlapping the AllGather portion with the
+QKV-
+preprojection of the next attention layer. This limits the overlap opportunity and for small models or for small batches where the
+QKV-
+projection takes a very small time, there is not enough time to overlap the AllGather. Second, the splitting into ReduceScatter and AllGather operations, is less efficient compared to the equivalent AllReduce operation. Figure
+5
+plots the performance of a single AllReduce kernel compared to the cost of the equivalent ReduceScatter+AllGather for different sizes of communication. As shown, this can add significant overheads, upwards of 50%. Third, the smaller tile-sized granularity of communication is less efficient than doing single large transfers. Figure
+6
+plots the achieved ReduceScatter bandwidth vs the tensor size. As shown, smaller communication sizes achieve much lower bandwidths. Due to these factors,
+(
+Wang et al. 2022
+;
+Chang et al. 2024
+;
+Zheng et al. 2025
+)
+are able to effectively hide communication only when the GEMM is large enough, requiring batches with large tokens-in-batch.
+
+NanoFlow
+(
+Zhu et al. 2024
+)
+attacks this problem from a scheduling angle: it slices an incoming batch into nano-batches – at the granularity of whole kernels (FFN, attention, collective) rather than CTA tiles – and assigns each nano-batch to a dedicated CUDA stream bound to a fixed subset of SMs. By co-scheduling nano-batches whose resource profiles complement one another (e.g., compute-heavy FFNs alongside comm-bound ReduceScatter), NanoFlow overlaps GPU compute, HBM traffic, and NVLink transfers. The approach, however, relies on high batch sizes for breaking the input batch into sufficiently sized nano-batches, as smaller kernels of nano-batches can result in significant overheads.
+
+In concurrent work, DeepSeek uses the idea of splitting a batch into two in their inference system codebase
+(
+DeepSeek [n. d.]
+)
+to achieve compute-communication overlap. However, since their inference system avoids tensor parallelism and instead relies on expert-parallelism, they need to support the more expensive all-to-all communication instead of the cheaper all-reduce needed for tensor-parallelism.
+Thus, their system overlaps the all-to-all communication of one batch with the computation of second batch, requiring
+\sim 20
+SMs for communication compared to 4-8 SMs used in
+TokenWeave
+. Further, they do not overlap layer normalization along with communication.
+
+2.3.
+NV-SHARP, Multicast and SymmetricMemory
+
+The fourth generation NVSwitch systems (NVLink4) available on Hopper GPUs incorporate dedicated SHARP (Scalable Hierarchical Aggregation and Reduction Protocol) engines, termed NVLink SHARP or NVLS. NVLS enables GPUs to issue multimem PTX load/store instructions to multicast addresses. These instructions leverage the switch fabric to (i) duplicate packets to each subscribed GPU and (ii) perform an in-network reduction before forwarding the aggregated result. Because arithmetic operations are executed directly within the switch ASIC, communication collectives significantly reduce both NVLink bandwidth usage and GPU SM resource consumption.
+
+PyTorch v2.6.0 exposes NVLS through its
+SymmetricMemory
+API
+(
+Wang et al. 2025
+)
+. SymmetricMemory facilitates allocating peer buffers on GPUs using the
+symm_mem.empty
+call (similar to
+torch.empty()
+). After buffer allocation, a collective call to
+symm_mem.rendezvous()
+exchanges memory handles, mapping peer buffers into the virtual address space of each participating GPU. Post-rendezvous, each GPU can access remote or multicast pointers using standard memory operations within Triton or CUDA kernels, eliminating explicit NCCL calls and substantially simplifying the implementation of communication routines.
+
+These hardware and software advancements considerably decrease the number of SMs required for executing communication primitives and alleviate memory bandwidth pressure. In our experiments, we observed that utilizing only 6-8% of SMs on the H100 GPUs suffices to saturate communication bandwidth, leaving the majority of SMs free for compute tasks that overlap communication. This can be seen in Figure
+7
+which shows the latency of AllReduce kernel vs the number of SMs.
+
+Figure 7
+.
+
+Multimem based AllReduce implementations require very few SMs. Shown is the performance of AllReduce multimem kernel under different number of SMs for varying sequence length (hidden size 8192, bf16). 4-8 SMs is enough in most cases.
+
+3.
+TokenWeave
+: Design and Implementation
+
+(a)
+
+Vanilla Tensor Parallelism
+
+(b)
+
+TokenWeave
+
+Figure 8
+.
+
+Overview of
+TokenWeave
+. (a) Vanilla Tensor Parallelism: all compute and communication operations are performed sequentially. (b)
+TokenWeave
+: input batch is partitioned into two splits. RMSNorm is fused with communication and communication of one split overlaps with computation of the other split. Separate compute and communication streams
+blend
+to orchestrate the overlap.
+
+Two diagrams: (a) shows compute and communication without overlap; (b) shows them overlapping.
+
+We now describe the main techniques of
+TokenWeave
+– a coarse grained smart
+Token-Splitting
+technique, RMSNorm reordering and a fused AllReduce-RMSNorm implementation. Figure
+8
+provides a high-level schematic of our method compared to the standard tensor parallel implementation.
+
+3.1.
+Coarse-Grained
+Token-Splitting
+
+TokenWeave
+partitions the incoming batch into two subsets, each with nearly equal computational and communication requirement. For illustration, consider an incoming batch with size 1 and a sequence comprising
+L
+tokens. This batch is divided into two split-batches: a
+prefix-split
+containing the initial subsequence of length
+L_{1}
+, and a
+suffix-split
+containing the remaining subsequence of length
+L_{2}
+(
+L=L_{1}
++
+L_{2}
+). These split-batches are processed separately in a pipelined manner.
+
+All transformer operations, except attention, are token-level, and pose no problem due to the split processing. However, the attention operation introduces dependencies, as attention computation of tokens in the suffix subsequence depend on tokens in the prefix subsequence. To handle this dependency,
+TokenWeave
+employs a chunked attention implementation
+(
+Agrawal et al. 2024
+)
+, and ensures that operations for
+prefix-split
+precede those of the
+suffix-split
+. When processing batches larger than size 1, partitions may comprise either complete or partial sequences.
+TokenWeave
+ensures all prefixes of partial sequences reside within the
+prefix-split
+, thereby preserving necessary computational dependencies.
+
+3.1.1.
+Wave-Aware
+Smart-splitting
+
+Partitioning a large computation into smaller units can introduce overhead on GPUs due to wave quantization effects. Consider a GEMM kernel that requires 300 CTAs (Cooperative Thread Arrays). On an NVIDIA H100 GPU with 132 SMs (Streaming Multiprocessors), assuming each CTA occupies exactly one SM, this computation would span two full waves and one partial wave utilizing 32 SMs. Thus, the total computation time equals three waves of execution.
+
+If this computation is evenly split into two batches of 150 CTAs each, each smaller batch now requires two waves: one full wave of 132 SMs followed by a partial wave of 18 SMs. Consequently, the two smaller computations collectively require four waves, thereby increasing execution time compared to the original unsplit computation.
+
+To prevent such overhead,
+Smart-splitting
+employs a wave-aware splitting strategy, ensuring that the combined waves required by both splits do not exceed the wave count of the original unsplit computation. In the example above,
+Smart-splitting
+strategically divides the batch into one split containing 132 CTAs (exactly one full wave) and the other split with 168 CTAs (one full wave and one partial wave). This method effectively maintains the total computational waves, minimizing any wave quantization overheads due to splitting. Figure
+9
+compares the latency of FFN layer with and without
+smart-splitting
+. As shown,
+smart-splitting
+can reduce splitting overheads, especially for batches with fewer tokens.
+
+Figure 9
+.
+Smart-splitting
+can reduce wave-quantization overheads. Shown is the latency of FFN layer with
+no-split
+,
+equal-splits
+and
+smart-splitting
+. Also, shown is the normalized time w.r.t.
+no-split
+case.
+Smart-splitting
+reduces splitting overheads, especially for smaller batches.
+
+3.1.2.
+Overlapped Execution
+
+The operations of these two batches can now be overlapped as shown in Figure
+8
+. As shown, when the AllReduce of the first batch is being processed, we compute the attention of the second batch. The FFN of the first batch is then overlapped with the AllReduce of the second batch and so on. We implement this overlapped execution via CUDA streams. A communication stream handles all the communication operations, while a compute stream runs the compute operations. Lightweight synchronization using
+CudaEventSynchronize
+is performed between the compute and communication stream to handle data dependencies.
+
+3.2.
+RMSNorm Reordering
+
+As described in Section
+2.1
+, distributed inference via tensor-parallelism involves an AllReduce operation after Attention and FFN computations. In transformer models, the RMSNorm operation typically follows these layers and is computed independently by each GPU. This independent computation results in redundancy since all GPUs have identical token embeddings post-AllReduce.
+
+To address this inefficiency,
+TokenWeave
+strategically reorders RMSNorm operations within the AllReduce process. Specifically, the AllReduce operation can be decomposed into ReduceScatter and AllGather operations. At the completion of the ReduceScatter step, each GPU possesses the complete and final state of
+\frac{1}{N}
+of the tensor, where
+N
+represents the total GPUs in the distributed replica. Consequently, each GPU can independently perform RMSNorm on its dedicated
+\frac{1}{N}
+portion without redundancy. Since RMSNorm is a token level operation, we only need to ensure that ReduceScatter splits the tensor only at token boundaries. This ensures that each GPU has the full token embeddings. The subsequent AllGather operation then distributes these post-RMSNorm values to all GPUs.
+
+Through this reordering,
+TokenWeave
+reduces RMSNorm computation by a factor of
+N
+compared to traditional implementations, eliminating unnecessary redundancy. However, as shown in Figure
+4
+, such a simple reordering can actually result in performance loss as the cost of dividing AllReduce into separate ReduceScatter and AllGather cancels the RMSNorm computation gains. We address this inefficiency through our fused kernel in the next section.
+
+⬇
+
+1
+
+template
+
+<
+typename
+
+scalar_t
+,
+
+int
+
+width
+>
+
+2
+
+__global__
+
+fused_rs_ln_ag_cta_kernel
+(...)
+
+{
+
+3
+
+const
+
+int
+
+vec_hidden_size
+
+=
+
+hidden_size
+
+/
+
+width
+;
+
+4
+
+int
+
+tokens_per_cta
+
+=
+
+(
+num_tokens
+
++
+
+gridDim
+.
+x
+
+-
+
+1)
+
+/
+
+gridDim
+.
+x
+;
+
+5
+
+6
+
+sync_remote_blocks
+<
+MemOpSem
+::
+Relaxed
+>(
+signal_pads
+,
+
+rank
+,
+
+world_size
+);
+
+7
+
+__syncthreads
+();
+
+8
+
+9
+
+for
+
+(
+int
+
+iter
+
+=
+
+0;
+
+iter
+
+<
+
+tokens_per_cta
+;
+
+iter
+++)
+
+{
+
+10
+
+int
+
+token_id
+
+=
+
+blockIdx
+.
+x
+
++
+
+iter
+
+*
+
+gridDim
+.
+x
+;
+
+11
+
+if
+
+(
+token_id
+
+>=
+
+num_tokens
+)
+
+continue
+;
+
+12
+
+13
+
+float
+
+variance
+[1]
+
+=
+
+{0.0
+f
+};
+
+14
+
+__shared__
+
+float
+
+s_variance
+;
+
+15
+
+int
+
+offset
+
+=
+
+token_id
+
+*
+
+vec_hidden_size
+;
+
+16
+
+int
+
+offset_scalar
+
+=
+
+token_id
+
+*
+
+hidden_size
+;
+
+17
+
+auto
+
+input_o
+
+=
+
+input_v
+
++
+
+offset
+;
+
+18
+
+auto
+
+residual_o
+
+=
+
+residual_v
+
++
+
+offset
+;
+
+19
+
+20
+
+for
+
+(
+int
+
+idx
+
+=
+
+threadIdx
+.
+x
+;
+
+idx
+
+<
+
+vec_hidden_size
+;
+
+idx
+
++=
+
+blockDim
+.
+x
+)
+
+{
+
+21
+
+auto
+
+multimem_temp
+
+=
+
+multimem_ld_reduce_add
+<16>(
+multimem_address_ptr
+
++
+
+22
+
+offset_scalar
+
++
+
+idx
+
+*
+
+width
+);
+
+23
+
+vec_t
+
+temp
+
+=
+
+*
+(
+reinterpret_cast
+<
+vec_t
+*
+>(&
+multimem_temp
+));
+
+24
+
+temp
+
++=
+
+residual_o
+[
+idx
+];
+
+25
+
+variance
+[0]
+
++=
+
+temp
+.
+sum_squares
+();
+
+26
+
+residual_o
+[
+idx
+]
+
+=
+
+temp
+;
+
+27
+
+}
+
+28
+
+29
+
+blockReduceSum
+<
+float
+,
+
+1>(
+variance
+);
+
+30
+
+if
+
+(
+threadIdx
+.
+x
+
+==
+
+0)
+
+31
+
+s_variance
+
+=
+
+rsqrtf
+(
+variance
+[0]
+
+/
+
+hidden_size
+
++
+
+epsilon
+);
+
+32
+
+__syncthreads
+();
+
+33
+
+34
+
+for
+
+(
+int
+
+idx
+
+=
+
+threadIdx
+.
+x
+;
+
+idx
+
+<
+
+vec_hidden_size
+;
+
+idx
+
++=
+
+blockDim
+.
+x
+)
+
+{
+
+35
+
+vec_t
+
+temp
+
+=
+
+residual_o
+[
+idx
+]
+
+*
+
+s_variance
+
+*
+
+weight_v
+[
+idx
+];
+
+36
+
+multimem_st
+<16>(
+mcptr
+
++
+
+offset
+
++
+
+idx
+
+*
+
+width
+,
+
+37
+
+*
+(
+reinterpret_cast
+<
+Vec
+<16>
+*
+>(&
+temp
+)));
+
+38
+
+}
+
+39
+
+}
+
+40
+
+__syncthreads
+();
+
+41
+
+sync_remote_blocks
+<
+MemOpSem
+::
+AcqRel
+>(
+signal_pads
+,
+
+rank
+,
+
+world_size
+);
+
+42
+
+}
+
+Listing 1:
+Implementation of Fused AllReduce+RMSNorm kernel. Current implementation only supports BFloat16. For brevity, some parts of the code have been omitted. The fused kernel is built on top of the PyTorch MultiMem AllReduce code
+(
+PyTorch Team [n. d.]
+)
+and the RMSNorm kernel from vLLM
+(
+vLLM Contributors [n. d.]
+)
+.
+
+3.3.
+Fused AllReduce-RMSNorm Implementation
+
+TokenWeave
+leverages NVIDIA H100’s multimem capabilities for an efficient, fused implementation of ReduceScatter, RMSNorm, and AllGather operations. Specifically, during ReduceScatter, each GPU uses NV-SHARP to perform the reduction of its
+\frac{1}{N}^{th}
+portion of the tensor. We then perform RMSNorm computation immediately on this reduced portion, and the results are subsequently written to multimem addresses for the AllGather distribution to all GPUs.
+
+We provide the source code of our fused kernel in
+1
+.
+RMSNorm typically necessitates two HBM reads — one to compute variance of the token embedding and another to scale the values by the computed variance — as well as one final HBM write. In contrast, our fused implementation optimizes memory access by computing variance (line 25) directly on the result of the multimem ReduceScatter (line 23), thus eliminating the need for the initial HBM read. Additionally, we save an extra HBM write by directly outputting the normalized values to multimem for the AllGather operation (line 36). Further, note that the residual operation is also fused with RMSNorm (line 24).
+
+The reduction in memory accesses, combined with the elimination of redundant computations, makes our fused AllReduce-RMSNorm kernel very efficient. As shown in Figure
+4
+, the fused kernel provides up to 40% gains over the current approach of separate AllReduce + RMSNorm computation across all sequence lengths.
+
+Also, the reduced compute and memory bandwidth requirements, allows this fused kernel to be executed with very few SMs (only 2-8 in our experiments) without incurring much overhead — as shown in Figure
+10
+the kernel execution time does not improve much after 8 SMs and for larger sequences, even 4 SMs are enough. This allows us to overlap the full AllReduce-RMSNorm operation of one split-batch with the compute of the other split, enabling overlap of not just the communication but also the memory-bound RMSNorm. Since this computation is overlapped with the other split-batch, even if using fewer SMs (e.g. 2 instead of 8) results in some overheads, it will be hidden as long as its execution time does not exceed the execution time of the overlapped compute kernel.
+
+Figure 10
+.
+
+The fused AllReduce-RMSNorm kernel performs optimally with very few SMs. Shown is the performance of AllReduce multimem kernel under varying number of SMs for different sequence lengths (hidden size 8192, bf16). 8 SMs is close to optimal in most cases.
+
+4.
+Experimental Evaluation
+
+We evaluate
+TokenWeave
+on multiple popular models, different workload settings and multiple TP configurations. In our evaluation, we seek to answer the following questions:
+
+(1)
+
+How much communication latency overhead is recovered by
+TokenWeave
+for different models under different TP sizes and batch configurations? (§
+4.2.1
+).
+
+(2)
+
+How does
+TokenWeave
+perform in end-to-end workload traces? (§
+4.2.2
+).
+
+(3)
+
+How does
+TokenWeave
+compare to prior approaches like TileLink and Nanoflow?
+(§
+4.2.3
+and §
+4.2.4
+).
+
+4.1.
+Experimental Setup
+
+Implementation Details:
+We implemented
+TokenWeave
+over the
+vLLM
+
+(
+Kwon et al. 2023
+)
+framework, a state-of-the-art serving system for LLM inference. Specifically, we build on the recent and highly performant V1 engine
+(
+vLLM Team [n. d.]
+)
+available in vLLM==
+v0.8.5.dev106
+. We leverage PyTorch==
+v2.6.0
+, which includes support for
+SymmetricMemory
+and implemented the communication collectives using
+triton-3.2.0
+and PyTorch CUDA extensions built on top of symmetric memory recipes recently released by PyTorch
+(
+Wang et al. 2025
+)
+.
+
+Models:
+We evaluate
+TokenWeave
+on three popular models Llama-3.3-70B, Qwen2.5-72B and Mixtral-8x22B models that are served on multiple GPUs using tensor parallelism today. The first two are dense models while Mixtral is an Mixture-of-experts (MoE) model. We skip smaller models such as Llama-3-8B, as they can be served efficiently on single GPUs.
+
+Environment:
+All our experiments are performed on an 8xH100 NVIDIA DGX system with NV-SHARP support. The TP-4 experiments use the same system but use four of the eight GPUs. We also use fixed TDP settings to ensure stable performance measurements
+(
+NVIDIA 2020
+)
+. For microbenchmarks, we perform warm-up, flush the L2 cache and use
+cudaEvent
+s for timing measurements. For end-to-end (e2e) results, we perform warm-up and then use
+time.perf_counter()
+for timing.
+We disable prefix caching to ensure consistent and fair comparisons.
+For end-to-end evaluations, we ignore the detokenization time (time to convert output tokens back to text performed in the CPU).
+
+Baselines:
+We first compare against the current vLLM implementation which does not overlap communication operations. We evaluate both the default ring- or tree-based AllReduce implementation, called
+vLLM-Default
+, and an optimized AllReduce implementation which leverages the NVSHARP and MultiMem support for H100s, called
+vLLM-multimem
+. Further, we also report the performance of vllm with all communication operations removed, called
+vLLM-nocomm
+. While this version will not produce correct model output, it serves as a performance reference.
+
+We also compare with TileLink
+(
+Zheng et al. 2025
+)
+which is the current state-of-the-art method for reducing communication overheads using compute-communication fusion and outperforms Flux
+(
+Chang et al. 2024
+)
+, as well as NanoFlow
+(
+Zhu et al. 2024
+)
+, a technique that optimizes compute, memory-bandwidth and communication. However, note that TileLink is not integrated with vLLM which makes an end-to-end comparison difficult. We thus use optimized single layer implementations of various models to compare
+TokenWeave
+against TileLink. NanoFlow again has their own serving stack and is not integrated with vLLM.
+Thus, to compare against the NanoFlow baseline, we look at the communication overhead which is recovered in NanoFlow against their baseline framework vs that recovered by
+TokenWeave
+against vLLM, which is our baseline framework. We also report absolute numbers for reference.
+
+4.2.
+Experimental Results
+
+We now present our experimental findings. We first evaluate
+TokenWeave
+’s end-to-end performance and then compare it against TileLink and Nanoflow.
+
+(a)
+
+8xH100
+
+(b)
+
+4xH100
+
+Figure 11
+.
+TokenWeave
+Latency Gains. Shown are the execution times of a prefill request with varying sequence length for different models on (a) 8xH100s and (b) 4xH100s. In almost all cases,
+TokenWeave
+is close to or better than the theoretical
+vllm-nocomm
+baseline with zero communication overheads, showing that
+TokenWeave
+not only recovers all the communication overheads, but provides additional gains due to RMSNorm fusion.
+
+4.2.1.
+TokenWeave
+Latency Benefits
+
+First, we evaluate latency for a single iteration of the forward pass. For this experiment, we use
+prefill-only batches with varying sequence lengths as shown in Figure
+11
+. We evaluate five different settings, corresponding to three models running on 8xH100s and 4xH100s, except for Mixtral-8x22B that does not fit on 4xH100s. As shown,
+TokenWeave
+shows consistent gains between
+18-29\%
+for the dense models in the 8xH100s case, with significant gains even at small sequence lengths. For the MoE Mixtral model, the gains are generally smaller but the communication overhead for Mixtral is also lower (Figure
+1
+). Further, unlike the dense models, there is a net overhead for
+TokenWeave
+in Mixtral at smaller sequence lengths of 1K and 2K. This is because, in MoE, the tokens for MLP computation get split across the 8 experts, making the FFN computations memory bound for smaller requests. As a result, even
+TokenWeave
+’s coarse splitting into two sub-tasks can result in non-trivial overheads that cannot be compensated by saving due to computation overlap. Finally, for the 4xH100s experiments,
+TokenWeave
+again gets substantial gains consistently over the range of sequence length starting from 1K. The gains are lower than 8xH100s, as the communication overhead itself is less with fewer GPUs.
+
+(a)
+
+8xH100
+
+(b)
+
+4xH100
+
+Figure 12
+.
+TokenWeave
+throughput gains for end-to-end workload traces. Shown is the measured throughput under fixed (input, output) length traces as well as the ShareGPT trace for different models on (a) 8xH100s and (b) 4xH100s.
+Two diagrams: (a) shows compute and communication without overlap; (b) shows them overlapping.
+
+Figure 13
+.
+TokenWeave
+throughput gains for end-to-end workload traces under chunk size variation. Shown is the measured throughput under fixed (input, output) length traces as well as the ShareGPT trace for Llama-3.3-70B on 8xH100 DGX. The chunk-size is varied from 1024 to 8192.
+
+4.2.2.
+TokenWeave
+Throughput Gains
+
+We now evaluate the throughput performance of
+TokenWeave
+for various workload traces.
+As is standard practice, we use chunked-prefills
+(
+Agrawal et al. 2024
+)
+with hybrid prefill-decode batching to ensure consistent latency guarantees while maximizing throughput. Chunked-prefill ensures that time-between-tokens (TBT) latency is bounded, resulting in smooth response to the user. Chunked-prefills is turned on by default in the vLLM framework. For the first experiment, we use a chunk size of 2K (vLLM default) for the dense models and 4K for Mixtral. We apply
+TokenWeave
+to hybrid batches with 1K or more tokens (4K for Mixtral) and use non-overlapped communication using our fused kernel for the smaller decode-only batches.
+
+Figure
+12
+shows the performance evaluation with chunked-prefills on workloads with both fixed input and output length requests, as well as ShareGPT
+(
+Wang et al. 2023
+)
+which is a real-world workload trace with varying input/output requests lengths based on user conversations. As shown, in the 8xH100s case,
+TokenWeave
+continues to show substantial throughput gains of
+\sim 20\%
+for the dense models and recovers most of the communication overheads.
+
+The chunk size used in chunked-prefill enables a trade-off between TBT latency and throughput, with smaller chunk sizes enabling lower TBT values but also resulting in lower throughput. In the second experiment, we vary the chunk size and evaluate
+TokenWeave
+’s throughput.
+Figure
+13
+uses the same workload as before but with varying chunked-prefill sizes for the Llama-3.3-70B model. The figure shows that there is consistent performance gains of 15-26% with
+TokenWeave
+over a range of chunk sizes.
+
+4.2.3.
+Comparison with TileLink
+
+Figure 14
+.
+Single layer latency for Llama-3.3-70B on 8xH100 DGX. Numbers represent normalized performance compared to
+vllm-multimem
+. While TileLink ends up with an overhead at small sequence lengths,
+TokenWeave
+provides consistent high gains over entire sequence length range.
+
+We now compare
+TokenWeave
+performance against TileLink,
+vLLM-Default
+and
+vLLM-multimem
+. As noted earlier, we use a single layer of the model for comparison since TileLink is not integrated into a serving stack. We also compare against an additional baseline, TileLink-OnlyMLP, which performs the TileLink overlap only for the MLP layers. While this overlaps only one of the two communications per layer, we find that it can be more efficient for smaller batches where the attention projection layers do not provide enough overlap opportunity and trying to overlap can increase rather than decrease overhead (recall that, unlike
+TokenWeave
+, TileLink can only overlap communication during GEMM computations).
+
+For this evaluation, we use batch size 1 and vary the sequence length of the single request. Figure
+14
+shows the time taken for a single layer computation. As shown,
+TokenWeave
+reduces the computation latency by
+20\%
+even at a small request length of 1K tokens, while state-of-the-art TileLink actually ends up with a net overhead at small sequence lengths. TileLink results in performance improvements only for sequence lengths
+>4K
+, but the gains saturate to around
+21\%
+, while
+TokenWeave
+provides much higher gains up to
+38\%
+. Note that end-to-end latency gains in Section
+4.2.1
+are lower than the single-layer latency gains here due to non-layer overheads like embedding, sampling, etc.
+
+4.2.4.
+Comparison with NanoFlow
+
+NanoFlow
+(
+Zhu et al. 2024
+)
+uses a custom serving stack and is not integrated with popular inference frameworks such as vLLM. This makes direct comparison of NanoFlow with
+TokenWeave
+difficult. Also, NanoFlow implementation requires framework level changes to co-ordinate the multiple nanobatches, which makes single layer microbenchmarks impractical. Furthermore, NanoFlow’s current implementation only supports NVIDIA A100 GPUs, whereas
+TokenWeave
+targets NVIDIA H100 GPUs. To facilitate a meaningful comparison, we adapted NanoFlow’s custom serving stack to run on H100 GPUs by implementing necessary modifications.
+
+While the NanoFlow paper shows that their serving stack is more efficient than an earlier version of vLLM on A100 GPUs, we find our vLLM V1 baseline throughput numbers on H100 GPUs are better than NanoFlow’s serving stack, perhaps because vLLM V1 has significantly improved its performance recently. Thus, instead of performing an absolute throughput comparison, we resort to a relative performance comparison as described next.
+
+We evaluate the adapted NanoFlow implementation under two conditions: with NanoFlow enabled and disabled within its own serving stack. Figure
+15
+shows the performance evaluation with chunked-prefills (chunk size 2K) on workloads with various fixed input and output length requests. As shown, NanoFlow provides only modest performance gains in the range of 5-8%, closely matching the 7% communication gains reported in the NanoFlow paper. In contrast,
+TokenWeave
+demonstrates significantly larger gains (
+\sim 20\%
+) across a broad range (see Figure
+12
+).
+
+Figure 15
+.
+
+NanoFlow throughput evaluation for end-to-end workload traces. Shown is the measured throughput under fixed (input, output) length traces for Llama-3.3-70B on 8xH100 DGX.
+nanoflow-full
+corresponds to full NanoFlow implementation, while
+nanoflow-frameworkonly
+disables NanoFlow (both nanobatching and overlap) but uses their custom serving framework.
+
+5.
+Conclusion
+
+We find the communication cost for large models served over multiple GPUs is as high as 20% today despite hardware support such as high speed NVLink and NVSHARP. Furthermore, we identify that RMSNorm also results in a significant overhead of 5–9%.
+TokenWeave
+addresses these issues by splitting the model input into two approximately equal batches and overlapping the compute of one batch with a novel fused AllReduce-RMSNorm communication and normalization kernel of the other batch. Through extensive experimental evaluations using multiple models running on 4 H100 and 8 H100 DGX GPUs, we show that
+TokenWeave
+provides up to 29% latency gains and up to 26% throughput gains compared to an optimized baseline in a variety of settings and workloads.
+

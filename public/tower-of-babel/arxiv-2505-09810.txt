@@ -1,0 +1,1204 @@
+Lossless Compression for LLM Tensor Incremental Snapshots
+Daniel G. Waddington, Cornel Constantinescu
+
+Abstract
+During the training of Large Language Models (LLMs), tensor data is periodically "checkpointed" to persistent storage to allow recovery of work done in the event of failure. The volume of data that must be copied during each checkpoint, even when using reduced-precision representations such as bfloat16 , often reaches hundreds of gigabytes. Furthermore, the data must be moved across a network and written to a storage system before the next epoch occurs. With a view to ultimately building an optimized checkpointing solution, this paper presents experimental analysis of checkpoint data used to derive a design that maximizes the use of lossless compression to reduce the volume of data. We examine how tensor data and its compressibility evolve during model training and evaluate the efficacy of existing common off-the-shelf general purpose compression engines combined with known data optimization techniques such as byte-grouping and incremental delta compression. Leveraging our analysis we have built an effective compression solution, known as Language Model Compressor (LMC), which is based on byte-grouping and Huffman encoding. LMC offers more compression performance than the best alternative (BZ2) but with an order-of-magnitude reduction in the time needed to perform the compression. We show that a 16-core parallel implementation of LMC can attain compression and decompression throughput of 2.78 GiB/s and 3.76 GiB/s respectively. This increase in performance ultimately reduces the CPU resources needed and provides more time to copy the data to the storage system before the next epoch thus allowing for higher-frequency checkpoints.
+
+
+
+1
+Introduction
+
+Today, LLMs are typically fine-tuned from existing base models. To create the base model a compute and data-intensive
+pre-training
+phase is needed. This phase uses vast input data sets (e.g., web crawls) to effectively extract language and subject understanding. For large models, such pre-training can take weeks or even months to complete. For example, the BLOOM 176B parameter model (based on GPT3
+[
+9
+]
+) took 3.5 months to train on a cluster of 384 80G A100 NVIDIA GPUs with a data set of 350B tokens
+[
+16
+]
+. At this scale of compute, failures invariably occur (
+[
+10
+]
+report that failures can slow down training by up to 43%). Prior work has shown that infrastructure and process failures are common in large-scale big data clusters, with a mean time between failure (MTBF) of 4–22 hours
+[
+6
+,
+4
+]
+. Consequently, resulting outages and restarts can become very costly.
+
+Scale-out of the training means that the compute and data are distributed across a cluster of compute nodes. Parallelism is achieved either distributing the training pipeline or by distributing the model weights and biases through
+sharding
+. The size of the checkpointed data depends on the model and training scheme. Nevertheless, a single checkpoint, combining data from all nodes, can reach many gigabytes. For example BLOOM checkpoints are 329 GiB in size consisting of data sharded across 48 nodes and 384 GPUs
+[
+16
+]
+. As the training occurs the tensors are updated over time (see Figure
+1
+).
+
+Figure 1:
+Tensor Data Shards Evolving
+
+To reduce cost incurred by restarting due to failure in the cluster,
+checkpointing
+is commonly used. Checkpointing periodically creates a snapshot of GPU memory state at a single point in time. Checkpoints are coherent across multiple nodes in the compute cluster - this is normally achieved by suspending compute at a specified epoch
+1
+1
+
+1
+
+An epoch is one full cycle through the input data
+. Once the state has been copied from the GPU memory (e.g., into local host memory) the training workload can asynchronously continue while the checkpoint data is written out to persistent storage.
+
+There is a balance between checkpointing frequency, the volume of data to persist, the time the GPUs are waiting idle, and the time to recover after failure. Prior work focuses on various optimizations of checkpoint frequency, reducing GPU idle time and minimizing recovery time
+[
+11
+,
+13
+,
+15
+]
+.
+
+This paper focuses on reducing the volume of data through lossless compression and the resources and time needed to perform it. We focus on lossless compression so as to allow precise recovery and elimination of unexpected possible side-effects that might result from lossy compression.
+
+We start by first examining data
+from six LLM checkpoint sequences taken from Hugging Face (HF). We examine attributes of the data (type, shape, size, entropy) and how it evolves during the training process. This is followed by an evaluation of the effectiveness of applying common-of-the-shelf (COTS) compression engines. From an understanding of the data, in Section
+4
+, we propose an alternative compression scheme based on Byte-Grouping (BG), Huffman Encoding and Run-Length Encoding (RLE) that offers more compressability and reduced execution time than alternative COTS encoders. We evaluate our method and compare it with the best known alternatives.
+
+2
+Background: The Nature of LLM Tensors
+
+Figure 2:
+Functional description of a biological neuron’s structure
+[
+5
+]
+
+Deep learning is a form of machine learning that builds large neural networks similar in essence to the human brain
+[
+5
+]
+. The neural network is composed of set of interconnected layers whereby artificial neurons "activate" according to an operation on their inputs. For dense networks, each neuron is connected to every other neuron of the next layer, hence its output value becomes the input for the next layer. During training, there are two neuron parameters that are adjusted:
+weight
+and
+bias
+. Weights are coefficients that affect the "strength" of each input
+(w_{i}j\cdot x_{i})
+, that is, how much of the input data is fed into the activation function (see Figure
+2
+). The weighted inputs are then summed and transformed using an activation function
+f
+to generate the output
+y_{j}
+as follows:
+
+y_{j}=f(\sum(w_{i}j\cdot x_{i})+b_{j})
+
+During the training phase of a neural network, weights and biases are adjusted iteratively to minimize the difference between the network’s predictions and the desired outcome. While LLM models and training is a complex matter outside the scope of this paper, these deep learning fundamentals carry through.
+
+Neuron parameters are represented as numerical
+tensors
+. The term tensor is a generalisation of scalars and vectors. Tensor elements are floating point during training and often quantized to integer values for the purpose of inferencing.
+
+Floating-Point Representations
+
+There are many bit representations of floating point numbers available in today’s computer systems. Most commonly, LLM models are based on one of three types: IEEE 32-bit float (single precision), IEEE 16-bit float (half precision) and Google’s 16-bit brain float
+[
+8
+]
+(see Figure
+3
+). These formats differ by how many bits are available and how the bits are divided between the exponent and mantissa (also termed the fraction). Because most hardware now supports bfloat16 as a superior format for deep learning (performing nearly as well as float32 but using half the number of bits)
+[
+8
+]
+, this paper focuses on the analysis of checkpointing data in float32 and bfloat16 formats (see Table
+1
+).
+
+Figure 3:
+LLM Floating Point Formats
+
+3
+Analysis of LLM Checkpoint Data
+
+We examine checkpoint data for six different models that are all publicly available on Hugging Face (
+https://huggingface.co/
+). From these sources, we have analyzed over 28 TiB of tensor data. Three of the data sets are based on bfloat16 and three on float32. The attributes of the sample models are shown in Table
+1
+. Additional information about the sample data is provided in Appendix A.
+
+Name
+
+Model Size (params)
+
+Tokens
+
+Type
+
+Chkpt Size
+
+Chkpt Count
+
+Shard Splits
+
+bloom
+
+176B
+
+366B
+
+BF16
+
+329GiB
+
+20
+
+72
+
+amber
+
+6.74B
+
+1.25T
+
+BF16
+
+13GiB
+
+358
+
+3
+
+transnormer
+
+7B
+
+1.4T
+
+BF16
+
+28GiB
+
+18
+
+11
+
+multiberts
+
+110M
+
+160M
+
+FP32
+
+441MiB
+
+28
+
+1
+
+olmo
+
+7B
+
+2.5T
+
+FP32
+
+26GiB
+
+558
+
+1
+
+gpt2
+
+124M
+
+4M
+
+FP32
+
+1.4GiB
+
+2000
+
+1
+
+Table 1:
+Attributes of Analyzed Data Sets
+
+3.1
+Converging Behavior
+
+As previously discussed, the purpose of training a model is to "tweak" the parameters until the optimum function of the neural network can be achieved. This adjustment of parameters lessens over time, eventually reaching values that are stable. Figure
+4
+shows a sample of weights (from shard
+h.18.self_attention.dense.weight
+) for the BLOOM data set. As is evident from the plot, at step 0 the values start randomly within the range +/- 0.005, then after a period of relatively aggressive change, they start to converge by around step 17. By step 20, the values are steady. This convergence behavior indicates that there are potential gains available for
+delta encoding
+between checkpoints.
+
+Figure 4:
+Sample Self-Attention Weights over Time from BLOOM Data Set
+
+We now examine the bit distribution, that is the ratio of zeros and ones.
+This data is from BLOOM and is therefore bfloat16. Figure
+5
+shows what proportion of bits (as a percentage on the z-axis) are set at that single point in time. Note that step 0 is at the rear of the plot, i.e., time runs from the back to the front.
+
+Figure 5:
+Bit Distribution for BLOOM Self-Attention QKV Weights Shard 0
+
+Although the early steps are more volatile, the plot shows that most bits (except 10 and 14) flip between steps. Bit 14 is the most significant bit of the exponent (bit 15 is the sign bit) and is thus only set for values beyond the range of 7-bit exponent (
+3.4*10^{19},-3.4*10^{19}=6.4*10^{19}
+). In this data, the values are not reaching a magnitude to warrant this bit.
+
+To explore further how tensor data changes over time, we examine how many bits are flipped between "steps" (refer to Figure
+1
+), which represent an iteration of the whole input data set. We do this by examining the result of an XOR operation on values in step
+n
+and
+n+1
+.
+
+Figure 6:
+XOR Delta Bit Distribution for BLOOM Self-Attention QKV Weights Shard 0
+
+Figure
+6
+shows the change in bit flip ratios as the step number increases. Note that step 0 is furthest back on the y-axis and that the z-axis maximum is 50% (i.e., equivalent to random change). This plot confirms several things. First, as indicated by falling bit set ratios (z-axis), stability increases as steps progress. Second, least-significant bits change more than most-significant bits - bits 10-14 rarely change at all. Third, sign bit changes reduce as the learning progresses, indicating less values are fluctuating across the zero boundary. In all, the "space available" in the three-dimensional cube suggest potential for compression.
+
+Figure 7:
+Bit changes for bfloat16 values -0.25 to 0.25 modified in 0.005 increments
+
+While, Figure
+6
+shows increasing potential for compressability as learning progresses, it is clear that the lowest-significant bits (especially bits 0-4) continue to fluctuate even close to convergence. This is congruent with the nature of floating point representations. Figure
+7
+illustrates how bfloat16 bits change as 0.005 increments are made from -0.25 to 0.25. The yellow pixels indicate a bit flip (between the value and its incremented value). Bit 0 is at the top of the figure. From this figure, it is evident that even for very small increments, the first few bits almost always change.
+
+4
+Proposed Compression Algorithm
+
+Byte-Grouping and RLE
+
+Byte-grouping (BG) is a simple modelling strategy that rearranges the data to exploit different stability across bytes. For example, considering Figure
+6
+, the stability of the most-significant byte (bits 8-15) is much greater than the least-significant byte (bits 0-7). Byte-grouping copies bytes from their original position in the tensor value into contiguous regions of memory assigned to the group. For 16-bit values, two byte-groups are formed (see Figure
+8
+example). For 32-bit values, four byte-groups are formed.
+
+Figure 8:
+Example Byte-Grouping of four 16-bit values
+
+Grouping more stable bytes in contiguous regions of memory, leads to more effective Run Length Encoding (RLE). RLE is a well known encoding method that replaces a symbol
+S
+with the pair
+(S,c)
+where
+c
+is the number of times
+S
+is repeated in this position. For example:
+
+AAAABBBAACCC\rightarrow(A,4),(B,3),(A,2),(C,3)
+
+Thus, RLE is effective when symbols are repeated. For the tensor delta data, repeating symbol zero is common and therefore RLE offers a path to additional compression.
+
+4.1
+Estimating compressibility with Entropy
+
+Byte-grouping transformation seems to help many off-the-shelf compression engines so we are using this layout of data. Here we want to investigate what would be the compressibility of this type of data when using a simple model: considering bytes as independent compression symbols and measuring per symbol (byte) information content. The average amount of information per symbol over all alphabet (of 256 symbols) is known as the
+entropy
+of the symbols probability distribution and measured in bits is given by:
+
+H=-\sum_{i=0}^{255}p_{i}\log_{2}p_{i}
+
+where
+p_{i}
+denotes the probability of occurrence of symbol
+i
+(byte value
+i
+) of the alphabet. For a given probability distribution of the symbols, the entropy represents the minimum number of bits needed to represent a symbol without losing any information (i.e. the code to be uniquely decodable). Note that the worst case for the entropy is when the symbols are uniformly distributed, so the probability of each symbol is
+p_{i}=1/256
+and the entropy
+H=8
+bits.
+
+To capture the changes in symbols probability distribution we provide
+adaptivity
+by computing symbols probability distribution on relatively small blocks of maximum
+64KiB
+(instead of entire file). As symbol probability
+p_{i}
+we use:
+
+p_{i}=\frac{\text{number of occurrences of the symbol $i$ in the block}}{\text{block size in bytes}}
+
+Figure
+9
+compares the compression ratios achieved by BZ2, DEFLATE and LZ4 (common off-the-shelf) with that which could be achieved by an entropy-based compression approach. BZ2 compression algorithm comes closer to the entropy, but it involves complex modelling by preprocessing data using the Burrows-Wheeler transform
+[
+2
+]
+making it quite slow.
+
+Next, we examine an alternative entropy coder implementation that achieves the code size per symbol (byte) closer to entropy.
+
+Figure 9:
+Entropy Comparison with Off-the-shelf Engines on BLOOM Data
+
+4.2
+Large Model Compression (LMC)
+
+We investigate using a Huffman-based entropy encoder because it is fast and optimal within 1 bit of entropy. A somewhat better alternative (in terms of compression ratio) would be an arithmetic coder. However, arithmetic encoding is generally much slower than Huffman encoding. To adapt to changes in per byte statistics as for entropy estimation, we eventually compute a new Huffman codebook for each block of maximum
+64KB
+and encode it in compressed stream (similar to
+[
+3
+]
+,
+[
+1
+]
+). Additionally, if the entire block consists of one byte value
+S
+repeated, it is encoded as a pair
+(S,c)
+, as in paragraph
+4
+. In short, LMC compression scheme can be summarized as block adaptive Huffman coding + RLE.
+Figure
+10
+compares BG-LMC with BG-entropy showing that BG-LMC comes very close to the ideal compression ratio offered by the entropy. The data shows that as the input becomes more compressible, the entropy ratio becomes more difficult to achieve due to the use of integral bits/byte inherent to Huffman coding.
+
+Figure 10:
+Comparison of BZ2, LMC, BG-LMC compression ratios vs. entropy of BLOOM data
+
+4.3
+Parallel LMC (PLMC)
+
+We implemented a simple data-parallel version of the BG-LMC algorithm (referred to as PLMC) that iteratively reads byte-grouped data into an input buffer and uses OpenMP to implement multi-threaded compression and decompression. The number of segments corresponds to the number of threads and is included in the codestream metadata, together with the compressed size of each piece. The implementation uses a default buffer size of 128 MiB. Nevertheless, this can be configured.
+
+5
+Experimental Results
+
+The system used to collect the data is based on an AMD Epyc 7343 16-core processor with 512GiB main memory and 23TiB NVMe SSD.
+
+5.1
+Single-threaded Performance
+
+Compression Ratios and Processing Time
+
+We collected data for compression ratio, compression throughput and decompression throughput. To better abstract the data, we calculated mean values across shard-deltas belonging to each data source. The primary attributes for
+consideration are compression ratio and throughput. For our use-case, compression performance is more important than decompression performance because the latter only happens in the event of disaster-recovery.
+
+Figure 11:
+Summary of Encoder Performance
+
+Figure
+11
+plots mean compression ratio vs. compression throughput for each of the six compression engines. The plots indicate that BG-LMC performs consistently better than the others. While BG-BZ2 achieves compression ratios within a few percent of BG-LMC its compression throughput performance is an order of magnitude slower. On the other end of the spectrum, the data shows that LZ4 is typically the fastest to compress, but offers a relatively poor compression ratio - the best achieved being only 0.77 for the
+amber
+data set.
+
+Appendix 3 shows data for decompression for a sample of five shards. BG-LMC decompression is 1.4x slower than the fastest decompression (LZ4).
+
+Compression Variance Over Time
+
+We next examine how the compressability changes over time. As previously discussed, as convergence occurs the tensor values stabilize and thus the delta changes reduce - resulting in more zeros and therefore more compressability.
+
+Figure 12:
+Compressability over time for 16 BLOOM shards
+
+Orange:BG-LMC, Blue:BZ2
+
+Figure
+12
+shows how compressibility of shard-deltas changes over time for 16 samples (mixed weights and biases). We show data for BG-LMC and BZ2. In this sample, the compression ratio for biases changes from
+\sim
+0.7 to
+\sim
+0.2 and for weights changes from
+\sim
+0.4 to less than 0.1. As the data converges, the compressibility gradient flattens out.
+
+5.2
+Multi-core Scale-up Performance
+
+To evaluate throughput scale-up, we evaluated concurrent implementations of LMC, GZIP and BZ2 - all on top of byte-grouped (BG) data. For these measurements IO bottlenecks were greatly reduced by using a RAM-disk. We chose a buffer size of 128 MiB although we found that throughput is not sensitive to buffer size. Figure
+13
+compares the compression throughput for the PLMC and off-the-shelf parallel implementations PIGZ and PBZ2. Figure
+14
+compares the decompression throughput. The compression ratio achieved by PLMC is
+0.597
+exceeding PIGZ (
+0.623
+) and PBZ2 (
+0.628
+) but with a significantly higher throughput. The data shows that compression scales relatively well for all three encoders. PIGZ decompression does not scale well.
+
+Figure 13:
+Comparison of PBZ2, PIGZ, PLMC compression throughput
+
+Figure 14:
+Comparison of PBZ2, PIGZ, PLMC decompression throughput (MiB/s)
+
+6
+Related Work
+
+As a general survey
+[
+19
+]
+presents compression algorithms for language models, including lossy-based solutions such as quantization and parameter sharing. Although LLM tensor data is not covered,
+[
+17
+]
+presents analysis and benchmarking of lossless compression for floating-point data.
+
+Prior work
+[
+18
+]
+has also explored the use of byte-grouping for tensor data for storage purposes. They do not cover incremental deltas nor improve on existing compression engines. Finally,
+[
+14
+]
+presents a general survey of time-series compression including work on combining Huffman encoding with delta and RLE
+[
+7
+]
+.
+
+7
+Conclusions
+
+In this paper we have explored the compressability of LLM tensor data for incremental snapshotting to storage. We examine how the tensor-deltas evolve over time down, how they are represented and how individual bits behave. With this knowledge in hand, we determined that entropy-based compression using Huffman encoding offers a superior solution to well known generic alternatives such as BZ2 and LZ4.
+
+Our solution, BG-LMC, combines fast-modelling (byte-grouping and RLE) with Huffman encoding to achieve compression levels marginally better than the best off-the-shelf alternative (BZ2) but with an order of magnitude reduction in time-to-compress. This analysis shows using BG-LMC can achieve compression ratios of less than 0.6 and single-threaded compression throughput of
+\sim
+300 MB/s. For multi-core scale-up, our solution achieves performance beyond parallel implementations of gzip and BZ2, attaining over 2.5GiB/s and 3.6GiB/s for compression and decompression respectively on only 16 cores.
+
+Appendix A
+
+A.1 Data Set Descriptions
+
+•
+
+Bloom
+- BigScience Large Open-science Open-access Multilingual Language Model (BLOOM)
+[
+16
+]
+
+https://huggingface.co/bigscience/bloom.
+
+•
+
+Amber
+- Amber is a 7B English language model using the LLaMA architecture.
+
+https://huggingface.co/LLM360/Amber
+
+•
+
+Transnormer
+- Linear transformer aimed at reducing the quadratic space-time complexity of vanilla transformers. TransNormerLLM is the first linear attention-based LLM that outperforms conventional softmax attention-based models in terms of both accuracy and efficiency.
+
+https://huggingface.co/OpenNLPLab/TransNormerLLM-7B
+
+•
+
+Olmo
+- OLMo is a series of Open Language Models designed to enable the science of language models. The OLMo models are trained on the Dolma dataset.
+
+https://huggingface.co/allenai/OLMo-7B
+
+•
+
+Multiberts
+- MultiBERTs (pretrained BERT) model on English language using a masked language modeling (MLM) objective. The model is based on the paper by Sellam et al.
+[
+12
+]
+.
+
+https://huggingface.co/MultiBertGunjanPatrick/multiberts-seed-0
+
+•
+
+Gpt2
+- A reproduction of GPT-2 based on 124M parameters trained using x8 A100 GPUs on OpenWebText.
+
+https://github.com/karpathy/nanoGPT
+
+A.2 Tensor Dimensions for Sample Data
+
+Bloom
+
+Amber
+
+Transnormer
+
+Multiberts
+
+Olmo
+
+GPT2
+
+14336 (425)
+
+32000 x 4096 (2)
+
+5120 (44)
+
+512 x 512 (1)
+
+50304 x 4096 (2)
+
+1024 x 768 (1)
+
+43008 x 14336 (70)
+
+4096 (65)
+
+5120 x 5120 (42)
+
+30522 x 768 (2)
+
+12288 x 4096 (32)
+
+50257 x 768 (1)
+
+43008 (70)
+
+4096 x 4096 (128)
+
+5120 x 15360 (42)
+
+512 x 768 (1)
+
+4096 x 4096 (32)
+
+1024 x 1024 (12)
+
+14336 x 14336 (70)
+
+11008 x 4096 (64)
+
+15360 x 5120 (126)
+
+1536 x 768 (2)
+
+4096 x 11008 (32)
+
+2304 (12)
+
+57344 x 4336 (70)
+
+4096 x 11008 (32)
+
+5120 x 15360 (42)
+
+768 (114)
+
+22016 x 4096 (32)
+
+768 x 2304 (12)
+
+57344 (70)
+
+768 x 768 (50)
+
+768 (74)
+
+Table 2:
+Tensor shard shapes for analyzed data sets (count in parenthesis)
+
+A.3 Detailed Results for BLOOM Data Set
+
+Encoder
+
+Shard
+
+Mean Compression Ratio
+
+Shard Size
+
+Mean Encode Time (seconds)
+
+Mean Decode Time (seconds)
+
+Steps
+
+BG-LMC
+
+h.X.mlp.dense_4h_to_h.weight
+
+0.565
+
+1.5GiB
+
+4.6762
+
+4.5397
+
+200
+
+BG-LMC
+
+h.X.mlp.dense_h_to_4h.weight
+
+0.530
+
+1.5GiB
+
+4.7379
+
+4.6953
+
+200
+
+BG-LMC
+
+h.X.self_attention.dense.weight
+
+0.600
+
+392.0MiB
+
+1.0748
+
+1.0068
+
+200
+
+BG-LMC
+
+h.X.self_attention.query_key_value.weight
+
+0.519
+
+1.1GiB
+
+3.4900
+
+3.3678
+
+200
+
+BG-LMC
+
+word_embeddings.weight
+
+0.574
+
+6.7GiB
+
+23.5087
+
+24.0144
+
+20
+
+LMC
+
+h.X.mlp.dense_4h_to_h.weight
+
+0.647
+
+1.5GiB
+
+3.6747
+
+3.1807
+
+200
+
+LMC
+
+h.X.mlp.dense_h_to_4h.weight
+
+0.603
+
+1.5GiB
+
+3.6340
+
+3.2266
+
+200
+
+LMC
+
+h.X.self_attention.dense.weight
+
+0.695
+
+392.0MiB
+
+0.9288
+
+0.8136
+
+200
+
+LMC
+
+h.X.self_attention.query_key_value.weight
+
+0.594
+
+1.1GiB
+
+2.7130
+
+2.3578
+
+200
+
+LMC
+
+word_embeddings.weight
+
+0.664
+
+6.7GiB
+
+17.0775
+
+16.1114
+
+20
+
+BG-BZ2
+
+h.X.mlp.dense_4h_to_h.weight
+
+0.593
+
+1.5GiB
+
+154.3418
+
+79.0762
+
+200
+
+BG-BZ2
+
+h.X.mlp.dense_h_to_4h.weight
+
+0.542
+
+1.5GiB
+
+137.3355
+
+72.3389
+
+200
+
+BG-BZ2
+
+h.X.self_attention.dense.weight
+
+0.627
+
+392.0MiB
+
+41.7933
+
+20.6631
+
+200
+
+BG-BZ2
+
+h.X.self_attention.query_key_value.weight
+
+0.538
+
+1.1GiB
+
+103.2792
+
+54.1697
+
+200
+
+BG-BZ2
+
+word_embeddings.weight
+
+0.599
+
+6.7GiB
+
+673.7042
+
+344.8112
+
+20
+
+BG-LZ4
+
+h.X.mlp.dense_4h_to_h.weight
+
+0.722
+
+1.5GiB
+
+4.3664
+
+1.6828
+
+200
+
+BG-LZ4
+
+h.X.mlp.dense_h_to_4h.weight
+
+0.669
+
+1.5GiB
+
+4.0569
+
+1.6928
+
+200
+
+BG-LZ4
+
+h.X.self_attention.dense.weight
+
+0.754
+
+392.0MiB
+
+1.1768
+
+0.4081
+
+200
+
+BG-LZ4
+
+h.X.self_attention.query_key_value.weight
+
+0.670
+
+1.1GiB
+
+3.1123
+
+1.3113
+
+200
+
+BG-LZ4
+
+word_embeddings.weight
+
+0.725
+
+6.7GiB
+
+21.4897
+
+9.5665
+
+20
+
+BZ2
+
+h.X.mlp.dense_4h_to_h.weight
+
+0.593
+
+1.5GiB
+
+171.0602
+
+85.7883
+
+200
+
+BZ2
+
+h.X.mlp.dense_h_to_4h.weight
+
+0.543
+
+1.5GiB
+
+157.7029
+
+79.5812
+
+200
+
+BZ2
+
+h.X.self_attention.dense.weight
+
+0.627
+
+392.0MiB
+
+43.2183
+
+21.4598
+
+200
+
+BZ2
+
+h.X.self_attention.query_key_value.weight
+
+0.535
+
+1.1GiB
+
+117.3340
+
+60.5858
+
+200
+
+BZ2
+
+word_embeddings.weight
+
+0.598
+
+6.7GiB
+
+734.9330
+
+371.4208
+
+20
+
+LZ4
+
+h.X.mlp.dense_4h_to_h.weight
+
+0.948
+
+1.5GiB
+
+3.2303
+
+1.3582
+
+200
+
+LZ4
+
+h.X.mlp.dense_h_to_4h.weight
+
+0.888
+
+1.5GiB
+
+3.7749
+
+1.5014
+
+200
+
+LZ4
+
+h.X.self_attention.dense.weight
+
+0.976
+
+392.0MiB
+
+0.6223
+
+0.3190
+
+200
+
+LZ4
+
+h.X.self_attention.query_key_value.weight
+
+0.885
+
+1.1GiB
+
+2.8173
+
+1.1237
+
+200
+
+LZ4
+
+word_embeddings.weight
+
+0.964
+
+6.7GiB
+
+14.3532
+
+7.8359
+
+20
+
+DEFLATE
+
+h.X.mlp.dense_4h_to_h.weight
+
+0.679
+
+1.5GiB
+
+34.7788
+
+18.3078
+
+200
+
+DEFLATE
+
+h.X.mlp.dense_h_to_4h.weight
+
+0.619
+
+1.5GiB
+
+35.0574
+
+16.4662
+
+200
+
+DEFLATE
+
+h.X.self_attention.dense.weight
+
+0.722
+
+392.0MiB
+
+8.2072
+
+4.8629
+
+200
+
+DEFLATE
+
+h.X.self_attention.query_key_value.weight
+
+0.616
+
+1.1GiB
+
+26.7587
+
+12.4380
+
+200
+
+DEFLATE
+
+word_embeddings.weight
+
+0.691
+
+6.7GiB
+
+145.9071
+
+81.3236
+
+20
+
+gzip
+
+h.X.mlp.dense_4h_to_h.weight
+
+0.679
+
+1.5GiB
+
+35.0080
+
+18.5110
+
+200
+
+gzip
+
+h.X.mlp.dense_h_to_4h.weight
+
+0.619
+
+1.5GiB
+
+34.9759
+
+16.5045
+
+200
+
+gzip
+
+h.X.self_attention.dense.weight
+
+0.722
+
+392.0MiB
+
+8.1997
+
+4.8827
+
+200
+
+gzip
+
+h.X.self_attention.query_key_value.weight
+
+0.616
+
+1.1GiB
+
+26.7039
+
+12.5117
+
+200
+
+gzip
+
+word_embeddings.weight
+
+0.691
+
+6.7GiB
+
+145.7747
+
+82.2829
+
+20
+

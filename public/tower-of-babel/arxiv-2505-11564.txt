@@ -1,0 +1,1237 @@
+HessFormer: Hessians at Foundation Scale
+Diego Granziol
+
+Abstract
+Whilst there have been major advancements in the field of first order optimisation of deep learning models, where state of the art open source mixture of expert models go into the hundreds of billions of parameters, methods that rely on Hessian vector products, are still limited to run on a single GPU and thus cannot even work for models in the billion parameter range. We release a software package HessFormer , which integrates nicely with the well known Transformers package and allows for distributed hessian vector computation across a single node with multiple GPUs. Underpinning our implementation is a distributed stochastic lanczos quadrature algorithm, which we release for public consumption. Using this package we investigate the Hessian spectral density of the recent Deepseek 70 70 bn parameter model.
+
+
+
+1
+Introduction
+
+Large-scale language models now routinely exceed
+10^{11}
+trainable parameters, yet our theoretical understanding of their optimisation landscape has stagnated at the million-parameter scale where exact second-order information is still tractable.
+The
+Hessian
+the matrix of second derivatives of the loss with respect to the parameters encodes the local curvature of that landscape.
+Its spectrum governs everything from the step-size limits of first-order optimisers
+(
+Cohen et al. 2021
+)
+, to the effectiveness of curvature-aware training algorithms such as Sophia
+(
+Liu et al. 2023
+)
+, to the reliability of post-hoc interventions such as influence functions and unlearning
+(
+Grosse et al. 2023
+;
+Jia et al. 2024
+)
+.
+Unfortunately, computing even a single Hessian vector product (HVP) for today’s 10–100 billion-parameter Transformers already exceeds the memory of a single GPU, and existing distributed frameworks deliberately detach gradient collectives from the autograd graph, rendering naive double-backward operations impossible
+(
+Huang et al. 2023
+)
+.
+As a result,
+no
+publicly available work has reported the full Hessian spectrum of a model larger than 7B parameters.
+
+We close this gap with
+HessFormer
+, the first software framework that enables
+distributed
+stochastic Lanczos quadrature on PyTorch models without modifying user code or sacrificing data, tensor, or pipeline parallelism.
+Leveraging the observation that HVPs can be expressed as a sum of inexpensive local contractions once gradients are preserved in graph form, we design a lightweight communication protocol that performs these contractions across GPUs and overlaps them with forward passes.
+Running on a single 8
+\times
+A200 node,
+HessFormer
+estimates hundreds of leading Hessian eigenvalues of
+DeepSeek-LLM-70B
+
+DeepSeek-AI 2025
+.
+
+Why does a 70 B-parameter Hessian spectrum matter?
+
+Dettmers et al. 2022
+show that once a model exceeds
+6
+B parameters, a handful of hidden-state dimensions become “extreme outliers” (up to 20× larger than typical activations). These outliers concentrate most of the model’s predictive power, so the authors create a mixed-precision scheme that keeps just those features in 16-bit while quantising everything else to 8-bit.
+Sun and Haghighat 2025
+use an Ising model of the transformer to model phase transition, and find that at
+7
+B parameters, transformers manage to learn whether their nonsensical outputs are nonsensical or not and thus represent fundamentally different learning machines. Further use cases may include
+
+1.
+
+Optimisation safety and speed.
+
+Tracking the extreme eigenvalues of
+H
+lets practitioners set learning rates and trust-region radii on firm ground rather than heuristics.
+
+2.
+
+Validation of curvature approximations.
+
+Block-diagonal, diagonal, and Kronecker-factor assumptions pervade second-order optimisers and pruning criteria.
+Only empirical spectra at “foundation” scale reveal where those assumptions break down.
+
+3.
+
+Diagnostics and monitoring.
+
+Spikes in the top eigenvalues often precede gradient explosions, while clusters of near-zero eigenvalues indicate flat directions and compression opportunities.
+
+4.
+
+Influence, unlearning, and continual learning.
+
+All three require solves of the form
+(H+\lambda I)^{-1}v
+.
+Fast HVPs move these techniques from toy models toward production-size LLMs.
+
+5.
+
+Scientific insight.
+
+Scaling-law research has so far focused on loss and gradient norms; Hessian spectra add a missing dimension, informing theories of sharp-vs-flat minima, mode connectivity, and transferability.
+
+By turning HVPs into a first-class distributed primitive,
+HessFormer
+closes the tooling gap between million-parameter theory and billion-parameter practice and furnishes the empirical groundwork for the next generation of optimisation, interpretability, and safety methods.
+
+2
+Motivation
+
+Koh and Liang 2017
+
+Hassibi and Stork 1993
+
+Nagel et al. 2020
+
+Martens 2010
+
+H_{\theta}=\frac{1}{n}\sum_{i}\nabla_{\theta}^{2}L(z_{i},\theta)
+
+[2pt]
+
+\delta\theta=-\,H_{\hat{\theta}}^{-1}\nabla_{\theta}L(z_{0},\hat{\theta})
+
+\Delta w=-\,w_{q}/(H^{-1})_{qq}\,H^{-1}e_{q}
+
+[2pt]
+
+\Delta E=w_{q}^{2}\big/\!\bigl(2\,(H^{-1})_{qq}\bigr)
+
+\displaystyle\min_{\tilde{w}}\,\frac{1}{2}\,(\tilde{w}-w)^{\!\top}H(\tilde{w}-w)
+
+[2pt]
+
+\text{s.t. }\tilde{w}_{i}\in\{\!\lfloor w_{i}\rfloor_{\text{g}},\lceil w_{i}\rceil_{\text{g}}\}\;\forall i
+
+\delta w=-\,H^{-1}\nabla_{w}\mathcal{L}(w)
+
+[2pt]
+
+w_{\text{new}}=w+\delta w
+
+Table 1
+:
+Key Hessian-based formulae for four different machine-learning techniques. (a) Influence functions, (b) Optimal brain surgeon, (c) Adaptive rounding, (d) Second order optimisation.
+
+The Hessian of a neural network, i.e. the matrix of second-order partial derivatives of the loss with respect to the parameters, is far more than an academic curiosity. As Table
+1
+shows, it is the central mathematical object behind four major research agendas: influence estimation
+(
+Koh and Liang 2017
+)
+, network surgery and pruning
+(
+Hassibi and Stork 1993
+)
+, post-training quantisation
+(
+Nagel et al. 2020
+)
+, and second-order optimisation
+(
+Martens 2010
+)
+. In every case the method either depends directly on an inverse Hessian vector product (HVP) or builds its key approximation from local curvature. A reliable Hessian spectrum therefore offers a common empirical benchmark against which techniques that tackle very different problems can be compared.
+Despite this centrality, empirical knowledge of Hessian spectra stops at networks of about seven billion parameters. For smaller convolutional and transformer models, three patterns appear repeatedly in the literature: strong block-level heterogeneity of eigenvalues that explains why adaptive optimisers outperform SGD
+(
+Zhang et al. 2024
+)
+; analytic cross-term structure unique to self-attention
+(
+Ormaniec et al. 2024
+)
+; and heavy-tailed eigenvalue decay that links deep learning to random-matrix theory
+(
+Xie et al. 2022
+)
+. Whether any of these properties persist, flatten, or split in the 70 B to 1 T range is unknown. Curvature-aware methods that work well at modest scale, Hessian trace regularisers
+(
+Sankar et al. 2020
+)
+, diagonal optimisers such as Sophia
+(
+Liu et al. 2023
+)
+, Kronecker factor approximations (K-FAC, EK-FAC), and projection-based influence estimation (LoGra) are therefore being applied to foundation models without direct validation.
+
+The technical reason for this gap is simple. Computing a single HVP for a 70 B parameter transformer requires a second backward pass that doubles activation memory, stores an extra gradient-sized buffer, and, crucially, performs gradient collectives
+inside
+the autograd graph. Popular sharding frameworks such as ZeRO and FSDP break this requirement: their gradient hooks run the reduce-scatter outside the graph and then set
+p.grad = None
+, severing every higher-order path
+(
+Huang et al. 2023
+)
+. Compiler systems like GSPMD
+(
+Xu et al. 2021
+)
+could in principle restore differentiability, but no public PyTorch stack exposes that capability.
+The absence of ground-truth curvature data between 10 B and 100 B parameters has practical consequences. We do not know whether the heavy tails seen at smaller scales become plateaus at mixture-of-experts boundaries, how far diagonal, block-diagonal, or Kronecker assumptions drift from reality when width and depth grow together, or whether the instabilities observed during billion-scale fine-tuning come from optimiser settings or genuinely extreme curvature. Accurate Hessian access is also essential for trustworthy unlearning
+(
+Jia et al. 2024
+)
+, data valuation and back-door detection
+(
+Zou et al. 2023
+)
+, and structured compression techniques such as WoodFisher and Optimal BERT Surgeon
+(
+Singh and Alistarh 2020
+;
+Kurtic et al. 2022
+)
+.
+Addressing these unknowns requires a tool that reveals second-order structure without dismantling the memory-efficient training stacks on which modern language models rely. By enabling distributed stochastic Lanczos quadrature for DeepSeek-LLM-70B on a single eight-GPU node,
+HessFormer
+fills this methodological void. The spectra it produces provide the first concrete evidence of curvature at foundation-model scale, allowing the community to calibrate optimisation, compression, and safety techniques against reality rather than conjecture.
+
+3
+Distributed Pealmutter & Stochastic Lanczos Quadrature
+
+3.1
+Huggingface Auto
+
+We leverage the ubiqitous Huggingface ecosystem, which has its own distributed inference environment called
+"auto"
+. One can specify which layers or part thereof go onto which GPU manually, but in this case instead of writing
+device="cuda:0"
+we simply use their integrated solution
+device="auto"
+. As this feature is inteded for inference only and does not support training. We trial two small
+1.5
+bn parameter Deepseek with further training on next token prediction using the huggingface wikitext dataset
+Merity et al. 2016
+. Both experiments run with identitcal hyperparameters, but for the baseline we use a
+H\times 200=140
+GB GPU instance and the other used
+4\times RTX4094=4\times 24
+GB multi GPU single node cluster. We compare the difference in training and validation loss results in Figures
+1(a)
+and
+1(b)
+. We see differences at the
+10^{-6}
+level, essentially GPU machine precision. Notice how the lines completely overlap on the typical training plot. This indicates that the gradients are none the less calculated effectively using auto.
+
+(a)
+
+Loss Difference magnified
+
+(b)
+
+Loss trajectory
+
+(c)
+
+spectral density difference
+
+Figure 1
+:
+Comparison between Training a
+1.5
+Bn parameter Qwen distilled Deepseek model on wikitrain for
+4
+epochs using auto from huggingface on multiple GPUs against using a single large enough GPU training on cuda.
+
+As a precursor, to the next section where we
+We further plot the differences in spectra when using auto or not. As shown in Figure
+1(c)
+, for a smoothed density, we see barely perceptible difference. Note that we are only using a single
+n=1
+seed vector. So we expect different results between densities using different seed vectors. Even though we fix the random vector and init to be
+seed=42
+we do expect differences machine to machine.
+
+Inefficiency:
+
+One of the reasons why training LLMs with device auto is not standard is that it places (some subset of/each) layer(s) on idividual GPUs. What this means is that at any one point
+n/n-1
+GPUs will be idle, inefficient in the large
+n
+limit. A better method, known as fully sharded data parallel is more efficient, but as detailed in the introduction does not allow for double backward pass.
+
+3.2
+DSLQ
+
+Unlike fully sharded data parallel implementations, the auto layerwise splitting does not automatically destroy the graph for memory efficiency and so it is possible to proceed with a double backward pass (otherwise known as Pearlmutters trick
+Pearlmutter 1994
+), which we detail in Pseudocode in Algorithm
+1
+. We combine this with distributed stochastic lanczos quadrature without orthogonalisation, which we detail in Algorithm
+2
+.
+
+We conduct ablation experiments to check the validity of our framework in preserving crucial spectral information. We test for a small
+1.5
+bn parameter model, how using our distributed setting alters the spectral resolution using a single random vector. As seen in Figure
+2
+, plotting in auto blue and the single GPU in red, the stem plots are basically identical. The only thing we see substantially difference is this one time outlier value for the wikitext dataset with a weight of
+10^{-27}
+. This is significantly smaller than the estimation of a single eigenvalue on the entire matrix and so represents with high probability a "ghost" from the Lanczos procedure due to no orthogonalisation.
+
+(a)
+
+Random Dataset
+
+(b)
+
+Wikitext
+
+(c)
+
+Pile (70B, 10 10 %)
+
+Figure 2
+:
+Stem comparison of using Auto (blue) vs. not using Auto (red) for Hessian of the DeepSeek-distilled Qwen models across three datasets. The rightmost subfigure is an example of how a large model looks on a common dataset.
+
+Memory Compute trade off: Investigating the Ghosts
+
+One may note in Figures
+3(a)
+,
+3(b)
+as well as in the previous Figure
+2
+that both plots have a bunching of eigenvalues at the right end by the largest magnitude eigenvalue. Since covariance matrix decomposition from linear regression into the within-cluster and between-cluster scatter
+
+\underbrace{\sum_{\ell=1}^{k}\sum_{i=1}^{n_{\ell}}(x_{\ell,i}-\bar{x}_{\ell})(x_{\ell,i}-\bar{x}_{\ell})^{\top}}_{\text{Within-Cluster Scatter}}\;+\;\underbrace{\sum_{\ell=1}^{k}n_{\ell}\bigl(\bar{x}_{\ell}-\bar{x}\bigr)\bigl(\bar{x}_{\ell}-\bar{x}\bigr)^{\top}}_{\text{Between-Cluster Scatter}},
+
+would suggest there is a singular mean eigenvalue of largest size, we investigate whether this is a linear algebra artifact.
+We run the
+1.5
+bn parameter Qwen distil with two variants. For the baseline we use full orthonormalisation by storing the
+Q
+matrix in Lanczos and for the trial we simply keep the three term recurrence relation and pretend we are in infinite precision. As can be seen in Figure
+3(d)
+, whilst we keep the general information in terms of the spectral support and shape of the bulk, we start to get
+ghost
+eigenvalues, against the baseline in Figure
+3(c)
+. This is nothing more than the memory complexity trade off but for stochastic Lanczos quadrature. By not enforcing orthogonality (which is impractical for large networks due to the extra memory cost) we end up repeating (essentially wasting computation). In this Figure we have only used
+25
+iterations and we already have multiple ghosts, as such we believe that it is prudent to keep the number of iterations less than
+20
+and for extremely large experiments we often use the value
+10
+to not waste computation in the non orthogonal finite precision paradigm.
+
+(a)
+
+100\%
+– 10 iters
+
+(b)
+
+1\%
+– 30 iters
+
+(c)
+
+Full Ortho
+
+(d)
+
+No Ortho
+
+Figure 3
+:
+DeepSeek Qwen 1.5 Bn: spectral effects of data subsampling and orthogonalization on the wikitext dataset.
+
+Algorithm 1
+
+Hessian–Vector Product (multi-GPU, double backward)
+
+1:
+
+Input:
+model
+\mathcal{M}
+,  loader
+\mathcal{D}
+,  vectors
+\{v_{i}\}
+
+2:
+
+v_{i}\leftarrow v_{i}.\texttt{to}(\mathrm{device}(p_{i}))
+
+3:
+
+h_{i}\leftarrow 0
+,
+N\leftarrow 0
+,
+D_{\text{main}}\leftarrow\mathrm{device}(p_{1})
+
+4:
+
+\mathcal{M}.\texttt{eval}()
+
+5:
+
+for
+
+each
+batch
+B
+in
+\mathcal{D}
+
+do
+
+6:
+
+B\leftarrow B.\texttt{to}(D_{\text{main}})
+
+7:
+
+\mathcal{M}.\texttt{zero\_grad}(\texttt{set\_to\_none}=\texttt{True})
+
+8:
+
+with
+
+sdp_kernel
+(flash
+=
+False):
+
+9:
+
+L\leftarrow\mathcal{M}(B).\texttt{loss}
+
+10:
+
+g_{i}\leftarrow\partial L/\partial p_{i}
+
+(create_graph)
+
+11:
+
+d\leftarrow\sum_{i}\!\bigl((g_{i}v_{i}).\texttt{sum()}\bigr).\texttt{to}(D_{\text{main}})
+
+12:
+
+u_{i}\leftarrow\partial d/\partial p_{i}
+
+(detach)
+
+13:
+
+b\leftarrow\lvert B\rvert
+
+14:
+
+h_{i}\leftarrow h_{i}+u_{i}\,b
+
+15:
+
+N\leftarrow N+b
+
+16:
+
+end
+
+for
+
+17:
+
+return
+
+h_{i}/N\hskip 8.19447pt\forall i
+
+Algorithm 2
+
+Lanczos Iteration (chunked, no re-orthog.)
+
+1:
+
+Input:
+HVP
+\mathcal{H}
+, chunked params,
+k_{\max}
+, tol
+\varepsilon
+
+2:
+
+Draw random
+q_{0}
+;  scatter to chunks;
+q_{0}\leftarrow q_{0}/\lVert q_{0}\rVert
+
+3:
+
+for
+
+k=0
+
+to
+
+k_{\max}-1
+
+do
+
+4:
+
+Gather
+q_{k}
+;
+r_{k}\leftarrow\mathcal{H}(q_{k})
+
+5:
+
+if
+
+k>0
+
+then
+
+6:
+
+r_{k}\leftarrow r_{k}-\beta_{k-1}q_{k-1}
+
+7:
+
+end
+
+if
+
+8:
+
+\alpha_{k}\leftarrow\langle q_{k},r_{k}\rangle
+
+9:
+
+r_{k}\leftarrow r_{k}-\alpha_{k}q_{k}
+
+10:
+
+\beta_{k}\leftarrow\lVert r_{k}\rVert
+
+11:
+
+if
+
+\beta_{k}<\varepsilon
+
+then
+
+12:
+
+break
+
+13:
+
+end
+
+if
+
+14:
+
+q_{k+1}\leftarrow r_{k}/\beta_{k}
+
+15:
+
+end
+
+for
+
+3.3
+Understanding the Dataset Impact
+
+As shown in Figure
+4
+. For random data, we see a reasonably consistent spectral density (with large near zero peak, no outliers, compact support) for various choices of sample size and sequence length on a random dataset on a trained LLM. Interestingly for Figure
+4(c)
+, we see what looks like a degenrate semi cricle.
+
+(a)
+
+n=10000,l=64
+
+(b)
+
+n=1000,l=1024
+
+(c)
+
+n=1000,l=64
+
+Figure 4
+:
+Random Data with Various (n=num_samples, l=seq_length) Hessian with
+30
+Lanczos HVP iterations.
+
+For the real news dataset
+Zeiler 2012
+in Figure
+5
+, initially subsampled to
+1\%
+of its total and
+further
+subsample in varying amounts, we see a very different shape with power law type decay. Furthermore note the presence of outliers, of which there are more as we increase the dataset size. This is in strong contrast to classical vision models such as in
+Granziol et al. 2022
+in which the number out outliers does not hugely change as we subsample.
+
+(a)
+
+1\%
+
+(b)
+
+10\%
+
+(c)
+
+100\%
+
+Figure 5
+:
+Real News Data (subsampled to
+1\%
+) with various amounts of further subsampling Hessia for Qwen
+1.5
+Bn parameter DeepSeek distilled
+
+We consider a case where we do know the data that the model was trained on. The Pythia
+Biderman et al. 2023
+models trained on the
+800
+GB Pile dataset
+Gao et al. 2020
+. We see going from Figure
+6(a)
+to
+6(b)
+, that with less aggressive subsampling, the negative eigenvalues dissapear. However for an alternative dataset on which the model was not trained, as shown in FIgures
+6(c)
+,
+6(d)
+increasing the dataset size, whilst it does reduce the magnitude of all eigenvalues (as expected from broadening theorems) it does not reduce the large negative eigenvalues found here.
+
+(a)
+
+1% Pile
+
+(b)
+
+100% Pile
+
+(c)
+
+1% Wiki
+
+(d)
+
+100% Wiki
+
+Figure 6
+:
+Pythia 12B (20 Lanczos iterations) spectral widths for the Pile and Wikipedia subsets.
+The 10 % Pile condition is omitted.
+
+3.4
+A note on numerical precision for the weight value
+
+In IEEE-754 float32 arithmetic we adopt
+Higham 2002
+model
+\operatorname{fl}(a\!\circ\!b)=(a\!\circ\!b)\bigl(1+\delta\bigr)
+with unit-roundoff
+u=2^{-24}\approx 5.96\times 10^{-8}
+and accumulated error
+\gamma_{n}=nu/(1-nu)
+when
+nu\ll 1
+.
+The symmetric Lanczos recurrence computed without re-orthogonalisation satisfies
+
+\beta_{j}\widehat{q}_{j+1}=A\widehat{q}_{j}-\alpha_{j}\widehat{q}_{j}-\beta_{j-1}\widehat{q}_{j-1}+e_{j},\qquad\|e_{j}\|\leq\bigl(\|A\|\gamma_{3}+\gamma_{2}\bigr)\max\{\|\widehat{q}_{j}\|,\|\widehat{q}_{j-1}\|\}.
+
+Paige 1976
+analysis gives the loss-of-orthogonality estimate
+
+\lvert\widehat{q}_{i}^{\mathsf{T}}\widehat{q}_{j}-\delta_{ij}\rvert\leq k\,u+{\cal O}(u^{2}),
+
+so each column of
+\widehat{Q}_{k}
+is perturbed by
+{\cal O}(ku)
+.
+After
+k=10
+steps we solve
+T_{k}\widehat{y}=\theta\widehat{y}
+exactly and form the Ritz vector
+\widehat{v}=\widehat{Q}_{k}\widehat{y}
+whose components are
+
+\widehat{v}_{i}=\sum_{j=1}^{k}\widehat{Q}_{ij}\widehat{y}_{j}
+.
+One inner product introduces at most
+\gamma_{k-1}\lvert\widehat{v}_{i}\rvert
+error, and basis perturbations add
+{\cal O}(ku)\lvert v_{i}\rvert
+, giving
+
+\lvert\widehat{v}_{i}-v_{i}\rvert\leq k\,u\,\lvert v_{i}\rvert.
+
+Squaring in float32 produces
+
+\widehat{w}_{i}=\operatorname{fl}\bigl(\widehat{v}_{i}^{2}\bigr)=\widehat{v}_{i}^{2}(1+\delta_{\text{sq}}),\qquad\lvert\delta_{\text{sq}}\rvert\leq u,
+
+and with
+\widehat{v}_{i}=v_{i}(1+\varepsilon_{i})
+and
+\lvert\varepsilon_{i}\rvert\leq k\,u
+we obtain
+
+\frac{\lvert\widehat{w}_{i}-w_{i}\rvert}{w_{i}}=\bigl|(1+\varepsilon_{i})^{2}(1+\delta_{\text{sq}})-1\bigr|\leq 2\,k\,u+{\cal O}\!\bigl((ku)^{2}\bigr).
+
+For
+k=10
+this bound is
+2ku\approx 1.19\times 10^{-6}
+, so each squared Ritz-vector element retains roughly six accurate decimal digits in float32 before higher-order terms dominate. As such whilst it may make sense to introduce such a
+10^{-6}
+noise floor, we find many of the bounds in these classic derivations simply to be too conservative. Note that many outliers have a roughly correct scaling (1/model param size). We are planning to release a random matrix theory derivation of the Lanczos error in upcoming work. As such we make an artistic decision to not touch the numerical plots.
+
+4
+Frontier Spectra
+
+We give here the first to our knowledge spectral density plots of the
+70
+bn Deepseek-Llama distilled frontier model in Figure
+7
+. We use a baseline of a
+10
+lanczos iterations, except for in version in Figure
+7(d)
+, where we run only
+4
+on only
+1\%
+of the realnews dataset, due to its huge computational cost. We see very interesting large negative outliers for the
+70
+bn model. This is strange because it indicates that there is a direction in the loss surface which if we were to descend we would heavily decrease the loss, an atpyical situation for a trained model. For frontier models that in theory generalise well to all data, as autoregressive models this is strange. We see that this is a general trend, which is robust to less aggressive (within our budget) subsampling, persists.
+
+(a)
+
+5\%
+Wikitext, 10 It
+
+(b)
+
+25\%
+Wikitext, 10 It
+
+(c)
+
+0.1\%
+RealNews, 10 It
+
+(d)
+
+1\%
+RealNews, 4 It
+
+Figure 7
+:
+70
+Bn DeepSeek Llama distillation: spectral widths under varying subsampling of Wikitext and RealNews.
+
+Given the ubiquity of the Pile dataset and the scraping wars to get as much data as possible to train large language models, a question of interest may be as to whether running the deepseek model on the pile dataset might give alternative results. Interestingly as shown in Figure
+2(c)
+this is not the case.
+
+4.1
+A note on rank degeneracy
+
+As the observant reader may have noticed, in all of our spectral plots, there seems to be a huge rank degeneracy around
+0
+. Unfortunately our spectral method, does not give us each of the eigenvalues for us to count. We only get a moment matched spectral approximation. Furthermore, the extent of our precision is limited as we do not store the vectors in memory (beyond a certain size) to allow us to keep orthonormality and stop the presence of ghosts. Furthermore even if we did, we would be limited by machine precision in our calculation. In this section we look at both issues in a bit more depth. Two examples of spectral results (known as the Ritz eigenvectors and weights) are given in Table
+2
+. In one case, we see the large spectral peak at a number not very close to
+0
+(
+0.01
+) but again note that only the moments of this spectral density must match the original, we could run this experiment again with a different seed and much more likely (from our evaluations at least) we would see something like in the second table. A huge rank degeneracy not at
+0
+but very close
+1e^{-6}
+. Is this zero or not? Whilst a full rigorous analysis of this is beyond the scope of this work, consider the fact that for
+32
+bit precision, we have one bit for the sign, eight bits for the exponent and tewnty-three for the mantissa, assuming that we represent zero exactly (usually the case in most frameworks) then machine epsilon is
+2^{-23}=-23\times\log_{10}2=1.2\times 10^{-7}
+. Interestingly the total weight to the other stems is in the region of
+10^{-10}
+. So one ten billionth of the model parameter directions determine the loss most strongly.
+
+Table 2
+:
+70B llama deepseek distilled spectral weights with 10 Lanczos iterations for wikitext_tmat-2 (25%) and realnewslike (1%).
+
+Wikitext
+
+Ritz Value
+
+Weight
+
+-82221.5234
+
+2.3228e-11
+
+-81374.5859
+
+1.2142e-11
+
+-50410.7188
+
+4.9422e-12
+
+-36873.0273
+
+4.7944e-11
+
+-22338.5938
+
+3.1632e-11
+
+-7015.3286
+
+1.9602e-10
+
+0.0145
+
+1.0000
+
+4249.3477
+
+3.7041e-10
+
+11931.8496
+
+2.0554e-11
+
+21408.2852
+
+8.0098e-12
+
+Realnewslike
+
+Ritz Value
+
+Weight
+
+-72159.5469
+
+1.4208e-13
+
+-71471.6719
+
+1.2187e-15
+
+-29396.1230
+
+2.6713e-18
+
+-11272.0820
+
+2.4919e-13
+
+-3630.3208
+
+4.9708e-11
+
+1.1277e-06
+
+1.0000
+
+1863.6674
+
+3.0464e-10
+
+8697.9453
+
+1.2413e-11
+
+18385.3047
+
+3.4053e-12
+
+23685.8652
+
+1.0928e-12
+
+This puts us in an uncomfortable situation, we are more than
+10\times
+away from machine precision. A more refined analysis might consider a Wigner model to the noise (additive noise) perturbation for the Hessian, however this would give us a semi circle of
+\pm 2\sigma\sqrt{P}
+where
+P
+could be in the billions and hence
+\sigma
+would have to be a function of
+P
+. Further work could look a multiplicative noise model to settle the question as to whether the Hessian really is low rank, or just has very many nearly flat directions. From a practical perspective this is less important (we can still compress very flat directions with limited loss impact), from a theoretical perspective, quite flat and flat are very different.
+
+5
+Banded Hessians
+
+In order to test for banded matrices, we in general have to go through a
+\mathcal{O}(P^{2})
+calculation, which is infeasible. So we initially start with a simpler subproblem. A dense matrix with no zero values is trivially maximally banded. As such a matrix can only have a tight band if it is sparse, so we check for sparsity as a simpler condition instead. We can indeed check for sparsity of a particular column using our Hessian vector product. In this case we simply generate a random vector which has a random index chosen as
+1
+and the rest zero. We could alternatively create the full Hessian column by column (and abruptly stop at the point of generation).
+
+(a)
+
+DeepSeek 32B (1 %)
+
+(b)
+
+DeepSeek 32B (5 %)
+
+(c)
+
+Pythia 12B (5 %)
+
+Figure 8
+:
+50-bin absolute-magnitude histograms of Hessian-column elements for DeepSeek 32B (1 % and 5 %) and Pythia 12B (5 %).
+
+We see that for both Deepseek
+32
+Bn in Figures
+8(a)
+,
+8(b)
+and for Pythia in Figure
+8(c)
+where we plot the histogram of the absolute magnitude of the entries of the randomly chosen column vector that there is a large peak at
+0
+. Unsurprsingly with greater subsampling the values themselves broaden (variance and hence mean square value increases). However as shown in the extensive Tables
+, we see that the number of elements smaller than machine epsilon is very nearly
+100\%
+. So there is evidence that the Hessian is sparse to within machine precision, which means that potentially within machine precision it could be banded. In general finding the minimum band is known to be NP hard. Certain heuristic methods like Reverse Cuthill-McKee require breadth first search and so are
+\mathcal{O}P^{2}
+in time complexity and hence infeasible, so potentially a sampling based RCM method could be used to see what the band size could be capped at.
+
+Table 3
+:
+Fraction of Hessian-column elements below each threshold for different models and random seeds.
+
+Threshold
+
+Fraction
+
+1e
+-12
+
+0.0343
+
+1e
+-11
+
+0.0823
+
+1e
+-10
+
+0.2880
+
+1e
+-9
+
+0.8751
+
+1e
+-8
+
+0.9978
+
+1e
+-7
+
+0.9999
+
+1e
+-6
+–1e
+-1
+
+1.0000
+
+Total elems = 32.8 B
+
+(a)
+
+Qwen-32B, 5 %
+
+Threshold
+
+Fraction
+
+1e
+-12
+
+0.0059
+
+1e
+-11
+
+0.0121
+
+1e
+-10
+
+0.0585
+
+1e
+-9
+
+0.3738
+
+1e
+-8
+
+0.9427
+
+1e
+-7
+–1e
+-1
+
+1.0000
+
+Total elems = 11.8 B
+
+(b)
+
+Pythia-12B, 5 %
+
+Idx
+
+Thres.
+
+F1
+
+F2
+
+F3
+
+F4
+
+F5
+
+0
+
+1e
+-12
+
+0.0067
+
+0.0076
+
+0.0087
+
+0.0069
+
+0.0095
+
+1
+
+1e
+-11
+
+0.0158
+
+0.0213
+
+0.0278
+
+0.0167
+
+0.0373
+
+2
+
+1e
+-10
+
+0.0833
+
+0.1246
+
+0.1693
+
+0.0912
+
+0.2458
+
+3
+
+1e
+-9
+
+0.5035
+
+0.6633
+
+0.8241
+
+0.5463
+
+0.8834
+
+4
+
+1e
+-8
+
+0.9921
+
+0.9983
+
+0.9993
+
+0.9929
+
+0.9977
+
+5
+
+1e
+-7
+
+0.9998
+
+0.9999
+
+1.0000
+
+0.9999
+
+1.0000
+
+6
+
+1e
+-6
+–1e
+-1
+
+1.0000
+
+5 iterations per seed
+
+(c)
+
+Pythia-12B, 5 % — five seeds
+
+6
+Compute resources.
+
+All Hessian–vector products (HVPs) were executed on a single server (type #19983985) with
+
+8 × NVIDIA H200 140 GB PCIe 5.0 GPUs
+(PCIe 5.0 ×16, 52.8 GB s
+-1
+host–device; no NVLink),
+dual Intel
+Xeon
+Platinum 8568Y+ CPUs (192 logical cores), and 2 TB DDR5 RAM.
+Local storage: 2 × Dell NVMe PM1733a 3.84 TB SSDs in RAID-0 (12.4 GB s
+-1
+sequential reads).
+Software: Ubuntu 22.04, CUDA 12.8, cuDNN 9.0, PyTorch 2.3.
+
+Compute accounting.
+
+•
+
+HVPs.
+Each run took 3 h wall-clock;
+3\text{h}\times 8\text{ GPUs}=24
+GPU-h.
+With 20 HVPs:
+20\times 24=480
+GPU-h.
+Applying a 1.5× overhead for checkpoints, failed starts, and analysis yields
+
+480\times 1.5=720
+GPU-h.
+
+•
+
+Smaller experiments.
+Hyper-parameter sweeps, ablations, and sanity-check
+trainings were of comparable scale; we conservatively allocate an
+
+additional
+
+\approx 720
+GPU-h.
+
+\boxed{\text{Total compute}\;=\;720+720=1\,440\ \text{GPU-hours}\;=\;60\ \text{GPU-days on H200 PCIe}}
+
+Using CodeCarbon v2.3 with the default grid mix,
+this corresponds to
+\approx 66\;\text{kg CO${}_{2}$e}
+.
+
+7
+Conclusion
+
+In this paper, we introduce
+HessFormer
+a method and software to calculate the empirical spectral density of foundation models that works within the popular Pytorch and Huggingface ecosystem. We validate the accuracy of the method against by running on smaller models that fit on a single GPU or where full orthogonalisation is possible and show minimal deviation from these idealised cases. We investigate the Spectra of Deepseek-
+70
+bn and comment on key aspects therein. Whilst our distributed stochastic lanczos quadrature is state of the art in terms of investigating the largest deep neural networks to date, an obvious limitation is that we are inherrently limited by the estimated spectral moments (using stochastic trace estimation) to the order of the number of Lanczos iterations, which again are unable to go beyond
+m=10
+due to loss of orthogonality, exemplified by the appearance of ghost eigenvalues in our experiments. Our method is compute in-efficient relative to FSDP and at the time of writing the state of the art known open-source models, have over
+700
+B parameters. Therefore our current experimental contribution is an order of magnitude off allowing curvature calculations for SoTA models. We also do not repeat the experiments with multiple seeds (data or random vector) and since we do not run many random vectors we do not run an average. However due to the self averaging property of large random vectors and matrices, we do not expect this to have major impact on the results of our research.
+
+Broader Impact
+
+Public access to reliable Hessians at the billion-parameter scale enables safer optimisation decisions, principled influence estimation, energy-efficient model compression and real-time curvature-based monitoring, thereby supporting both performance and alignment goals. At the same time, detailed curvature information could facilitate model extraction, jailbreak attacks and rapid miniaturisation of powerful systems for malicious use. To balance these considerations, HessFormer is released under a research-only licence, with exploit-specific details withheld and an explicit call for users to integrate curvature analyses into existing responsible-AI protocols while remaining vigilant to emerging dual-use scenarios. Our work, as all foundation model scale gradient work brings with it an ever increasing and unsustainable energy and environmental impact. However, increased faithfulness to the full Hessian may impact the ability to compress models (reducing inference energy) and reduce per flop optimisation (reducing training energy) and so we are optimistic that this research could pave the way for less and not more energy useage.
+

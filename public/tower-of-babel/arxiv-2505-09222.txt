@@ -1,0 +1,945 @@
+QUIC Steps: Evaluating Pacing Strategies in QUIC Implementations DOI: 10.1145/3730985 Volume: 3 CoNEXT2 13 6 Journal: PACMNET CCS: Networks Transport protocols CCS: Networks Network measurement
+Marcel Kempf, Simon Tietz, Benedikt Jaeger, Johannes Späth, Georg Carle, Johannes Zirngibl
+
+Abstract
+. Pacing is a key mechanism in modern transport protocols, used to regulate packet transmission timing to minimize traffic burstiness, lower latency, and reduce packet loss. Standardized in 2021, QUIC is a UDP-based protocol designed to improve upon the TCP / TLS stack. While the QUIC protocol recommends pacing, and congestion control algorithms like BBR rely on it, the user-space nature of QUIC introduces unique challenges. These challenges include coarse-grained timers, system call overhead, and OS scheduling delays, all of which complicate precise packet pacing. This paper investigates how pacing is implemented differently across QUIC stacks, including quiche, picoquic, and ngtcp2, and evaluates the impact of system-level features like GSO and Linux qdiscs on pacing. Using a custom measurement framework and a passive optical fiber tap, we establish a baseline with default settings and systematically explore the effects of qdiscs, hardware offloading using the ETF qdisc, and GSO on pacing precision and network performance. We also extend and evaluate a kernel patch to enable pacing of individual packets within GSO buffers, combining batching efficiency with precise pacing. Kernel-assisted and purely user-space pacing approaches are compared. We show that pacing with only user-space timers can work well, as demonstrated by picoquic with BBR. With quiche, we identify FQ as a qdisc well-suited for pacing QUIC traffic, as it is relatively easy to use and offers precise pacing based on packet timestamps. We uncovered that internal mechanisms, such as a library’s spurious loss detection logic or algorithms such as HyStart++, can interfere with pacing and cause issues like unstable congestion windows and increased packet loss. Our findings provide new insights into the trade-offs involved in implementing pacing in QUIC and highlight potential optimizations for real-world applications like video streaming and video calls.
+
+
+
+If you cite this paper, please use the ACM CoNEXT reference: Marcel Kempf, Simon Tietz, Benedikt Jaeger, Johannes Späth, Georg Carle, and Johannes Zirngibl. 2025. QUIC Steps: Evaluating Pacing Strategies in QUIC Implementations. Proc. ACM Netw. 3, CoNEXT2, Article 13 (June 2025), 14 pages. https://doi.org/10.1145/3730985
+
+†
+†
+cc-license:
+by
+
+1.
+Introduction
+
+QUIC has rapidly gained adoption and now handles a significant share of global network traffic
+(
+Joras and Chi 2020
+;
+Cloudflare Radar 2024
+;
+Zirngibl et al. 2021
+;
+Zirngibl et al. 2024
+)
+.
+It is used for applications like web browsing, video streaming, and video calls.
+As QUIC continues to grow further in importance, improving its performance is an active area of research.
+
+Pacing, the controlled scheduling of packet transmissions, is a well-known mechanism for improving efficiency by trying to avoid bursty packet transmissions.
+It is known to reduce packet loss, lower queuing delays, and improve overall network performance by spacing out packets more evenly over time
+(
+De Bruijn and Dumazet 2018
+;
+Zhang et al. 2024
+)
+. The QUIC standard issues the normative statement that a sender should pace outgoing traffic with, for example, a leaky bucket algorithm
+(
+Iyengar and Swett 2021
+)
+.
+As Congestion Control Algorithms like Bottleneck Bandwidth and RTT depend on pacing to work, most QUIC implementations contain at least some form of pacing.
+
+However, implementing pacing in QUIC presents specific challenges.
+Unlike TCP, which is paced in the kernel, QUIC runs in user-space.
+Therefore, QUIC stacks must implement pacing themselves, which may not be as effective as kernel-based pacing due to latency and jitter added by system calls and Operating System scheduling.
+Some implementations rely on kernel features, especially Linux queueing disciplines, to help with pacing.
+Additionally, techniques like Generic Segmentation Offload, which are designed to improve performance, might interfere with pacing by releasing bursts of packets together, counteracting the smoothing effect of pacing.
+
+Since QUIC as a general purpose transport protocol is used for video streaming and video calls, understanding how to implement effective pacing is important for these real-world applications.
+This paper explores how pacing is implemented in different QUIC stacks, examines the impact of Generic Segmentation Offload, and investigates whether qdiscs can improve QUIC pacing.
+
+This work covers the following contributions:
+
+(i)
+
+We evaluate the pacing behavior of QUIC libraries on the wire and find different behavior between libraries and configurations. While picoquic shows the largest bursts with loss-based Congestion Control Algorithms, its pacing behavior using Bottleneck Bandwidth and RTT outperforms other implementations without using kernel functionalities.
+
+(ii)
+
+We evaluate different mechanisms with and without kernel support,
+e.g.
+, Fair Queue or Generic Segmentation Offload and their impact on the pacing behavior. Existing mechanisms offer QUIC flexibility, but an informed optimization of QUIC implementations and used mechanisms is important to reach optimal behavior for individual applications and the network in general.
+
+(iii)
+
+We extend and evaluate a kernel patch that enables pacing within Generic Segmentation Offload buffers. This allows QUIC stacks to retain the performance benefits of batching without sacrificing pacing.
+
+(iv)
+
+We provide all shown patches, configurations, measurement results, evaluation scripts, and our measurement framework to allow others to evaluate QUIC pacing in the future and optimize their applications. All data is available in a public GitHub repository
+(
+Kempf et al. 2025
+)
+.
+
+We introduce important background in
+Section
+
+2
+, followed by a description of our measurement framework, used implementations and features in
+Section
+
+3
+.
+
+Section
+
+4
+evaluates the behavior of different QUIC libraries in combination with system functionalities.
+Finally, we cover related work in
+Section
+
+5
+and conclude our findings in
+Section
+
+6
+.
+
+2.
+Background
+
+This section provides relevant background for QUIC and pacing, as well as the Linux kernel features that are used in this work.
+
+Pacing denotes the even distribution of packets over a Round-Trip Time
+(
+Aggarwal et al. 2000
+)
+.
+The goal of pacing is to reduce queuing and hereby packet loss by avoiding bursty packet transmissions.
+
+Pacing is integrated in the Linux kernel for more than a decade
+(
+Dumazet 2013
+)
+.
+However, TCP traffic is only paced when either the selected congestion control algorithm performs pacing or a queueing discipline is used that supports pacing.
+For example, Debian Bookworm uses TCP CUBIC and Fair Queuing Controlled Delay as defaults
+(
+Debian 2024
+)
+, thus TCP traffic is not paced.
+Regarding QUIC, RFC 9002
+(
+Iyengar and Swett 2021
+)
+states that packet bursts have to be prevented and suggests pacing in combination with the used Congestion Control Algorithm.
+During the current discussions to define a variable acknowledgment frequency
+(
+Iyengar et al. 2025
+)
+, the suggestion to pace is further highlighted.
+While a smaller acknowledgment frequency reduces the overhead for data receivers, it reduces the effectiveness of acknowledgment-clocking and could lead to bursts if pacing is not implemented.
+
+QUIC traffic can be paced by a queueing discipline, a mechanism connecting the Linux kernel’s networking stack and a Network Interface Card.
+It queues and schedules packets for transmission.
+queueing disciplines can prioritize, delay, or drop packets allowing features like rate limiting, traffic shaping, or pacing.
+QUIC traffic profits from a queueing discipline that supports the scheduling of packets based on a timestamp, which can be passed to the kernel for every packet.
+Pacing approaches with other queueing disciplines involving rate limiting,
+e.g.
+, Token Bucket Filter, do not offer an interface for adjusting the pacing rate dynamically from user-space.
+They are therefore less interesting for the usage with QUIC, as the desired pacing rate can change continuously during a connection.
+We look at the Fair Queue and Earliest TxTime First queueing disciplines in
+Section
+
+4
+, as both of them support the previously mentioned timestamp-based scheduling.
+By setting the
+SO_TXTIME
+socket option, a timestamp can be passed with each
+sendmsg
+call using the
+SCM_TXTIME
+control message header.
+The main difference between Fair Queue and Earliest TxTime First is that Earliest TxTime First drops packets if their timestamp is in the past, while Fair Queue does not.
+To ensure that packets are enqueued before their scheduled transmission time and thus not dropped, Earliest TxTime First has a
+delta
+parameter that specifies a time offset at which the queueing discipline becomes active in advance
+(
+Sanchez-Palencia and Gomes 2018
+)
+.
+The optimal value for this parameter depends on the processing overhead and varies from system to system.
+However, Earliest TxTime First supports hardware offloading for Network Interface Cards that support the so-called
+LaunchTime
+feature.
+In this case, the Network Interface Card holds back outgoing packets until the timestamp is reached, sending them out at the specified timestamp.
+This could further increase the precision of pacing (see
+Section
+
+4.4
+).
+
+To reduce the overhead of context switches between QUIC in user-space and the kernel, segmentation offloading can be used.
+This technique allows passing multiple packets between the kernel network stack and the user space as one data unit
+(
+The kernel development community 2024
+)
+.
+Generic Segmentation Offload and Generic Receive Offload can be used with QUIC and can significantly improve the throughput
+(
+Kempf et al. 2024b
+)
+.
+However, Generic Segmentation Offload prevents pacing within each batch of packets.
+We focus on the sending behavior and thus Generic Segmentation Offload (see
+Section
+
+4.3
+).
+
+3.
+Approach
+
+This section describes our measurement setup and the developed framework for reproducible measurements.
+We also introduce the network emulation techniques to achieve realistic conditions and a controlled bottleneck buffer.
+Finally, the tested QUIC implementations and their pacing behavior are shortly presented.
+
+3.1.
+Measurement Framework
+
+To perform reproducible measurements, we use the framework introduced by
+Jaeger et al. 2023
+.
+The framework is designed to set up and configure measurements on bare-metal servers, offering a consistent environment for QUIC experiments with configurable and extensible logging options.
+It automates two hosts as client and server to evaluate properties of single QUIC connections in different scenarios.
+The server is set up to be a QUIC server hosting a file of flexible size.
+The client is instructed to download this file.
+No information for session resumption is stored on the client, so that each repetition has the same conditions.
+We focus on the server’s pacing behavior during file transmission, as this is the direction of continuous user data flow.
+
+To evaluate the pacing behavior and inter-packet gap, precise timestamps are required.
+When capturing timestamps at the server, the capturing itself might influence the timing of the packets.
+On the other side, capturing timestamps on the client only provides accurate values if no network emulation is applied, as network emulation usually re-shapes traffic.
+To avoid these issues, we extended the framework to support a third measurement host, the sniffer, which is responsible for capturing packets on the wire between client and server.
+We rely on a passive optical fiber tap, which forwards a copy of all packets to the sniffer.
+The resulting topology is shown in
+Figure
+
+1
+.
+The optical fiber tap and the sniffer allow us to capture precise timing information without influencing the connection or involved hosts.
+
+MoonGen
+
+(
+Emmerich et al. 2015
+)
+is used to capture packets on the sniffer as it offers high precision with timestamp resolutions below
+2\text{\,}\mathrm{ns}
+.
+
+Topology of the measurement setup.
+
+Figure 1
+.
+Topology of the measurement setup with an optical fiber tap. Dashed links only carry management traffic, solid links only carry measurement traffic. Delay and rate limiting are denoted in blue and orange.
+Topology of the measurement setup.
+Topology of the measurement setup with an optical fiber tap between client and server.
+
+Client and server are both equipped with an
+Intel I210 Gigabit Fiber
+Network Interface Card.
+We chose this card, as it provides support for the
+LaunchTime
+feature, which is part of our measurements.
+The sniffer is equipped with an
+Intel E810-XXV
+Network Interface Card.
+All hosts run Debian Bookworm with client and server running on Linux kernel
+6.1.112-rt30
+and the sniffer running on
+6.1.0-17-amd64
+.
+
+3.2.
+Network Emulation
+
+In our setup, client and server are directly connected by a
+1\text{\,}\mathrm{Gbit}\text{/}\mathrm{s}
+link with a latency of less than
+1\text{\,}\mathrm{ms}
+.
+As this ultra low Round-Trip Time might cause unwanted side effects in the congestion control mechanisms, we emulate a bandwidth of
+40\text{\,}\mathrm{Mbit}\text{/}\mathrm{s}
+with a minimum Round-Trip Time of
+40\text{\,}\mathrm{ms}
+.
+While real-world networks may introduce additional dynamics such as cross traffic, queue sharing, competing flows, or load balancing, we intentionally avoid these complexities to ensure reproducibility and focus on stack behavior.
+We use
+tc
+to set up a Token Bucket Filter for bandwidth limitation and
+netem
+for the Round-Trip Time emulation
+(
+Kuznetsov 2001
+;
+Ludovici and Pfeifer 2011
+)
+.
+While queueing disciplines are usually used for egress traffic, we need to shape the incoming traffic at the client to not influence the pacing done by the server sending data.
+Therefore, we use an intermediate functional block on the client to use a Token Bucket Filter on incoming traffic at the client.
+The bandwidth from client to server does not need to be limited as mainly acknowledgments are sent in this direction.
+To achieve the desired Round-Trip Time,
+20\text{\,}\mathrm{ms}
+are applied directly after the Token Bucket Filter as well as for outgoing traffic at the client.
+This split is necessary to avoid measuring the uncommon scenario of highly asymmetric latency.
+However, to avoid unwanted packet loss due to the usage of
+netem
+after Token Bucket Filter, we increase the buffer size to fit two Bandwidth-Delay Products of packets.
+Due to the independent monitoring with the sniffer, we are able to capture packets sent by the server before any traffic shaping is done.
+
+3.3.
+Implementations
+
+For our measurements, we use the example client / server implementations of the QUIC libraries quiche
+(
+Cloudflare 2024a
+)
+, picoquic
+(
+Private Octopus 2024
+)
+, and ngtcp2
+(
+Tsujikawa 2024
+)
+.
+We chose these implementations as they follow different approaches for pacing.
+While the pacing rate calculation works the same for all three implementations, the actual pacing is done differently.
+Cloudflare’s quiche calculates an optimal sending time for each packet and uses the
+SO_TXTIME
+socket option as described in
+Section
+
+2
+to pass this timestamp to the kernel.
+A queueing discipline like Fair Queue or Earliest TxTime First can then schedule the packets based on this timestamp.
+In contrast, ngtcp2 does not depend on system clocks.
+An application is responsible to send packets at the correct time as calculated by the library.
+For both implementations, the timestamp of the current packet is based on the previous packet’s timestamp and the pacing rate.
+picoquic depends on the application to respect timestamps and wait until it is allowed to send, but it uses a leaky bucket algorithm for pacing as proposed in RFC 9002
+(
+Iyengar and Swett 2021
+)
+.
+This credit-based approach allows small bursts after inactivity in contrast to the interval-based approach of quiche and ngtcp2.
+For the comparison with TCP / Transport Layer Security, we use
+nginx
+and
+wget
+explicitly enabling TLS to ensure a fair comparison with QUIC, which includes both transport and encryption
+(
+Kempf et al. 2024a
+)
+.
+
+3.4.
+Limitations
+
+The results presented in
+Section
+
+4
+are based on a single, specific network configuration (
+40\text{\,}\mathrm{Mbit}\text{/}\mathrm{s}
+bandwidth,
+40\text{\,}\mathrm{ms}
+minimum Round-Trip Time).
+We chose these conditions to study pacing in a controlled environment.
+This setup allows for reproducible measurements and focuses on stack behavior.
+The exact findings are specific to these fixed parameters and may not be directly generalizable to all network conditions
+However, general trends and differences in behavior are visible and explainable with the implementations.
+Real networks have different and complex properties, like varying burstiness, cross traffic, shared queues, competing connections, or load balancing.
+The impact of pacing and burstiness can be highly context-dependent, and it can be expected that the results vary under different network configurations.
+We leave the evaluation of pacing in further network scenarios to future work.
+
+3.5.
+Ethics
+
+This work relies solely on a controlled test environment utilizing synthetic data.
+Therefore, it does not involve any real-world user traffic or personal information, raising no privacy concerns or other ethical issues.
+
+4.
+Evaluation
+
+We evaluate the pacing behavior of QUIC implementations using the measurement framework described in
+Section
+
+3
+.
+Our goal is to analyze how different configurations and system-level features influence pacing.
+We establish a baseline using QUIC implementations and the Operating System in their default configurations.
+We compare results to the TCP / Transport Layer Security stack.
+This provides insights into the general behavior of libraries and allows a comparison with more advanced configurations.
+Next, we investigate the impact of different Linux queueing disciplines on pacing, focusing on their ability to regulate packet transmission.
+Subsequently, we analyze how Generic Segmentation Offload affects pacing in QUIC, also considering an approach that paces packets from a single Generic Segmentation Offload buffer inside the kernel.
+Finally, we evaluate hardware offloading capabilities by enabling the Earliest TxTime First queueing discipline with support for
+LaunchTime
+.
+
+During each measurement, the server transferred a
+100\text{\,}\mathrm{MiB}
+file to the client over HTTP (v3 for QUIC and v2 for TCP/TLS).
+Each configuration was repeated 20 times and the values of all repetitions are combined for the evaluation.
+Before combining measurements, we verified the stability of results and found that the presented inter-packet gap and packet train length metrics showed a small standard deviation.
+The UDP receive buffer size was increased to
+50\text{\,}\mathrm{MiB}
+to prevent packet loss at the client
+(
+Kempf et al. 2024b
+)
+.
+
+Figure 2
+.
+Distribution of gaps between packets sent by the server during the download for the baseline measurements. All implementations use CUBIC.
+
+Figure 3
+.
+Distribution of packets across packet trains with specific lengths (x-axis) for the baseline. Packet trains are sequences of packets with at most
+0.1\text{\,}\mathrm{ms}
+between two packets.
+
+4.1.
+Baseline Measurement
+
+For the baseline measurements, we use the default settings for all QUIC implementations and set the Congestion Control Algorithm to CUBIC for comparability.
+
+Figure
+
+2
+shows the Cumulative Distribution Function of the inter-packet gaps.
+We observe that even though the distributions differ, approximately
+50\text{\,}\mathrm{\%}
+of the packets are sent back-to-back without being paced.
+picoquic sends slightly fewer packets back-to-back, only reaching
+40\text{\,}\mathrm{\%}
+.
+Another commonality is that the majority of packets is sent with inter-packet gaps of less than
+1.5\text{\,}\mathrm{ms}
+.
+
+Looking only at these distributions does not provide a clear picture of the pacing behavior.
+To gain further insights, we analyze the distribution of the lengths of the packet trains in
+Figure
+
+3
+.
+All consecutive packets with an inter-packet gap of <
+0.1\text{\,}\mathrm{ms}
+each are considered a packet train.
+Since the minimum theoretical inter-packet gap in our setup is approximately
+0.012\text{\,}\mathrm{ms}
+, a
+0.1\text{\,}\mathrm{ms}
+threshold is sufficiently larger to distinguish between fundamental serialization delays and actual bursts or intentionally paced packets.
+A packet train of size one is a single packet.
+As larger packet trains are bursts, we consider small packet trains and a rather constant inter-packet gap to be necessary for good pacing.
+
+(a)
+
+picoquic
+
+(b)
+
+quiche
+
+(c)
+
+ngtcp2
+
+Figure 4
+.
+Comparison of the QUIC libraries picoquic, quiche and ngtcp2 configured with different Congestion Control Algorithms. For each library, the top subfigure shows the inter-packet gaps while the bottom subfigure shows the packet train lengths (PTLs).
+Comparison of the QUIC libraries picoquic, quiche and ngtcp2 configured with different Congestion Control Algorithms.
+Comparison of the \quiclibraries \picoquic, \quicheand \ngtcpconfigured with different \acp{cca} (CUBIC, Reno, and BBR). The distributions of inter-packet gaps and packet train lengths are shown.
+
+For TCP / Transport Layer Security and ngtcp2, more than
+99.9\text{\,}\mathrm{\%}
+of the packets are in packet trains consisting of five packets or less, demonstrating consistent pacing behavior.
+In contrast, picoquic limits packet trains to five packets or fewer for only
+60\text{\,}\mathrm{\%}
+of the packets, and quiche achieves this for
+89\text{\,}\mathrm{\%}
+.
+After taking a closer look at the distributions, we see that picoquic has
+3.6\text{\,}\mathrm{\%}
+of packet trains, making up almost
+40\text{\,}\mathrm{\%}
+of all packets, consisting of 16 or 17 packets.
+We observed that those bursts are usually sent after a
+5\text{\,}\mathrm{ms}
+idle period happening almost every
+10\text{\,}\mathrm{ms}
+.
+This behavior is visible with CUBIC and NewReno as Congestion Control Algorithm but not present with Bottleneck Bandwidth and RTT.
+
+Figure
+
+4
+compares the pacing behavior for different Congestion Control Algorithms.
+The built-in optimization of Bottleneck Bandwidth and RTT in picoquic to pace traffic can be fully utilized and traffic is close to perfectly spaced.
+Only loss-based Congestion Control Algorithms result in bursty behavior in picoquic.
+This behavior is not visible with the other implementations.
+For quiche and ngtcp2, bursts are smaller when CUBIC or NewReno are used.
+However, both libraries do not reach the pacing behavior of picoquic if Bottleneck Bandwidth and RTT is used, but the pacing behavior is similar to the baseline.
+The Bottleneck Bandwidth and RTT implementation of ngtcp2 even leads to an increase of loss by an order of magnitude.
+
+The packet train length of quiche is more evenly distributed across values between 6 and 20 and does not show any significant outliers.
+Looking at
+Table
+
+1
+, it is evident that the standard deviation of both metrics is highest for quiche.
+A patch for quiche presented in
+Section
+
+4.2
+unravels the origin of these observations, as they were not caused by the missing pacing.
+quiche itself does not pace packets but relies on a suitable queueing discipline to schedule packets based on timestamps.
+
+Table 1
+.
+Reached goodput and number of dropped packets during the baseline measurements. The bandwidth is limited to
+40\text{\,}\mathrm{Mbit}\text{/}\mathrm{s}
+. Packets are dropped due to a full buffer at the introduced bottleneck.
+
+Implementation
+
+Dropped packets
+
+Goodput [
+\mathrm{Mbit}\text{/}\mathrm{s}
+]
+
+quiche
+
+687.15\pm 338
+.12)
+
+34.67\pm 0
+.64)
+
+picoquic
+
+861.45\pm 99
+.53)
+
+37.09\pm 0
+.03)
+
+ngtcp2
+
+503.45\pm 7
+.39)
+
+15.93\pm 0
+.00)
+
+TCP / Transport Layer Security
+
+16.50\pm 0
+.67)
+
+37.37\pm 0
+.02)
+
+4.2.
+Fair Queue
+
+Figure 5
+.
+The impact of the Fair Queue queueing discipline on quiche pacing. SF denotes our quiche patch to change the behavior of the spurious loss detection. Without the patch, pacing can be drastically impacted in case of loss.
+
+To evaluate kernel-supported pacing, we use the Fair Queue queueing discipline, which integrates with quiche’s pacing mechanism to schedule packets based on timestamps.
+With Fair Queue, we surprisingly observe a performance decrease.
+While the goodput worsens to
+33.64(0.89)\text{\,}\mathrm{Mbit}\text{/}\mathrm{s}
+, the number of dropped packets increases to
+1022.55(324.33)\text{\,}\mathrm{packets}
+.
+The overall stability of metrics decreased, resulting in an increased standard deviation for both metrics.
+The tail of the packet train length distribution shown in
+Figure
+
+5
+reveals that the number of packet trains with more than five packets increased.
+A detailed analysis of the source code and individual loss events shows that after a packet is lost, quiche periodically performs a rollback on the congestion window.
+This happens multiple times in a row, leading to more packet loss.
+We were able to observe periods of up to
+5\text{\,}\mathrm{s}
+where the congestion window fluctuates between two values, causing a high number of packet loss.
+The only scenario in which CUBIC may roll back the congestion window is the detection of a spurious congestion event
+(
+Xu et al. 2023
+)
+.
+While spurious loss is usually defined as receiving an acknowledgment for a packet considered lost, quiche also defines any loss that involves a number of packets lower than a specific threshold as spurious loss
+(
+Cloudflare 2024b
+)
+.
+When quiche detects packet loss after the start of the current congestion recovery period, it creates a congestion event and initiates a new recovery period, with the congestion controller state checkpointed beforehand.
+If the acknowledged packet was sent after the recovery period began, quiche’s CUBIC algorithm checks whether the increase in lost packets since the checkpoint is below a threshold and restores the checkpoint state if so, creating a risk of perpetual congestion window rollbacks.
+An example of this behavior can be seen in Appendix
+Figure
+
+7
+.
+As observed, pacing worsens this issue by reducing packet loss per cycle, which increases the chances of rollbacks, whereas quiche recovers more quickly in the baseline measurements because of larger bursts of loss.
+Although this mechanism was originally introduced to improve performance
+(
+Yuan 2023
+)
+, we deactivate it for all further measurements, as it causes aggressive behavior and worse performance in our setup.
+
+Comparing the pacing of the quiche baseline with the Fair Queue configuration and the previously mentioned mechanism disabled, we observe similar pacing during large parts of the connection.
+However, with Fair Queue, packet trains longer than five packets are rare while they make up over
+10\text{\,}\mathrm{\%}
+of the packets in the baseline.
+Due to the ACK-clocking effect, packets are paced during large parts of the connection with both configurations.
+Only after a congestion event, we observe that ACK-clocking does not lead to a stable pacing behavior without the Fair Queue queueing discipline.
+This happens because the congestion window is decreased, but acknowledgments are still arriving at the old rate.
+This offset leads to delayed bursts, which are not present when using Fair Queue.
+
+4.3.
+GSO
+
+Generic Segmentation Offload can significantly reduce CPU overhead for packet processing in QUIC.
+However, its batching nature leads to bursts as shown in
+Figure
+
+6
+.
+Pacing single packets with queueing disciplines, as introduced in
+Section
+
+4.2
+, remains possible with batching methods like
+sendmmsg()
+, but not with Generic Segmentation Offload.
+The Generic Segmentation Offload buffer size, controlled by the QUIC implementation, directly influences this burstiness.
+While Generic Segmentation Offload reduces CPU load, the resulting bursty traffic might cause a performance degradation.
+
+To mitigate the burstiness introduced by Generic Segmentation Offload, two approaches can be considered.
+The easier approach is to send smaller Generic Segmentation Offload bursts and to pace the gaps between them.
+This can be done by adjusting the Generic Segmentation Offload buffer size calculation in the QUIC implementation.
+However, this approach does not fully utilize the advantages of Generic Segmentation Offload and requires a trade-off between CPU load and burstiness.
+The second approach is to pace individual packets within the Generic Segmentation Offload buffer at the kernel level.
+Our evaluation focuses on the second approach, as it allows large buffers to be passed to the kernel, maximizing the benefits of Generic Segmentation Offload while enabling the kernel to pace packets individually.
+The trade-off here, however, is that this requires modifications to the kernel.
+
+Table 2
+.
+Reached goodput and number of dropped packets during the Generic Segmentation Offload measurements. The bandwidth is limited to
+40\text{\,}\mathrm{Mbit}\text{/}\mathrm{s}
+. Packets are dropped due to a full buffer at the introduced bottleneck.
+
+GSO
+
+Dropped packets
+
+Goodput [
+\mathrm{Mbit}\text{/}\mathrm{s}
+]
+
+enabled
+
+6.35\pm 1
+.01)
+
+31.06\pm 0
+.33)
+
+disabled
+
+160.80\pm 39
+.17)
+
+31.71\pm 0
+.08)
+
+paced
+
+166.20\pm 41
+.00)
+
+31.71\pm 0
+.07)
+
+Figure 6
+.
+The impact of Generic Segmentation Offload on the pacing behavior of quiche. Combining multiple QUIC packets into one buffer reduces system calls but increases the burstiness. Generic Segmentation Offload-paced is based on a kernel patch that allows senders to provide a pacing rate with the Generic Segmentation Offload buffer.
+
+We implemented a kernel patch for Generic Segmentation Offload pacing based on a proposal by Willem de Bruijn
+(
+de Bruijn 2020
+)
+.
+The patch was adapted for easier integration with QUIC libraries, enabling the kernel to accept a pacing rate in bytes per second for each Generic Segmentation Offload buffer.
+
+Figure
+
+6
+shows the results.
+We compare three variants of quiche with paced traffic:
+Generic Segmentation Offload is disabled in the first measurement, Generic Segmentation Offload is enabled in the second, and Generic Segmentation Offload is enabled with our kernel patch, allowing the kernel to pace packets within each Generic Segmentation Offload batch, in the third.
+The results show that paced Generic Segmentation Offload achieves pacing behavior similar to Generic Segmentation Offload-disabled configurations.
+Over
+80\text{\,}\mathrm{\%}
+of packets are sent outside a packet train, indicating effective pacing.
+However,
+Table
+
+2
+shows that packet loss increases to nearly ten times that of unpaced Generic Segmentation Offload.
+This additional loss occurs only at the end of the slow start phase.
+We attribute this behavior to HyStart++, a modification to the slow start phase to exit early based on Round-Trip Time increases
+(
+Balasubramanian et al. 2023
+)
+.
+With standard Generic Segmentation Offload, the bursty traffic fills the bottleneck buffer, causing a rapid Round-Trip Time increase that causes an early exit from slow start.
+In contrast, paced Generic Segmentation Offload and Generic Segmentation Offload-disabled configurations exhibit smoother traffic patterns, leading to a slower Round-Trip Time increase that does not trigger early slow start exits.
+Adjusting the parameters of HyStart++ based on the performed pacing could mitigate this issue.
+
+4.4.
+ETF and Hardware Offloading
+
+We now evaluate the Earliest TxTime First queueing discipline, which offers support for
+LaunchTime
+to offload pacing to the Network Interface Card.
+For that, we compare Fair Queue, Earliest TxTime First, and Earliest TxTime First with
+LaunchTime
+, all with paced Generic Segmentation Offload.
+As described in
+Section
+
+2
+, Earliest TxTime First requires a
+delta
+parameter suitable for the used hardware.
+
+Bosk et al. 2022
+identified
+175\text{\,}\mathrm{\SIUnitSymbolMicro s}
+to be most suitable on a system similar to ours, but they argue that a higher value could reduce packet drops.
+To be a bit more conservative, we chose a
+delta
+of
+200\text{\,}\mathrm{\SIUnitSymbolMicro s}
+.
+
+The distributions of the inter-packet gaps and the packet train lengths for the three measurements don’t show any significant differences.
+As the implementations of both queueing disciplines do not differ much, this is expected.
+
+To evaluate if the
+LaunchTime
+feature improves pacing precision, we compare expected and actual send timestamps for all packets.
+As Generic Segmentation Offload introduces extra complexity and lowers the amount of samples for this metric, the measurements are done without Generic Segmentation Offload.
+The expected timestamp together with the QUIC packet number is logged by the quiche server while the actual timestamp and the packet number are retrieved from the packet capture of the sniffer.
+While the actual difference is not a suitable metric here, the standard deviation, from now on referenced as precision, of the differences is.
+It is independent of the mean average, which is not meaningful as the clocks of server and sniffer are not synchronized in our setup.
+
+The precision of Earliest TxTime First with and without hardware offloading is
+0.27\text{\,}\mathrm{ms}
+and
+0.28\text{\,}\mathrm{ms}
+respectively.
+As the behavior and precision do not differ from the Earliest TxTime First queueing discipline without hardware offloading, we do not consider the
+LaunchTime
+feature to be beneficial for pacing.
+Others have also experienced no increase in performance when using Earliest TxTime First with
+LaunchTime
+
+(
+Rezabek et al. 2023
+)
+.
+To our surprise, the precision of Fair Queue is
+0.12\text{\,}\mathrm{ms}
+, which is better than the Earliest TxTime First implementations.
+The baseline measurements without any queueing discipline show the worst precision with
+0.94\text{\,}\mathrm{ms}
+.
+This is also expected, as the kernel does not process the timestamps of the packets in this case.
+
+5.
+Related Work
+
+Pacing for TCP was already investigated in 2000 by
+Aggarwal et al. 2000
+
+(
+Aggarwal et al. 2000
+)
+.
+They showed that pacing can have advantages in many scenarios but might also negatively impact the performance.
+More recent studies confirmed many of these findings
+(
+Grazia et al. 2021
+)
+and focused on use cases,
+e.g.
+, integrated into Congestion Control Algorithm
+(
+Cardwell et al. 2017
+;
+Song et al. 2021
+;
+Zeynali et al. 2024
+)
+or video streaming scenarios
+(
+Spang et al. 2023
+)
+.
+The ongoing importance of pacing in transport protocols is further highlighted by recent discussions within the IETF, where
+Welzl et al. 2025
+
+(
+Welzl et al. 2025
+)
+provide an overview of pacing mechanisms and their role in improving network performance.
+Its existence underscores that effective pacing, particularly for user-space protocols like QUIC, remains a relevant area of research.
+
+Differences and the performance of QUIC compared to the existing stack have been evaluated by different works
+(
+Jaeger et al. 2023
+;
+Kempf et al. 2024b
+;
+Yang et al. 2020
+;
+Tyunyayev et al. 2022
+;
+Yu and Benson 2021
+;
+Megyesi et al. 2016
+;
+Shreedhar et al. 2022
+;
+Wolsing et al. 2019
+;
+Bauer et al. 2023
+)
+.
+However, they mostly focus on the reachable goodput, page load times, or offloading features without considering pacing behavior of implementations.
+
+In 2020,
+Marx et al. 2020
+
+(
+Marx et al. 2020
+)
+compared different QUIC implementations based on their source code.
+They find that only 8 out of 15 libraries implement pacing.
+Other research argues that QUIC has advantages due to pacing
+(
+De Bruijn and Dumazet 2018
+;
+Zhang et al. 2024
+;
+Yu et al. 2017
+)
+.
+However, the quality of the actual pacing is not evaluated.
+Fastly
+(
+Oku and Iyengar 2020
+)
+and Cloudflare
+(
+Ghedini 2020
+)
+have discussed the effects of optimizations on performance,
+e.g.
+, Generic Segmentation Offload, but also mentioned drawbacks regarding pacing and suggest further investigation.
+In contrast,
+Manzoor et al. 2019
+
+(
+Manzoor et al. 2019
+)
+explicitly prevent pacing to improve QUIC performance in WiFi.
+While the increased burstiness improves their results, they did not evaluate inter-packet gaps and the actual pacing behavior in more detail.
+
+We show that even though pacing might be implemented, the interplay of QUIC as user-space implementation with the kernel and offloading features can have a drastic impact.
+These effects have to be considered in the future and configurations should be adapted based on the use case.
+
+6.
+Conclusion
+
+In this work, we evaluated the pacing behavior of three QUIC libraries, Cloudflare quiche, ngtcp2 and picoquic.
+We shed light on the impact of different Congestion Control Algorithms and functionalities offered by the kernel.
+Our results show that pacing behavior differs widely between libraries.
+While picoquic offers a Bottleneck Bandwidth and RTT implementation which evenly spaces packets, other libraries show advantages using CUBIC.
+quiche can make use of the Fair Queue queueing discipline for pacing but also Generic Segmentation Offload to reduce context switches between the library in user-space and the kernel.
+We show that both functionalities reach the targeted goal, but while Generic Segmentation Offload reduces the sending overhead, it drastically impacts packet spacing.
+Our adapted kernel patch for paced Generic Segmentation Offload, optimized for easy integration into QUIC implementations, combines the efficiency of batching to reduce the overhead of system calls while keeping the pacing behavior.
+Hardware offloading does not show relevant improvements and reduces pacing precision as intended by the library.
+
+Finally, our work shows that pacing in QUIC is possible and can be achieved using different approaches.
+Accurate pacing can be entirely done from user-space as shown by picoquic with Bottleneck Bandwidth and RTT or with the help of kernel functionality such as the Fair Queue queueing discipline or when using Generic Segmentation Offload.
+However, the behavior differs between implementations and approaches.
+Depending on the application use case,
+e.g.
+, video streaming, real-time communications, or web access, different pacing strategies or even no pacing at all might be beneficial.
+Our evaluation offers important insights for a better understanding of pacing in QUIC, contributing to the ongoing development and successful usage in different scenarios.
+
+Appendix A
+Spurious Loss Behavior: quiche
+
+Figure
+
+7
+shows the behavior of the original quiche implementation in case of spurious loss.
+The behavior is explained in more detail in
+Section
+
+4.2
+.
+It is also discussed in a GitHub issue
+(
+Yuan 2023
+)
+.
+It can drastically impact pacing behavior and performance.
+Therefore, we deactivate the behavior by patching quiche.
+
+Figure 7
+.
+Example of the quiche behavior in case of spurious loss. The current implementation can lead to perpetual congestion window rollbacks.
+
+Appendix B
+Artifacts
+
+The source code of our measurement framework introduced in
+Section
+
+3
+is published on GitHub
+(
+Kempf et al. 2025
+)
+.
+As explained, it is an extension to the framework published by
+Jaeger et al. 2023
+
+(
+Jaeger et al. 2023
+)
+.
+Furthermore, this repository contains the configurations for all measurements and all used patches for quiche and paced Generic Segmentation Offload.
+The framework and configurations can be used to reproduce results and study further configurations or libraries.
+
+Besides these artifacts to allow measurements, the collected data from our measurements presented in this work is also published in the same repository.
+The data contains detailed logs, packet captures and additional information from the involved systems.
+By using the included evaluation scripts, the data can be analyzed and visualized.
+

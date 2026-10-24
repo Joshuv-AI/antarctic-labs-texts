@@ -1,0 +1,4086 @@
+Prime Collective Communications Library - Technical Report
+Michael Keiblinger, Mario Sieg, Jack Min Ong, Sami Jaghouar, Johannes Hagemann
+
+Abstract
+This report presents the Prime Collective Communications Library (PCCL), a novel fault-tolerant collective communication library designed specifically for distributed machine learning workloads over the public internet. PCCL introduces a new programming model that enables dynamic peer joining and failure recovery. The library implements efficient collective operations like all-reduce while providing robust fault tolerance mechanisms that allow the system to continue operating even when peers fail or join during ongoing operations. We demonstrate that PCCL’s design enables practical solutions to dynamic membership challenges in workloads with repeated operations and deterministic state advancement. Our implementation passes extensive stress tests across all major operating systems, showing reliable operation even under rapid peer churn and concurrent collective operations. By dispatching to multiple connections, we can efficiently utilize cross-continental long-fat-pipe TCP WAN links, in our experiments achieving up to 45 Gbit/s of bandwidth utilization across western Europe and 25 Gbit/s across North America and Europe. PCCL’s architecture enables easy implementation of distributed low-communication optimization strategies like DiLoCo, which significantly reduce communication frequency. Combined with quantization, this leads to a significant reduction in the bandwidth required for distributed training workloads. PCCL also allows for concurrent collective operations, which enables optimization strategies like async DiLoCo, which can completely hide communication overhead by implementing one-step delayed parameter updates. PCCL can facilitate exact bit-parity of the shared state across peers in all cases induced by graceful or abrupt peer churn. While PCCL exposes a C99 API, Python bindings are available which are compatible with PyTorch alongside FSDP. PCCL is available under the open source MIT license.
+
+
+
+1
+Introduction
+
+Over the past decade, the increasing scale and complexity of machine learning (ML) models have driven the adoption of large-scale distributed training across clusters of GPUs or other specialized accelerators. These workloads are especially communication-intensive, as parameter updates and gradient calculations must be synchronized across multiple worker nodes. To handle this synchronization, collective communication libraries like MPI and, more recently, NVIDIA Collective Communications Library (NCCL)
+(
+NVIDIA Corporation, 2025
+)
+have played a central role in providing efficient all-reduce, broadcast, and other collective operations on tightly coupled, high-performance clusters.
+
+Despite their success, these traditional libraries were not designed to handle the realities of modern, highly dynamic environments, where resources may join or leave frequently and where connectivity spans public clouds or other wide-area networks. They often assume fixed membership, predictable node connectivity, and uniform performance characteristics—assumptions that rarely hold at large scale or outside dedicated HPC clusters. As a result, when failures or dynamic reconfigurations occur, these libraries do not gracefully handle peer churn, and thus prevent resilient training.
+
+In this work, we introduce the Prime Collective Communications Library (
+PCCL
+), a novel fault-tolerant collective communication library that addresses these fundamental limitations.
+PCCL
+is designed specifically for distributed ML workloads operating over public networks, where peers may fail, join, or disconnect at any point during training. Our approach enables dynamic peer membership and incorporates robust fault-tolerance mechanisms that allow the system to continue collective operations even as peers come and go. By exploiting the deterministic nature of most optimizers, where bit-identical state progression is guaranteed if all peers receive identical updates - even when performed on GPUs,
+PCCL
+ensures consistent model synchronization across nodes without additional communication beyond the collective operation results.
+
+Unlike traditional HPC libraries,
+PCCL
+leverages a master-client model that accommodates dynamic membership and continuous topology optimization. New peers join as "registered," then graduate to full participation through a quick consensus phase. Each collective operation proceeds via carefully orchestrated micro-consensus steps—ensuring fault tolerance and consistent model states, even if peers leave mid-operation. In the following sections, we detail how these design decisions enable smooth peer churn, p2p bandwidth measurements for ring-based optimization, and bit-parity among peers inside the shared state without unnecessary re-transmissions.
+
+2
+PCCL Architecture
+
+2.1
+Overview
+
+PCCL introduces a novel approach to collective communications for distributed machine learning that differs significantly from classic HPC libraries such as OpenMPI or NCCL.
+This section describes the design rationale behind PCCL’s master-client model, its fine-grained state machine, and the mechanisms it employs to ensure fault tolerance and dynamic peer membership.
+The following subsections detail each component, providing insights into how PCCL handles joining or failing peers mid-run, optimizes its ring topology based on bandwidth measurements, and enforces bit-identical shared state across participants.
+
+2.2
+Master–Client Model
+
+Unlike traditional libraries that assume all processes start simultaneously, PCCL leverages a lightweight master process that orchestrates membership and consensus of collective operations.
+
+•
+
+Clients (Peers)
+: Each training process instantiates a PCCL communicator and connects to the master. Once a peer is "registered," it can be voted into the active group.
+
+•
+
+Master Node
+: Maintains a view of which peers are accepted, tracks the ring topology (for all-reduce operations), and coordinates all state transitions through micro-consensus steps.
+
+2.2.1
+Membership Lifecycle
+
+When a new peer connects, it enters an initial
+registered
+phase. Accepted peers periodically vote on whether to admit newly registered peers into their group. If they do so, the master instructs everyone to establish direct p2p connections as needed. This approach allows peer churn without forcing restarts of the entire training job.
+
+2.2.2
+What the Master Tracks
+
+Clients and Their Status.
+
+The master differentiates between
+registered
+peers (not yet active) and
+accepted
+peers (fully integrated into the collective).
+
+Ring Topology and Bandwidth Metrics.
+
+Based on p2p bandwidth tests, the master attempts to optimize the ring order, solving an asymmetric traveling-salesman problem
+(
+Jaghouar et al., 2024
+)
+.
+For this purpose, we have developed a custom heuristic and exact ATSP solver called
+libtsp
+
+(
+Keiblinger, 2025
+)
+.
+PCCL’s optimization can occur as a quick pass (immediate solution within a short timeout) or a more involved "moonshot" background computation.
+Once a new or improved ring order is established, the master instructs peers to reconfigure their p2p connections accordingly.
+
+Shared State.
+
+The master ensures that each peer has the same shared state.
+Any peer with an out-of-date revision or mismatched content is instructed to request data from an up-to-date peer.
+This ensures that all participants converge on a bit-identical set of parameters and optimizer states.
+
+Collective Operations.
+
+The master coordinates all active collective operations, preventing conflicts between accepting new peers, synchronizing shared state, and performing ring-based collectives.
+While it does coordinate the collective operations, it is not involved in the actual collective operations nor shared state re-transmissions themselves.
+It merely ensures consensus of all peers that the collective operation has completed and propagates IO failures to potentially interrupt ongoing collective operations to avoid stall.
+
+2.3
+Collective Operations and States
+
+PCCL manages each operation (e.g., an all-reduce) through well-defined states.
+This state machine approach enables graceful error handling if a peer drops out mid-operation and ensures that every peer transitions in lockstep.
+
+2.3.1
+Phases and State Machine
+
+Each peer moves through a sequence of phases:
+
+•
+
+ConnectionPhase
+:
+
+PEER_REGISTERED
+or
+PEER_ACCEPTED
+.
+
+•
+
+ConnectionState
+:
+e.g.
+IDLE
+,
+
+VOTE_ACCEPT_NEW_PEERS
+,
+COLLECTIVE_COMMUNICATIONS_RUNNING
+,
+etc.
+
+•
+
+CollectiveCommunicationState (per tag)
+:
+
+VOTE_INITIATE_COLLECTIVE_COMMS
+,
+
+PERFORM_COLLECTIVE_COMMS
+,
+VOTE_COMPLETE_COLLECTIVE_COMMS
+.
+
+Each transition requires unanimous agreement among involved peers ("micro-consensus") so that inconsistencies or partial failures can be detected and handled quickly.
+
+2.3.2
+One Operation at a Time per Group
+
+Within a single peer group, PCCL enforces a strict rule that only one major operation (accepting peers, synchronizing shared state, or running a collective) can be active at any given moment. This ensures correctness and predictability, especially in the face of dynamic membership.
+
+Registered
+Idle
+Shared State Sync
+Topology
+Update
+Collective
+Operations
+on acceptance
+on consensus
+on consensus
+on consensus
+
+Figure 1:
+Example flow chart for PCCL states and transitions.
+
+2.4
+Shared State and Consistency
+
+A unique feature of PCCL is its focus on maintaining bit-identical state across all accepted peers.
+
+Each peer submits a hash of its local parameter (tensor) contents.
+The master identifies any outlier peers that need to be updated, prompting a direct p2p data transfer to bring them into sync.
+
+This process leverages a simple, non-cryptographic, purpose-built, parallelizable hashing function internally referred to as
+simplehash
+, which draws inspiration from fvn1a and utilizes a warp-tree reduce
+(
+Fowler et al., 1991
+)
+.
+This kernel is completely deterministic despite its parallel nature and empirically validated on GPU generations ranging from the GTX 980 Ti to the B200.
+To not make assumptions about device placement of shared state across peers, the hash function is also implemented on CPU utilizing OpenMP to emulate the parallel execution model of the GPU while preserving hash identity.
+The hash function achieves performance comparable to NVIDIA Thrust’s reduce kernels
+(
+NVIDIA, 2014
+)
+
+A.1
+.
+
+2.5
+Fault Tolerance and Dynamic Membership
+
+In a realistic setting, peers may fail or disconnect unexpectedly:
+
+•
+
+If a peer disappears mid-collective, PCCL cancels the current operation, marks the peer as gone, and allows the application developer to retry the collective without that peer.
+
+•
+
+If the the number of peers drops below a user-specified threshold, training can pause or wait for new arrivals.
+
+2.5.1
+Accepting New Peers
+
+When a fresh peer connects, it remains in
+PEER_REGISTERED
+until existing accepted peers vote to integrate it.
+At that point, the master instructs everyone to set up p2p connections with the newcomer.
+If any step of that connection process fails, peers can retry or reject the newcomer, preserving stability and consistency.
+
+2.5.2
+Topology Optimization
+
+To perform ring-based collectives efficiently, PCCL measures bandwidth between peers and solves an asymmetric traveling-salesman problem to optimize ring order.
+The master first attempts to find a heuristic solution within a predetermined time limit to avoid stalling the run, while it may later attempt a "moonshot" for a potentially more optimal arrangement.
+When a new or improved topology is discovered, PCCL triggers a reconfiguration phase among all accepted peers to adopt the updated ring.
+If, for example, computers are co-located in the same datacenter, packets can often be delivered locally without ever bouncing off the gateway.
+Thus, topology optimization naturally results in the exploitation of low-latency local communication paths and minimizes the number of expensive public internet hops in the route.
+
+2.5.3
+Fault Tolerance
+
+Fault tolerance in general is a challenging problem that cannot be solved fully by any single mechanism.
+Fault tolerance is a property of the system as a whole that indicates the system’s ability to continue operating correctly even in the presence of faults.
+If error paths are not unwound correctly, the system could stall, or if the recovery logic is not correct, the system could enter an inconsistent state.
+
+What this amounts to is an engineering problem of identifying all possible error paths.
+To make this problem tractable, it is crucial to restrict as much as possible the set of legal state transitions the system can make.
+
+Previous internal attempts at implementing this library have failed to achieve fault tolerance because the API was too permissive.
+Peers could join and leave the run any time - as opposed to only via a dedicated accept phase, resulting in a system that created a nearly uncountable number of legal states and error paths.
+
+This justifies the existence of the rather "authoritarian" master node that coordinates micro-consensus steps.
+By reducing the system-state to what amounts to a clear finite state machine, we can reason about the system’s behavior in a much more straightforward manner.
+
+Ensuring lockstep of application-level state also turned out to be impossible with previous approaches, as join any time means it cannot be known where in the training loop other peers are, thus making it impossible to fall into lockstep.
+
+Only through significantly limiting the set of allowed operations was it possible to achieve a system that is fault tolerant.
+
+2.6
+Low Overhead
+
+PCCL is best seen as a light-weight wrapper for
+send()
+and
+recv()
+socket operations with inexpensive error handling and recovery paths.
+For a tiny MNIST model with
+128
+hidden units (100k parameters), PCCL achieves the following per-api-call latencies over loopback:
+
+•
+
+pcclUpdateTopology
+:
+0.097667
+ms
+
+•
+
+pcclSynchronizeSharedState
+(includes hashing) :
+1.1595
+ms
+
+•
+
+pcclAllReduceAsync
+:
+0.005292
+ms
+
+•
+
+pcclAwaitAsyncReduce
+(awaits collective operations):
+7.03225
+ms
+
+2.6.1
+Stress Testing
+
+PCCL passes extensive long-running stress tests in CI on all supported operating systems (Linux, macOS, Windows) spanning approximately 8 hours per run.
+Each stress-test worker simulates a typical training run involving the typical operations like topology updates, shared-state synchronization, and multiple concurrent collective operations.
+The training loop is high-frequency in nature and takes on the order of 100 milliseconds per iteration.
+This is in hopes of inducing every possible timing issue over a long time horizon.
+Peers are spawned and killed randomly every 500-1000 milliseconds.
+As long as the shared state is advanced correctly despite the sustained peer churn, the test is considered passing.
+To pass this stress test, PCCL must correctly unwind all possible error paths such that the application can correctly retry in lock-step and that all concurrent operations are scheduled and awaited and retried correctly if a failure occurs in a particular operation.
+
+3
+Implementing Distributed Training Algorithms
+
+PCCL, while designed for use in distributed training, is a general purpose library for collective communications.
+It provides the necessary primitives for implementing distributed computing algorithms.
+PCCL does not provide any higher-level distributed training algorithms, but rather provides a foundation on which such algorithms can be built.
+
+We hope that PCCL provides the generality necessary to be useful not only pre-existing distributed training algorithms, but also to be a tool for future research in the design of new distributed training algorithms.
+
+The following sections describe how to implement some popular distributed training algorithms using PCCL:
+
+3.1
+Distributed Data Parallel
+
+While DDP
+(
+Dean et al., 2012
+)
+is not particularly well-suited for training over the public internet due to its frequent communication requirements, we will start with naive DDP as a starting point for demonstrating the programming paradigm of PCCL.
+
+Algorithm 1
+
+Naive DDP Training Loop with PCCL (Pseudo-Code)
+
+1:
+
+2:
+
+\mathcal{C}
+
+\leftarrow
+PCCL communicator
+
+3:
+
+model
+
+\leftarrow
+local copy of the model
+
+4:
+
+optimizer
+
+\leftarrow
+local optimizer
+
+5:
+
+\mathrm{train\_loader}
+
+\leftarrow
+local data loader (each peer sees a distinct subset of the data).
+
+\triangleright
+
+Collect shared state. (model and optimizer state)
+
+6:
+
+\mathrm{sharedState}\leftarrow[\,p_{data}\;\;|\;\;p_{data}\in model]\cup[\,opt_{state}\;\;|\;\;opt_{state}\in optimizer]
+
+7:
+
+for
+
+iteration=1
+
+to
+
+\mathit{maxIters}
+
+do
+
+\triangleright
+
+Update topology and accept new peers
+
+8:
+
+\mathrm{updateTopology}(\mathcal{C})
+
+\triangleright
+
+Synchronize shared state. (No-op if advanced correctly)
+
+9:
+
+\mathrm{syncSharedState}(\mathcal{C},sharedState)
+
+\triangleright
+
+Perform forward and backward pass
+
+10:
+
+\mathrm{batch}\leftarrow\mathrm{LocalDataLoader.nextBatch()}
+
+11:
+
+\mathrm{loss}\leftarrow\mathrm{ForwardBackwardPass}(\theta^{(p)},\mathrm{batch})
+
+12:
+
+\mathrm{optimizer.zeroGrad()}
+
+13:
+
+\mathrm{loss.backward()}
+
+\triangleright
+
+Use PCCL’s All-Reduce to sum gradients across all peers.
+
+14:
+
+\mathrm{AllReduce}(\mathcal{C},[\,p.\mathrm{grad}\;\;|\;\;p\in model],\texttt{op}=\textsc{Avg})
+
+\triangleright
+
+Perform the local parameter update (identical on each peer).
+
+15:
+
+\mathrm{optimizer.step()}
+
+16:
+
+end
+
+for
+
+Explanation of Key Steps:
+
+•
+
+Synchronize Shared State
+:
+The model’s parameters and optimizer state are considered shared state.
+The shared state is validated to be identical on all peers and retransmitted if necessary.
+In a correct application loop, this step is a no-op except for the first iteration after a peer has joined the run.
+
+•
+
+Local Forward/Backward Pass
+:
+Each peer runs a forward and backward pass on its mini-batch, producing local gradients.
+
+•
+
+All-Reduce of Gradients
+:
+The PCCL All-Reduce call (
+\mathrm{AllReduce}(\mathcal{C},\mathcal{G},\textsc{Avg})
+) averages the local gradients across all peers. After this step, every peer holds the same average of gradients.
+
+•
+
+Local Update
+:
+Each peer’s optimizer applies exactly the same gradient step, so the model parameters remain in sync across all peers.
+In a correct implementation, each peer should independently advance to precisely the same state after this operation.
+
+3.2
+DiLoCo
+
+DiLoCo (
+Distributed Low-Communication
+)
+(
+Douillard et al., 2024
+)
+is a local-SGD-based optimization strategy inspired by recent work on large-scale distributed training via federated averaging. It divides the training loop into an
+inner
+phase and an
+outer
+phase:
+
+•
+
+Inner Phase:
+Each peer (worker) trains locally for
+H
+steps using a standard optimizer such as AdamW. Crucially,
+no communication
+occurs during these inner steps, which drastically reduces overhead over the public internet.
+
+•
+
+Outer Phase:
+After
+H
+local steps, each peer computes its parameter difference
+\Delta^{(p)}=\theta-\theta^{(p)}
+. These differences are collectively merged (
+e.g.
+, averaged) to form an
+outer gradient
+, which is then applied by an
+outer optimizer
+(e.g. Nesterov momentum).
+
+Because peers only synchronize once per
+H
+steps, DiLoCo drastically reduces communication required, making it suitable for training over the public internet.
+
+DiLoCo at number of steps
+H=1
+with an outer optimizer of
+SGD(lr=1.0)
+is roughly equivalent to DDP assuming inner optimizer states are roughly comparable across peers by training on similar data.
+DiLoCo can thus be arbitrarily configured on a continuum from what is roughly equivalent to DDP to more infrequent communication at the cost of convergence speed.
+
+Algorithm 2
+
+DiLoCo Training Loop (Pseudo-Code)
+
+1:
+
+2:
+
+\mathcal{C}
+
+\leftarrow
+PCCL communicator
+
+3:
+
+\{\theta^{(p)}\}
+
+\leftarrow
+model parameters on each peer
+p
+
+4:
+
+\theta^{(g)}
+
+\leftarrow
+global (outer) aggregator parameters
+
+5:
+
+\mathrm{optimizer}
+
+\leftarrow
+inner optimizer
+
+6:
+
+\mathrm{outerOptimizer}
+
+\leftarrow
+outer optimizer
+
+7:
+
+\mathrm{InnerSteps}
+
+\leftarrow
+number of inner training steps before communication
+
+\triangleright
+
+Collect shared state. (model and optimizer state)
+
+8:
+
+\mathrm{sharedState}\leftarrow[\,p_{data}\;\;|\;\;p_{data}\in model]\cup[\,opt_{state}\;\;|\;\;opt_{state}\in optimizer]
+
+9:
+
+for
+
+t=1
+
+to
+
+\mathit{maxIterations}
+
+do
+
+10:
+
+\mathrm{updateTopology}(\mathcal{C})
+
+\triangleright
+
+Update topology and accept new peers
+
+11:
+
+\mathrm{syncSharedState}(\mathcal{C},\texttt{enforcePopular})
+
+\triangleright
+
+Sync shared state (No-op if advanced correctly)
+
+\triangleright
+
+Local Training Phase
+
+12:
+
+for
+
+i=1
+
+to
+
+\mathrm{InnerSteps}
+
+do
+
+13:
+
+\mathrm{batch}\leftarrow\mathrm{LocalDataLoader.nextBatch()}
+
+14:
+
+\mathrm{loss}\leftarrow\mathrm{ForwardPass}(\theta^{(p)},\mathrm{batch})
+
+15:
+
+\mathrm{optimizer.zeroGrad()}
+
+16:
+
+\mathrm{loss.backward()}
+
+17:
+
+\mathrm{optimizer.step()}
+
+18:
+
+end
+
+for
+
+19:
+
+\Delta^{(g)}\leftarrow\theta^{(g)}-\theta^{(p)}
+
+\triangleright
+
+Aggregate Global Parameter Differences
+
+20:
+
+\mathrm{AllReduce}(\mathcal{C},\Delta^{(g)},\textsc{Avg})
+
+\triangleright
+
+Perform pseudo-gradient reduction
+
+21:
+
+\theta^{(g)}\leftarrow outerOptimizer.step(\theta^{(g)},\Delta^{(g)})
+
+\triangleright
+
+Apply Global Update
+
+22:
+
+\theta^{(p)}\leftarrow\theta^{(g)}
+
+23:
+
+end
+
+for
+
+3.3
+Async DiLoCo
+
+While DiLoCo reduces communication by only synchronizing after
+H
+local steps,
+async DiLoCo
+goes one step further and
+overlaps
+the global reduce phase with local compute. This is achieved by maintaining a one-step delay in applying the freshly reduced global update.
+
+For clarity, we note that this is a distinctly different simplified strategy compared to
+streaming DiLoCo
+
+(
+Douillard et al., 2025
+)
+.
+
+Key Idea.
+
+Instead of blocking all peers until the all-reduce of parameter deltas finishes, each peer immediately proceeds to the next batch of local training. The background all-reduce completes asynchronously, and its result is incorporated (via the outer optimizer) at the
+beginning
+of the next outer iteration. As a result, the communication overhead is effectively hidden behind local compute, at the cost of applying parameter deltas one step behind.
+
+The following is a simplified version of Async DiLoCo optimized for clarity.
+It assumes that peers do not join or leave the run.
+
+Algorithm 3
+
+Async DiLoCo (Simplified, no peer churn possible)
+
+1:
+
+2:
+
+\mathcal{C}
+: PCCL communicator
+
+3:
+
+\theta^{(p)}
+: local model parameters on peer
+p
+
+4:
+
+\theta^{(g)}
+: global (outer) aggregator parameters
+
+5:
+
+\mathrm{optimizer}
+: local (inner) optimizer
+
+6:
+
+\mathrm{outerOptimizer}
+: outer optimizer acting on
+\theta^{(g)}
+
+7:
+
+\mathrm{InnerSteps}
+: # of local steps before streaming each update
+
+8:
+
+Initialize
+:
+
+9:
+
+\theta^{(p)}\leftarrow\theta^{(g)}
+
+\triangleright
+all peers start from shared state
+
+10:
+
+\Delta^{(\mathrm{t-1})}\leftarrow\mathbf{0}
+
+\triangleright
+no pending deltas initially
+
+11:
+
+\mathrm{activeThread}\leftarrow\text{None}
+
+\triangleright
+no active all-reduce thread
+
+\triangleright
+
+Accept peers in advance, as peer churn is not possible
+
+12:
+
+while
+
+\mathrm{getWorldSize}(\mathcal{C})<\mathrm{targetWorldSize}
+
+do
+
+13:
+
+\mathrm{updateTopology}(\mathcal{C})
+
+14:
+
+\mathrm{syncSharedState}(\mathcal{C},sharedState)
+
+15:
+
+end
+
+while
+\triangleright
+
+Main Training Loop
+
+16:
+
+for
+
+t=1\dots\mathrm{maxOuterIters}
+
+do
+
+17:
+
+for
+
+i=1\dots\mathrm{InnerSteps}
+
+do
+
+\triangleright
+
+Local Training Phase
+
+18:
+
+(x,y)\leftarrow\mathrm{LocalDataLoader}.\mathrm{nextBatch}()
+
+19:
+
+\mathrm{loss}\leftarrow\mathrm{ForwardPass}(\theta^{(p)},x,y)
+
+20:
+
+\mathrm{optimizer}.\mathrm{zeroGrad}()
+
+21:
+
+\mathrm{loss}.\mathrm{backward}()
+
+22:
+
+\mathrm{optimizer}.\mathrm{step}()
+
+23:
+
+end
+
+for
+\triangleright
+
+Await completion of all-reduce of previous iteration’s parameter differences
+
+24:
+
+\mathrm{AwaitAsyncAllReduce}(\mathcal{C},\Delta^{(t-1)})
+
+25:
+
+\Delta^{(t)}\leftarrow\theta^{(g)}-\theta^{(p)}
+
+\triangleright
+
+Aggregate Global Parameter Differences
+
+26:
+
+\mathrm{activeThread}\leftarrow\mathrm{AsyncAllReduce}(\mathcal{C},\Delta^{(t)})
+
+\triangleright
+
+Launch async all-reduce in background
+
+27:
+
+if
+
+\mathrm{isFinished}(\Delta^{(t-1)})
+
+then
+
+28:
+
+\mathrm{outerOpt}.\text{step}(\theta^{(g)},\;\Delta^{(\mathrm{t-1})})
+
+\triangleright
+
+Apply global update of previous iteration
+
+29:
+
+\theta^{(p)}\leftarrow\theta^{(g)}
+
+30:
+
+end
+
+if
+
+31:
+
+Proceed immediately to next iteration;
+all-reduce overlaps with local compute.
+
+32:
+
+end
+
+for
+
+Implementation Details.
+
+•
+
+Each peer keeps a
+background thread
+or analogous asynchronous mechanism to run
+all-reduce
+on the
+previous
+iteration’s
+\Delta^{(t-1)}
+. Thus, no peer stalls waiting for communication.
+
+•
+
+At iteration
+t
+, if the previous all-reduce is complete, we apply the newly aggregated result via the
+\mathrm{outerOptimizer}
+. Then local training for iteration
+t
+proceeds normally.
+
+•
+
+At the
+end
+of iteration
+t
+, we compute
+\Delta^{(t)}
+and immediately hand it off for asynchronous all-reduce. Meanwhile, iteration
+t{+}1
+starts.
+
+In practice,
+async
+DiLoCo must also handle situations where a new peer joins (or an existing peer fails) during training.
+Because PCCL requires that major operations (topology updates, shared-state syncs, or collectives) do
+not
+overlap with collective operations,
+we periodically check whether there are
+pending
+peers before awaiting the completion of any in-flight collective to start e.g a topology update and subsequent shared-state synchronization.
+If there are new arrivals, we safely pause any in-flight collective, update topology, and run a shared-state synchronization
+exactly once, and then immediately resume async DiLoCo.
+
+3.3.1
+Handling Peer Churn in Async DiLoCo
+
+While Async DiLoCo (see
+Algorithm
+
+3
+) effectively overlaps local compute with background communication, additional considerations arise when peers join or leave mid-run. In particular, each collective operation (the all-reduce of parameter deltas) is spread across multiple training iterations because of the one-step delay. Therefore, any membership change must be carefully sequenced to avoid interfering with in-flight collectives, which PCCL does not allow to overlap for safety reasons.
+
+1. No Overlap of Major Operations with Collectives.
+
+As described in
+Section
+
+2
+, PCCL restricts a communicator to only one major operation at a time:
+
+•
+
+accepting or removing peers (topology updates),
+
+•
+
+collective communication (e.g. all-reduce),
+
+•
+
+shared state synchronization.
+
+A new peer that arrives is placed in the
+registered
+state until the pre-existing set of peers accept the new peer. Similarly, if a peer fails in the middle of a collective, PCCL aborts the operation, reconfigures membership (without accepting new peers), and only then allows the next collective to begin.
+
+2. Reconciling One-Step-Behind Updates.
+
+In
+Algorithm
+
+3
+, every peer applies global parameter deltas with a one-iteration delay so local training can run in parallel with background communication. When a new peer arrives, it must:
+
+1.
+
+Synchronize Shared State:
+Obtain the most recent aggregator (outer) parameters and optimizer state from an active peer.
+
+2.
+
+Reset Inner Model:
+Copy those aggregator parameters into its local model, ensuring it starts from the current global baseline.
+
+3.
+
+Enter the One-Step-Behind Pipeline:
+On the next iteration, the new peer contributes its parameter deltas in the background all-reduce. Because it "misses" the completion of the all-reduce of the previous iteration, additional synchronization is required for the newcomer to enter into lock-step with bit-parity.
+
+3. Temporarily stalling the pipeline for membership changes.
+
+As mentioned in section
+2
+, PCCL requires that major operations (topology updates, shared-state syncs, or collectives) do
+not
+overlap with collective operations.
+This means that when a new peer arrives, we must temporarily stall the pipeline until the in-flight collectives complete.
+Only then can we proceed with the membership change and the subsequent shared-state synchronization.
+PCCL thus provides a mechanism to check for pending peers to only trigger the above steps if there are pending peers
+that require integration.
+This function is guaranteed to return the same value for all peers in the run.
+This function employs a micro-consensus scheme similar to the major operations, however, it can be arbitrarily overlapped with concurrent collectives.
+
+4. Ensuring Global Consistency.
+
+Once a new peer is accepted, the application triggers a shared-state synchronization.
+This brings the peer up to date with the latest global state. The inner steps of the new peers will
+be based on the same global state as those of the other peers.
+The pseudo-grad output of the resulting inner steps is thus "weight-compatible" with that of the other peers
+and the changes from the current outer step can be contributed into the next all-reduce.
+However, because the new peer joined after the previous all-reduce has already started,
+which will determine the
+next
+outer state, the new peer must "eavesdrop" on the result of the
+previous all-reduce to acquire the correct outer state.
+Thus, one additional shared state synchronization is required in the outer step when a new peer joins.
+The pre-existing peers provide the shared state after being advanced by the result of the previous all-reduce
+that the new peer missed.
+The new peer simply adopts the outer state provided by the pre-existing peers without performing an outer optimizer step.
+After this procedure is complete, the new peer is now fully integrated and "weight-compatible" with the other peers.
+
+The second shared state synchronization utilizes the
+sendOnly
+or
+receiveOnly
+strategies to ensure that the shared state of newcomers is never chosen to be distributed.
+This is important, for example, if more peers join in one step than the number of pre-existing peers.
+If this is the case and we would use the default
+enforcePopular
+strategy, the pre-existing peers will loose hash popularity and the undesired state is chosen and distributed.
+
+Allowing peer churn while sustaining a
+one-step-behind
+global update enables robust scaling in unreliable or heterogeneous environments.
+DiLoCo’s inner steps
+H
+can be set such that
+t_{compute}
+roughly equals
+t_{comm}
+for a balanced system.
+In such a setting, the communication overhead is completely hidden behind local compute.
+Future work may explore under which conditions waiting for communication "amortizes" in terms of better wall-clock convergence.
+
+Algorithm 4
+
+Async DiLoCo with Conditional Topology & Shared State Updates
+
+1:
+
+2:
+
+\mathcal{C}
+
+PCCL communicator
+
+3:
+
+\theta^{(g)}
+
+Aggregator (outer) parameters (shared state)
+
+4:
+
+\theta^{(p)}
+
+Local model parameters on peer
+p
+
+5:
+
+\mathrm{optimizer}
+
+Local inner optimizer
+
+6:
+
+\mathrm{outerOpt}
+
+Outer optimizer acting on
+\theta^{(g)}
+
+7:
+
+\mathrm{InnerSteps}
+
+Number of local steps per iteration
+
+8:
+
+\mathrm{activeThread}\leftarrow\text{None}
+
+No initial all-reduce thread
+
+9:
+
+\Delta^{(\mathrm{t-1})}\leftarrow\mathbf{0}
+
+No pending delta initially
+
+10:
+
+11:
+
+for
+
+t=1\dots\mathrm{maxOuterIters}
+
+do
+
+12:
+
+Check for new peers (only if needed)
+
+13:
+
+if
+
+\mathcal{C}.\texttt{are\_peers\_pending}()
+
+then
+
+\triangleright
+Handle membership changes now
+
+14:
+
+if
+
+\mathrm{activeThread}
+still running
+then
+
+15:
+
+\mathrm{AwaitAsyncAllReduce}(\mathcal{C},\Delta^{(t-1)})
+
+\triangleright
+wait for any in-flight collective
+
+16:
+
+end
+
+if
+
+17:
+
+\mathcal{C}.\texttt{updateTopology}()
+
+\triangleright
+Accept new peers
+
+18:
+
+\mathcal{C}.\texttt{syncSharedState}(\theta^{(g)},\texttt{enforcePopular})
+
+\triangleright
+e.g. aggregator & outerOpt state
+
+19:
+
+\theta^{(p)}\leftarrow\theta^{(g)}
+
+\triangleright
+local model is now in sync
+
+20:
+
+end
+
+if
+\triangleright
+
+Local (inner) training
+
+21:
+
+for
+
+i=1\dots\mathrm{InnerSteps}
+
+do
+
+22:
+
+(x,y)\leftarrow\mathrm{LocalData.nextBatch}()
+
+23:
+
+\mathrm{optimizer}.\text{zeroGrad}()
+
+24:
+
+\mathrm{loss}\leftarrow\mathrm{ForwardBackwardPass}(\theta^{(p)},x,y)
+
+25:
+
+\mathrm{optimizer}.\text{step}()
+
+26:
+
+end
+
+for
+
+27:
+
+\mathrm{AwaitAsyncAllReduce}(\mathcal{C},\Delta^{(t-1)})
+
+\triangleright
+wait for any in-flight all-reduce
+
+28:
+
+\Delta^{(t)}\leftarrow\theta^{(g)}-\theta^{(p)}
+
+\triangleright
+
+Compute new parameter difference
+
+29:
+
+\mathrm{activeThread}\leftarrow\mathrm{AsyncAllReduce}(\mathcal{C},\;\Delta^{(t)})
+
+\triangleright
+
+Launch async all-reduce in background
+
+30:
+
+if
+
+\mathrm{isFinished}(\Delta^{(t-1)})
+
+then
+
+31:
+
+\mathrm{outerOpt}.\text{step}(\theta^{(g)},\;\Delta^{(\mathrm{t-1})})
+
+\triangleright
+
+Apply global update of previous iteration
+
+32:
+
+\theta^{(p)}\leftarrow\theta^{(g)}
+
+33:
+
+if
+
+\mathrm{newComerHasJoined}
+
+then
+
+34:
+
+\mathcal{C}.\texttt{syncSharedState}(\theta^{(g)},\texttt{sendOnly})
+
+\triangleright
+
+Provide result of previous all-reduce
+
+35:
+
+end
+
+if
+
+36:
+
+else
+
+37:
+
+if
+
+\mathrm{selfIsNew}
+
+then
+
+38:
+
+\mathcal{C}.\texttt{syncSharedState}(\theta^{(g)},\texttt{receiveOnly})
+
+\triangleright
+
+Obtain result of previous all-reduce
+
+39:
+
+end
+
+if
+
+40:
+
+\theta^{(p)}\leftarrow\theta^{(g)}
+
+41:
+
+end
+
+if
+
+42:
+
+end
+
+for
+
+4
+Implementation Details
+
+4.1
+All-Reduce Implementation
+
+Below is pseudo-code for the ring-based All-Reduce operation in PCCL.
+PCCL implements an
+N-1
+formulation of a pipelined ring-reduce, where
+N
+represents the world-size.
+
+Algorithm 5
+
+Ring-Based All-Reduce (High-Level Pseudo-Code)
+
+1:
+
+Input:
+
+2:
+
+buffer
+: Local array/tensor of size
+N
+
+3:
+
+data_type
+: Element type (e.g.,
+float32
+)
+
+4:
+
+reduce_op
+: Reduction operator (e.g.
+Sum
+)
+
+5:
+
+rank
+: This peer’s index in
+[0..\text{world\_size}-1]
+
+6:
+
+world_size
+: Total number of peers
+
+7:
+
+ring_order
+: Order of ranks in the ring
+
+8:
+
+Output:
+
+9:
+
+buffer
+: Overwritten so that all peers share the fully reduced result
+
+10:
+
+N\leftarrow\text{length}(\texttt{buffer})
+
+11:
+
+chunkBoundaries
+
+\leftarrow\textsc{ComputeChunkBoundaries}(N,\texttt{world\_size})
+
+\triangleright
+
+\texttt{chunkBoundaries}[r]=(start\_idx,end\_idx)
+
+12:
+
+(\texttt{selfStart},\texttt{selfEnd})\leftarrow\texttt{chunkBoundaries}[\texttt{rank}]
+
+13:
+
+(\texttt{buffer\_bak})\leftarrow\texttt{clone(buffer)}
+
+\triangleright
+
+Phase 1: Reduce-Scatter
+
+14:
+
+for
+
+\texttt{step}\leftarrow 0
+
+to
+
+(\texttt{world\_size}-2)
+
+do
+
+15:
+
+\texttt{txChunk}\leftarrow(\texttt{rank}-\texttt{step})\bmod\texttt{world\_size}
+
+16:
+
+\texttt{rxChunk}\leftarrow(\texttt{rank}-\texttt{step}-1)\bmod\texttt{world\_size}
+
+17:
+
+(txStart,txEnd)\leftarrow\texttt{chunkBoundaries}[\texttt{txChunk}]
+
+18:
+
+(rxStart,rxEnd)\leftarrow\texttt{chunkBoundaries}[\texttt{rxChunk}]
+
+19:
+
+\texttt{txSpan}\leftarrow\texttt{buffer}[txStart:txEnd]
+
+20:
+
+\texttt{rxSpan}\leftarrow\texttt{buffer}[rxStart:rxEnd]
+
+21:
+
+\textsc{runReduceStage}(\texttt{txSpan},\texttt{rxSpan},\texttt{reduce\_op},\dots)
+
+\triangleright
+Sends txSpan, receives another chunk, accumulates into rxSpan
+
+22:
+
+if
+
+operation aborted or I/O failure
+
+then
+
+23:
+
+\texttt{buffer}\leftarrow\texttt{buffer\_bak}
+
+\triangleright
+Restore buffer to pre-operation state
+
+24:
+
+HandleAbortAndReturn
+()
+
+25:
+
+end
+
+if
+
+26:
+
+end
+
+for
+\triangleright
+
+Phase 2: Reduce-Gather
+
+27:
+
+\texttt{currentChunk}\leftarrow(\texttt{rank}+1)\bmod\texttt{world\_size}
+
+28:
+
+for
+
+\texttt{step}\leftarrow 0
+
+to
+
+(\texttt{world\_size}-2)
+
+do
+
+29:
+
+(txStart,txEnd)\leftarrow\texttt{chunkBoundaries}[\texttt{currentChunk}]
+
+30:
+
+\texttt{txSpan}\leftarrow\texttt{buffer}[txStart:txEnd]
+
+31:
+
+\texttt{incChunk}\leftarrow(\texttt{currentChunk}-1+\texttt{world\_size})\bmod\texttt{world\_size}
+
+32:
+
+(rxStart,rxEnd)\leftarrow\texttt{chunkBoundaries}[\texttt{incChunk}]
+
+33:
+
+\texttt{rxSpan}\leftarrow\texttt{buffer}[rxStart:rxEnd]
+
+34:
+
+\textsc{runAllgatherStage}(\texttt{txSpan},\texttt{rxSpan},\dots)
+
+\triangleright
+Broadcast local chunk, receive next chunk into rxSpan
+
+35:
+
+if
+
+operation aborted or I/O failure
+
+then
+
+36:
+
+\texttt{buffer}\leftarrow\texttt{buffer\_bak}
+
+\triangleright
+Restore buffer to pre-operation state
+
+37:
+
+HandleAbortAndReturn
+()
+
+38:
+
+end
+
+if
+
+39:
+
+\texttt{currentChunk}\leftarrow\texttt{incChunk}
+
+\triangleright
+Take ownership of newly received chunk for next step
+
+40:
+
+end
+
+for
+\triangleright
+
+Finalize, e.g. apply averaging if reduce_op =
+Avg
+
+41:
+
+\textsc{finalizeReduction}(\texttt{buffer},\texttt{reduce\_op},\texttt{world\_size})
+
+Algorithm 6
+
+runReduceStage/runAllgatherStage (structural view)
+
+1:
+
+function
+
+runReduceStage/runAllgatherStage
+(
+txSpan
+,
+\triangleright
+data to send
+
+rxSpan
+,
+\triangleright
+where to accumulate
+
+recvBuf
+,
+\triangleright
+temporary receive buffer
+
+tag
+,
+seqNr
+,
+
+op
+,
+
+quantEnabled
+,
+
+rank
+,
+worldSize
+,
+ringOrder
+,
+
+masterSocket
+,
+
+peerTx
+,
+peerRx
+)
+
+2:
+
+\triangleright
+Identify next/prev peers in the ring
+
+3:
+
+\mathit{txPeer}\leftarrow(\mathit{rank}+1)\bmod\mathit{worldSize}
+
+4:
+
+\mathit{rxPeer}\leftarrow(\mathit{rank}-1+\mathit{worldSize})\bmod\mathit{worldSize}
+
+5:
+
+if
+
+quantEnabled
+
+then
+
+\triangleright
+Exchange quantization metadata if enabled
+
+6:
+
+sendMeta(
+peerTx
+,
+tag
+,
+seqNr
+)
+
+7:
+
+\textit{meta}\leftarrow receiveMeta(\texttt{peerRx},\,\texttt{tag},\,\texttt{seqNr})
+
+8:
+
+if
+abort signaled via
+masterSocket
+
+then
+
+9:
+
+return
+
+(fail, aborted)
+
+10:
+
+end
+
+if
+
+11:
+
+end
+
+if
+\triangleright
+Full-duplex chunked send/recv loop
+
+12:
+
+\mathit{doneSend}\leftarrow\texttt{false},\;\mathit{doneRecv}\leftarrow\texttt{false}
+
+13:
+
+while
+
+\neg(\mathit{doneSend}\,\wedge\,\mathit{doneRecv})
+
+do
+
+14:
+
+try_send_next_chunk(
+peerTx
+,
+txSpan
+,
+seqNr
+)
+
+15:
+
+try_recv_next_chunk(
+peerRx
+,
+recvBuf
+,
+seqNr
+)
+
+16:
+
+if new full chunk arrived
+then
+
+17:
+
+reduce_or_write_into(
+rxSpan
+,
+recvBuf
+,
+op
+)
+
+18:
+
+\texttt{abortReceived}\leftarrow\texttt{masterSocket.recvQueue}.pop()
+
+\triangleright
+Periodically check
+masterSocket
+for abort (no IO overhead)
+
+19:
+
+if
+
+abortReceived
+
+then
+
+20:
+
+return
+
+(success, aborted)
+
+21:
+
+end
+
+if
+
+22:
+
+end
+
+while
+
+23:
+
+return
+
+(success, not_aborted)
+
+24:
+
+end
+
+function
+
+Overview of Steps.
+
+1.
+
+Compute Chunk Boundaries.
+Partition the tensor into
+world_size
+slices.
+
+2.
+
+Reduce-Scatter Phase.
+Each rank progressively sends (and receives) slices and accumulates the incoming data into its local buffer using the chosen
+reduce_op
+. After
+\texttt{world\_size}-1
+iterations, each rank "owns" exactly one fully reduced chunk.
+
+3.
+
+Reduce-Gather Phase.
+Each rank broadcasts its reduced chunk around the ring until all peers obtain the entire reduced tensor.
+
+4.
+
+Finalize Reduction.
+If the requested operation is
+Avg
+, each element in the final buffer is divided by
+world_size
+. For
+Sum
+,
+Max
+, etc. this step is either a no-op or a simple transform.
+
+Conceptually, it consists of:
+
+1.
+
+Reduce-Scatter Phase:
+each rank accumulates the partial sums for one slice of the tensor.
+
+2.
+
+Reduce-Gather Phase:
+each rank then broadcasts its completed slice so that all ranks share the final result.
+
+If at any point an IO failure occurs, the operation is aborted and unwinds and restores the buffer to its pre-operation state.
+
+During the reduce-scatter phase, each rank sends and receives a subset of the data to reduce while periodically checking the
+masterSocket
+for abort signals.
+It is crucial that the abort checking does not induce any additional IO overhead and the corresponding IO operations are performed asynchronously.
+We can achieve this check to be largely free as the master connection is a separate TCP stream and the abort signal is pushed from a separate thread.
+
+5
+Implementation Challenges
+
+5.1
+Socket Implementation Behavior
+
+PCCL targets TCP/IP for use over the public internet.
+OS-level socket APIs however often differ drastically between operating systems.
+Socket header compatibility can often be non-existent, requiring different error handling (e.g on WSA, which
+differs drastically from more traditional BSD-style socket implementations) or workarounds for lack of features.
+Beyond header incompatibility, socket implementations can often differ drastically in behavior, making it challenging to make tight assertions on behavior within the bounds of the implementation’s stated and soft guarantees. This is especially true with respect to blocking/unblocking behavior of functions like
+recv()
+in response to
+close()
+and
+shutdown()
+calls,
+half-close drain behavior differing on Windows, and other subtle differences.
+We thus relied on extensive CI testing and long-running stress testing simulating extreme conditions of peer churn to validate behavior and to guide design decisions.
+During the course of development, we have observed numerous quirks about socket implementation behavior in containerization platforms like Docker
+and in some cases even what we believe to be bugs in the XNU kernel with respect to send buffer exhaustion handling.
+
+5.2
+Threadpark
+
+To saturate full-duplex links, dedicated send and receive threads are used per connection.
+However, C++ synchronization primitives such as condition variables proved insufficient in terms of wake-up latency.
+We thus implemented a custom library
+threadpark
+which allows easy implementation of low-latency wake-up systems and lock-free data-structures.
+To ensure high-throughput and low-latency,
+threadpark
+uses futex-like apis on all major operating systems (Linux, macOS, Windows, FreeBSD & OpenBSD).
+This includes Linux’s
+futex
+, macOS’s
+__ulock_wait
+and Windows’s
+WakeByAddressSingle
+.
+
+5.3
+Zero-Copy, Bit-wise deterministic, Interruptable, Pipelined, Quantized, Asynchronous & Concurrent Collective Commmunications
+
+PCCL implements zero-copy, interruptable pipelined collective communications operations, where user-provided buffers (i.e PyTorch tensor storage buffers) are referenced directly by the resulting
+send()
+socket operations.
+
+As PCCL must unwind correctly from any IO failure without leaving the system in an inconsistent state or causing undefined behavior,
+special care must be taken with respect to
+
+•
+
+Propagating via explicit means localized failure conditions such that all peers can react
+
+•
+
+Discarding partial data attributed to aborted operations with minimal protocol state
+
+•
+
+Phrasing the main algorithm such to allow for concurrent polling of state changes propagated via the master without performance degradation
+
+The multi-threaded nature of the algorithm paired with a strictly necessary zero-malloc policy for the reduce code path
+necessitated a custom caching allocator to provide the conceptual benefits of dynamic memory allocation without the performance penalties associated with the use of standard
+malloc()
+and
+free()
+calls and page faults caused by lazy initialization of pages by a first-touch
+memcpy()
+call.
+
+5.3.1
+Bit-wise Determinism
+
+It is well known that a pipelined ring-reduce produces bit-wise deterministic results on all peers given that the share phase propagates the owned subsets of respective peers to all other peers without modification.
+
+However, for most quantization functions that are used in ML training
+D(Q(x))\neq x
+, meaning that the quantization function
+Q(x)
+and the dequantization function
+D(x)
+are not perfect inverses to each other.
+
+Additionally, each peer has access to higher precision data of the subset of data that is its contribution.
+For the sake of bit-wise determinism, we cannot make use of the additional precision beyond what can be recovered from dequantization of the data that a peer sends.
+Not doing so would result in "lingering" precision present in the fully reduced result of a peer’s contribution that is not present on the respective other peers.
+However, because accumulation takes place in higher precision than the received quantized data, the argument can be made that as world size grows, we get a better approximation of the true sum and it is thus not necessary to cling to this precision.
+
+5.4
+Determinism of NVIDIA PTX Intrinsics
+
+To facilitate deterministic advancement of the shared state based on collective operations, it is important to be aware of the kernels invoked in the outer optimizer step.
+If the implementation of numerics differs between peers due to different hardware, advancement of the shared state would be non-deterministic.
+GPUs are known to be non-deterministic due to their parallel nature, but as long as no true GPU indeterminism is introduced when memory is shared across threads in an inherently race-prone manner,
+each thread can be made to execute the same code and produce the same result.
+
+NVIDIA provides a sometimes broken, soft guarantee of forward compatibility of PTX code across different generations of hardware - however not necessarily that
+those instructions will behave identically across different generations of hardware.
+With the exception of some early PTX 1.1 ISA removals (e.g.
+cross
+,
+dot
+,
+mag
+and
+vred
+)
+(
+NVIDIA, 2011
+)
+-
+which were never emitted by any compiler - and the removal of no-sync
+shfl
+/
+vote
+instructions in PTX 6.4
+(
+NVIDIA, 2019
+)
+,
+most PTX code is generally forward-assemblable.
+Additionally, NVIDIA’s newly introduced
+sm_XXXa
+compilation target specifically targets architecture-specific features and
+sm_XXXf
+targets features that are family-specific
+(
+NVIDIA, 2020
+)
+.
+Additionally, some intrinsics like
+__nv_expf
+are not real PTX instructions, but are implemented in
+libdevice
+, which is an LLVM bitcode module.
+Here behavior could either change through changes in
+libdevice
+or changes in the ISA implementation across different architectures.
+Despite this increased surface area, we confirm
+__nv_expf
+behaves identically on
+sm_52
+(GTX 980 Ti),
+sm_61
+(GTX 1060),
+sm_89
+(RTX 4090),
+sm_90
+(GH 200),
+sm_100
+(B200), as determined by hashing the output bits of
+__nv_expf
+across all 2
+32
+bit-patterns of float.
+
+A.2
+
+Due to this result, we can be confident in a defacto guarantee of cross-architecture bit-wise determinism for the
+__nv_expf
+intrinsic and likely many other NVIDIA libdevice/PTX intrinsics.
+
+6
+Benchmarks
+
+6.1
+HPC Benchmark
+
+The following benchmark compares the implementation agnostic reduce throughput of PCCL to that of Gloo
+(
+PyTorch, 2017
+)
+, as computed by the size of the reduce contribution of one peer divided by the time it takes to reduce across all ranks.
+Note that this value is not a measurement of actual communication performed, but rather a way to compare the relative performance of the two libraries in an implementation agnostic manner.
+While PCCL does not specifically specialize for high-speed networks, PCCL remains competitive with Gloo.
+It should be noted that PCCL’s abortable design places PCCL at a disadvantage compared to Gloo, as PCCL must perform many futex syscalls during the course of performing a collective operation.
+Thus PCCL is more sensitive to OS scheduler-induced latencies and achieved throughput is therefore subject to higher variance.
+Future versions of PCCL may address these issues.
+
+2
+3
+4
+5
+6
+7
+8
+0
+500
+1{,}000
+1{,}500
+2{,}000
+World Size
+Reduce Throughput (MB/s)
+Gloo
+PCCL
+
+The experiment was conducted on eight nodes with approximately 35.6 GBit/s of achievable Ethernet bandwidth over a single connection while reducing
+1024\cdot 1024\cdot 256\cdot 4
+= 1.073 GB of data per peer.
+
+6.2
+Effect of Multiple Connections over WAN
+
+On the public Internet, opening multiple simultaneous connections can dramatically boost achievable bandwidth. TCP’s receive-window auto-scaling on high-latency, high-bandwidth WAN links rarely reaches the peak speed that brute-forcing a single connection can achieve—and disabling auto-scaling altogether almost always makes performance worse.
+Moreover, many routers use per-flow fair-queuing. By running several parallel streams, one can effectively “carve out” extra bandwidth slices that a single flow alone wouldn’t receive under strict per-flow fairness.
+Multiple concurrent all reduces can thus dispatch to multiple concurrent connections of the PCCL p2p connection pool, resulting in a higher bandwidth utilization.
+This assumption holds for modern ML training given that multiple parameter tensors can be reduced independently,
+or potentially even chunked beyond that for element-wise reduction operations.
+When performing multiple concurrent all reduces, the effective reduce throughput is computed as the sum of the sizes of the reduce contributions of a particular peer divided by the time it takes for all all reduces to complete.
+
+As an example, when measuring the total throughput (RX+TX) as a function of number of connections with
+iperf3
+, we observe the following scaling from
+europe-west1-b
+to
+europe-west2-b
+:
+
+0
+5
+10
+15
+20
+25
+30
+35
+0
+20
+40
+60
+Number of Concurrent Connections
+Throughput GBit/s (RX+TX)
+
+This effect is even more pronounced for cross-continental connections, as shown in the following figure:
+0
+20
+40
+60
+80
+100
+120
+0
+20
+40
+Number of Concurrent Connections
+Throughput (Gbit/s, TX+RX)
+
+This behavior is not exclusive to Google Cloud’s
+Tier_1
+networking tier, but can also be observed with many other providers.
+For example, when measuring the throughput from Nebius (Helsinki, Finland) to Voltage Park (Dallas, Texas) with
+iperf3
+, we observe the following scaling:
+
+0
+20
+40
+60
+80
+100
+120
+140
+160
+0
+20
+40
+Number of Concurrent Connections
+Throughput (Gbit/s, TX+RX)
+
+Cross-continental connections in North America behave similarly (
+us-west1-b
+to
+us-east1-d
+):
+0
+20
+40
+60
+80
+100
+0
+20
+40
+60
+Number of Concurrent Connections
+Throughput (Gbit/s, TX+RX)
+
+6.3
+WAN All Reduce Benchmarks
+
+6.3.1
+Experiment 1: All Reduce Across North America and Europe
+
+In this experiment, we all reduce 1.073 GB of data across 18 nodes in North America and Europe.
+The nodes are connected via Google Cloud’s
+Tier_1
+networking performance tier which uses close to optimal BGP routes between regions.
+
+1024\cdot 1024\cdot 256=268,435,456
+32-bit float values are reduced without quantization or compression.
+The all reduce takes 90.5 seconds to complete, resulting in an implementation agnostic reduce throughput of 11.85 MB/s computed as the size of the reduce contribution of one peer divided by the time it takes to reduce across all ranks.
+The bandwidth utilization per peer (TX + RX bytes transmitted per second) is 358.4 Mbit/s.
+It should be noted that this experiment is fatally bottlenecked by the hop over the respective undersea cable connecting the US and Europe.
+
+Figure 2:
+All Reduce Across North America and Europe
+
+Table 1:
+All Reduce Peers and their respective locations
+
+Peer
+
+Region
+
+Location
+
+North America
+
+peer-01
+
+us-west1-b
+
+The Dalles, Oregon
+
+peer-02
+
+us-south1-c
+
+Dallas, Texas
+
+peer-03
+
+us-east1-d
+
+Moncks Corner, South Carolina
+
+peer-04
+
+us-central1-c
+
+Council Bluffs, Iowa
+
+peer-10
+
+northamerica-northeast1-a
+
+Montréal, Québec
+
+peer-11
+
+northamerica-northeast2-b
+
+Toronto, Ontario
+
+peer-12
+
+us-central1-c
+
+Council Bluffs, Iowa
+
+peer-14
+
+us-west1-b
+
+The Dalles, Oregon
+
+peer-15
+
+us-south1-c
+
+Dallas, Texas
+
+peer-16
+
+us-east4-a
+
+Ashburn, Virginia
+
+peer-17
+
+us-east1-d
+
+Moncks Corner, South Carolina
+
+peer-18
+
+us-east4-a
+
+Ashburn, Virginia
+
+Europe
+
+peer-05
+
+europe-west3-c
+
+Frankfurt, Germany
+
+peer-06
+
+europe-west9-b
+
+Paris, France
+
+peer-07
+
+europe-west1-b
+
+St. Ghislain, Belgium
+
+peer-08
+
+europe-west2-b
+
+London, United Kingdom
+
+peer-09
+
+europe-west4-c
+
+Eemshaven, Netherlands
+
+peer-13
+
+europe-west1-b
+
+St. Ghislain, Belgium
+
+Metric
+
+Value
+
+World Size
+
+18
+
+Reduce Contribution
+
+1.073 GB
+
+Reduce Contribution Elements
+
+268,435,456 float32 values
+
+Reduce Time
+
+90.5 s
+\pm
+0.345s
+
+Effective Reduce Throughput
+
+11.85 MB/s
+
+Bandwidth Utilization
+
+358.4 Mbit/s
+
+Tx-Bytes per peer
+
+2.02818 GB
+
+Rx-Bytes per peer
+
+2.02818 GB
+
+Table 2:
+Performance Metrics
+
+6.3.2
+Experiment 1.1: Concurrent Connections North America+Europe
+
+When using multiple concurrent all reduce operations and dispatching to multiple connections, we observe the following scaling in the setting of the All Reduce North-America & Europe West experiment:
+
+Table 3:
+Summary: All-Reduce Performance (Europe West, 6 nodes)
+
+# CON
+
+Time (s ± s)
+
+eff. TPT (GB/s)
+
+TX+RX
+
+BW (Gbit/s)
+
+TX+RX/peer (GB)
+
+128
+
+10.726
+\pm
+1.315
+
+0.800
+
+24.54
+\pm
+2.923
+
+32.45
+
+100
+
+10.046
+\pm
+3.563
+
+0.667
+
+21.70
+\pm
+4.774
+
+25.35
+
+64
+
+11.338
+\pm
+1.870
+
+0.379
+
+11.73
+\pm
+1.854
+
+16.22
+
+32
+
+7.614
+\pm
+0.608
+
+0.282
+
+8.57
+\pm
+0.654
+
+8.11
+
+16
+
+9.900
+\pm
+2.511
+
+0.108
+
+3.43
+\pm
+0.664
+
+4.05
+
+8
+
+4.356
+\pm
+0.474
+
+0.123
+
+1.88
+\pm
+0.207
+
+1.01
+
+0
+20
+40
+60
+80
+100
+120
+140
+0
+10
+20
+30
+Number of Concurrent Connections
+Bandwidth Utilization (Gbit/s)
+
+Metric
+
+Value
+
+Number of Peers
+
+18
+
+Reduce Contribution per Reduce Operation
+
+64 MiB
+
+Number of Reduce Operations
+
+{ 8, 16, 32, 64, 100, 128 }
+
+Max Number of Concurrent Reduce Operations
+
+{ 8, 16, 32, 64, 100, 128 }
+
+P2P Connection Pool Size
+
+{ 8, 16, 32, 64, 100, 128 }
+
+Table 4:
+Concurrent All-Reduce Experiment Details
+
+6.4
+Experiment 2: All Reduce Across North America
+
+Experiment 2 is a reduced version of Experiment 1, where we all reduce 1.073 GB of data across 12 nodes in North America.
+
+Figure 3:
+All Reduce Across North America
+
+Table 5:
+All Reduce Peers and their respective locations
+
+Peer
+
+Region
+
+Location
+
+North America
+
+peer-01
+
+us-west1-b
+
+The Dalles, Oregon
+
+peer-02
+
+us-south1-c
+
+Dallas, Texas
+
+peer-03
+
+us-east1-d
+
+Moncks Corner, South Carolina
+
+peer-04
+
+us-central1-c
+
+Council Bluffs, Iowa
+
+peer-05
+
+northamerica-northeast1-a
+
+Montréal, Québec
+
+peer-06
+
+northamerica-northeast2-b
+
+Toronto, Ontario
+
+peer-07
+
+us-central1-c
+
+Council Bluffs, Iowa
+
+peer-08
+
+us-west1-b
+
+The Dalles, Oregon
+
+peer-09
+
+us-south1-c
+
+Dallas, Texas
+
+peer-10
+
+us-east4-a
+
+Ashburn, Virginia
+
+peer-11
+
+us-east1-d
+
+Moncks Corner, South Carolina
+
+peer-12
+
+us-east4-a
+
+Ashburn, Virginia
+
+Metric
+
+Value
+
+World Size
+
+12
+
+Reduce Contribution
+
+1.073 GB
+
+Reduce Contribution Elements
+
+268,435,456 float32 values
+
+Reduce Time
+
+35.2 s
+\pm
+0.306s
+
+Effective Reduce Throughput
+
+30.48 MB/s
+
+Bandwidth Utilization
+
+897.616 Mbit/s
+
+Tx-Bytes per peer
+
+1.9685 GB
+
+Rx-Bytes per peer
+
+1.9685 GB
+
+Table 6:
+Performance Metrics
+
+6.4.1
+Experiment 2.1: Concurrent Connections North America
+
+When using multiple concurrent all reduce operations and dispatching to multiple connections, we observe the following scaling in the setting of the All Reduce North-America experiment.
+
+Table 7:
+Summary: All-Reduce Performance (North America, 12 nodes)
+
+# CON
+
+Time (s ± s)
+
+eff. TPT (GB/s)
+
+TX+RX
+
+BW (Gbit/s)
+
+TX+RX/peer (GB)
+
+128
+
+9.419
+\pm
+1.753
+
+0.911
+
+27.57
+\pm
+4.822
+
+31.49
+
+64
+
+4.894
+\pm
+0.597
+
+0.878
+
+26.08
+\pm
+2.948
+
+15.74
+
+32
+
+3.350
+\pm
+0.179
+
+0.641
+
+18.85
+\pm
+0.997
+
+7.87
+
+16
+
+3.572
+\pm
+0.705
+
+0.299
+
+9.01
+\pm
+0.125
+
+3.93
+
+8
+
+3.227
+\pm
+0.564
+
+0.166
+
+4.88
+\pm
+0.010
+
+1.96
+
+0
+20
+40
+60
+80
+100
+120
+140
+10
+20
+30
+Number of Concurrent Connections
+Bandwidth Utilization (Gbit/s)
+
+Metric
+
+Value
+
+Number of Peers
+
+12
+
+Reduce Contribution per Reduce Operation
+
+64 MiB
+
+Number of Reduce Operations
+
+{ 8, 16, 32, 64, 128 }
+
+Max Number of Concurrent Reduce Operations
+
+{ 8, 16, 32, 64, 128 }
+
+P2P Connection Pool Size
+
+{ 8, 16, 32, 64, 128 }
+
+Table 8:
+Concurrent All-Reduce Experiment Details
+
+6.5
+Experiment 3: All Reduce Europe West
+
+In this experiment we all reduce 1.073 GB of data across 6 nodes in western Europe - analogous to Experiment 3 of the previous section - while scaling the number of concurrent all reduce operations.
+
+Figure 4:
+All Reduce Europe West
+
+Table 9:
+All Reduce Peers and their respective locations
+
+Peer
+
+Region
+
+Location
+
+Europe
+
+peer-01
+
+europe-west3-c
+
+Frankfurt, Germany
+
+peer-02
+
+europe-west9-b
+
+Paris, France
+
+peer-03
+
+europe-west1-b
+
+St. Ghislain, Belgium
+
+peer-04
+
+europe-west2-b
+
+London, United Kingdom
+
+peer-05
+
+europe-west4-c
+
+Eemshaven, Netherlands
+
+peer-06
+
+europe-west1-b
+
+St. Ghislain, Belgium
+
+Metric
+
+Value
+
+World Size
+
+6
+
+Reduce Contribution
+
+1.073 GB
+
+Reduce Contribution Elements
+
+268,435,456 float32 values
+
+Reduce Time
+
+8.3 s
+\pm
+0.328s
+
+Effective Reduce Throughput
+
+129.2 MB/s
+
+Bandwidth Utilization
+
+3.6704 Gbit/s
+
+Tx-Bytes per peer
+
+1.7895 GB
+
+Rx-Bytes per peer
+
+1.7895 GB
+
+6.5.1
+Experiment 3.1: Concurrent Connections Europe West
+
+When using multiple concurrent all reduce operations and dispatching to multiple connections, we observe the following scaling in the setting of the Europe-West experiment:
+
+Table 10:
+Summary: All-Reduce Performance (Europe West, 6 nodes)
+
+# CON
+
+Time (s ± s)
+
+eff. TPT (GB/s)
+
+TX+RX
+
+BW (Gbit/s)
+
+TX+RX/peer (GB)
+
+128
+
+5.066
+\pm
+0.560
+
+1.694
+
+45.74
+\pm
+5.265
+
+28.63
+
+100
+
+4.136
+\pm
+0.757
+
+1.622
+
+44.55
+\pm
+7.733
+
+22.36
+
+64
+
+2.596
+\pm
+0.233
+
+1.655
+
+44.47
+\pm
+3.964
+
+14.31
+
+32
+
+1.684
+\pm
+0.167
+
+1.275
+
+34.29
+\pm
+3.127
+
+9.21
+
+16
+
+1.602
+\pm
+0.219
+
+0.669
+
+18.17
+\pm
+2.321
+
+5.04
+
+8
+
+1.292
+\pm
+0.159
+
+0.415
+
+11.25
+\pm
+1.398
+
+3.11
+
+0
+20
+40
+60
+80
+100
+120
+140
+10
+20
+30
+40
+50
+Number of Concurrent Connections
+Bandwidth Utilization (Gbit/s)
+
+Metric
+
+Value
+
+Number of Peers
+
+12
+
+Reduce Contribution per Reduce Operation
+
+64 MiB
+
+Number of Reduce Operations
+
+{ 8, 16, 32, 64, 128 }
+
+Max Number of Concurrent Reduce Operations
+
+{ 8, 16, 32, 64, 128 }
+
+P2P Connection Pool Size
+
+{ 8, 16, 32, 64, 128 }
+
+Table 11:
+Concurrent All-Reduce Experiment Details
+
+6.6
+Comparisons with Gloo (without VPN over WAN)
+
+It should be noted that Gloo is not designed to operate over the public internet, however given that all of our nodes have internal IP addresses assigned by our cloud provider, we can measure
+Gloo’s performance over the public internet without the overhead of a client-side software VPN.
+For this comparison, we replicate the Experiments 1, 2 and 3 with Gloo on the same nodes.
+Across the board, we observe a gap in performance of Gloo compared to PCCL, which we attribute to lack of topology optimization, resulting in a naive rank launching order propagating into a suboptimal ring order.
+
+Table 12:
+Comparison of reduce time between PCCL and Gloo
+
+Experiment
+
+PCCL Time (s)
+
+Gloo Time (s)
+
+Improvement (%)
+
+1.
+North America + Europe
+
+90.50
+\pm
+0.35
+
+94.44
+\pm
+1.84
+
+4.15%
+
+2.
+North America
+
+35.20
+\pm
+0.31
+
+37.58
+\pm
+0.85
+
+6.33%
+
+3.
+Europe
+
+8.30
+\pm
+0.33
+
+9.67
+\pm
+0.77
+
+14.17%
+
+Table 13:
+Comparison of effective throughput between PCCL and Gloo
+
+Experiment
+
+PCCL eff. TPT (MB/s)
+
+Gloo eff. TPT (MB/s)
+
+1.
+North America + Europe
+
+11.85
+
+11.37
+
+2.
+North America
+
+30.48
+
+28.82
+
+3.
+Europe
+
+129.20
+
+113.66
+
+It should be noted that Gloo does not natively support concurrent all-reduce operations and can thus not effectively utilize the most crucial trick to maximize throughput over the public internet.
+
+7
+Related Work
+
+Gloo
+(
+PyTorch, 2017
+)
+
+Gloo is a collective library optimized for on-premise co-located clusters. Because it assumes full peer reachability over a secure local network, it cannot natively be used over the public internet without employing a VPN. This significantly holds back Gloo in this regard and is a major reason why PCCL was developed.
+This was our approach for INTELLECT-1
+(
+Jaghouar et al., 2024
+)
+, which resulted infrastructure that required heavy manual intervention/on-boarding steps instead of an automatically handled, robust join procedure.
+
+Hivemind
+(
+Ryabinin et al., 2020
+)
+
+Hivemind is a decentralized collective communication and training framework built on top of PyTorch that uses a gossip-based peer sampling service and a distributed hash table (DHT) for peer discovery and parameter exchange. Unlike PCCL’s master–client micro-consensus model, Hivemind operates in a fully decentralized fashion: peers form dynamic shards via Rendezvous hashing, performing asynchronous, compressed all-reduce rounds within each shard. Hivemind employs gradient compressors (e.g., Top-K sparsification, signSGD) with error-feedback loops to reduce bandwidth, and relies on best-effort RPC (e.g., gRPC) and timeouts to handle peer churn. This design allows flexible on/off-ramping of workers without global coordination, but sacrifices strict synchronization: collective results converge only eventually rather than bit-exactly, making deterministic state progression across heterogeneous hardware unattainable.
+
+Horovod + Elastic
+
+Elastic Horovod extends Horovod’s
+(
+Sergeev and Balso, 2018
+)
+MPI/Gloo collectives with a Python-level rendezvous and in-memory rollback API that lets workers join or depart without a full job restart. Horovod+Elastic drives recovery from failed collective operations through Python exceptions via an explicit rollback. While this makes moderate-scale elasticity easy to script, it also:
+
+•
+
+Incurs non-trivial latency from rollbacks and recovery (potentially seconds)
+
+•
+
+Relies on application-level checkpoint hooks rather than a low-level micro-consensus, leaving subtle failure paths largely unexercised,
+
+•
+
+Does not guarantee bit-identical state across ranks — merely logical equivalence via user-supplied state objects.
+
+In contrast, PCCL is fault tolerant in and of itself as opposed to wrapping an inherently non-fault tolerant lower-level library, uses a fine-grained consensus protocol, facilitating a design where possible error paths are enumerable and testable, and can enforce bit-exact shared-state progression purely from collective-op results. PCCL’s error paths in comparison are roughly equally fast as the success paths and do not require dedicated rollback mechanisms.
+
+8
+Practical Implications
+
+With PCCL’s strong fault tolerance and dynamic membership, PCCL makes training on spot instances practically feasible.
+With only one non-spot instance, the run is guaranteed stable and loss of training state is impossible.
+Additionally, PCCL will allow for aggregation of compute resources across the internet with previously infeasible ease, resulting in less idle compute in underutilized data centers.
+Thus, Hybrid- and Multi-Cloud Training or even Edge and Federated Learning for less communication-intensive training workloads will be easy to orchestrate.
+In addition, PCCL’s shared state system implicitly protects model weights and optimizer state, where even if all peers have dropped from the training run, resumption will only be allowed from the previous shared state hash, which peers are expected to restore from local checkpoints. This categorically rules out training-dynamics inconsistencies introduced by restarts assuming an i.i.d data loader.
+
+9
+Conclusion
+
+In this work, we presented the Prime Collective Communications Library (
+PCCL
+), a novel, fault-tolerant collective communications library tailored for dynamic, wide-area distributed machine learning workloads. Unlike traditional MPI-derived libraries such as NCCL,
+PCCL
+natively supports peer churn through a master-client model and fine-grained micro-consensus, enabling peers to join or fail without restarting the entire training job. We detailed how
+PCCL
+maintains bit-identical shared state via parallel hashing and on-demand data transfer, optimizes ring topologies through p2p bandwidth measurements and ATSP solvers, and provides interruptible, zero-copy pipelined collectives. Through extensive stress tests across Linux, macOS, and Windows—subjecting the system to rapid peer churn and concurrent operations—and implementation-agnostic throughput benchmarks, we demonstrated that
+PCCL
+is both robust and competitive with existing libraries.
+Beyond the core library, we showed how
+PCCL
+enables the straightforward implementation of communication-efficient training algorithms such as DiLoCo and its asynchronous variant, further reducing bandwidth requirements and hiding communication latency behind compute. These examples illustrate
+PCCL
+’s versatility as a low-level primitive for both classical DDP and next-generation low-communication optimizers over unreliable or heterogeneous networks.
+We also aim to investigate adaptive synchronization schedules and incremental topology optimization driven by real-time telemetry. By lowering the barrier to resilient, internet-scale training,
+PCCL
+opens the door to new distributed ML workflows on spot instances and across geographically dispersed resources.
+
+Appendix A
+Appendix
+
+A.1
+SimpleHash vs Thrust
+
+In this section we compare the performance of SimpleHash memory-throughput to that of Thrust’s reduce kernels.
+
+2^{4}
+2^{5}
+2^{6}
+2^{7}
+2^{8}
+2^{9}
+2^{10}
+2^{11}
+0
+200
+400
+600
+800
+1{,}000
+Data Size (MB)
+Bandwidth (GB/s)
+SimpleHash (32-bit words)
+Thrust int32-reduce
+Theoretical max (1008.1 GB/s)
+
+Figure 5:
+RTX 4090: SimpleHash vs. Thrust int32 Reduction
+
+A.2
+Comparing behavior of
+__nv_expf
+across different architectures
+
+We compare the behavior of
+__nv_expf
+across different architectures using the following test which hashes the output bits of
+__nv_expf
+across all 2
+32
+bit-patterns of float.
+
+⬇
+
+#include
+
+<
+cstdio
+>
+
+#include
+
+<
+cstdint
+>
+
+#include
+
+<
+cuda_runtime
+.
+h
+>
+
+#include
+
+<
+cmath
+>
+
+__global__
+
+void
+
+testExpAndHash
+(
+unsigned
+
+long
+
+long
+*
+
+d_nan
+,
+
+unsigned
+
+long
+
+long
+*
+
+d_inf
+,
+
+unsigned
+
+long
+
+long
+*
+
+d_finite
+,
+
+unsigned
+
+long
+
+long
+*
+
+d_sumBits
+,
+
+unsigned
+
+int
+*
+
+d_xorBits
+)
+
+{
+
+const
+
+unsigned
+
+long
+
+long
+
+N
+
+=
+
+0
+x1ULL
+
+<<
+
+32;
+
+unsigned
+
+long
+
+long
+
+stride
+
+=
+
+gridDim
+.
+x
+
+*
+
+blockDim
+.
+x
+;
+
+unsigned
+
+long
+
+long
+
+idx
+
+=
+
+blockIdx
+.
+x
+
+*
+
+blockDim
+.
+x
+
++
+
+threadIdx
+.
+x
+;
+
+unsigned
+
+long
+
+long
+
+nanCt
+
+=
+
+0,
+
+infCt
+
+=
+
+0,
+
+finCt
+
+=
+
+0;
+
+unsigned
+
+long
+
+long
+
+sumBits
+
+=
+
+0;
+
+unsigned
+
+int
+
+xorBits
+
+=
+
+0;
+
+for
+
+(
+unsigned
+
+long
+
+long
+
+i
+
+=
+
+idx
+;
+
+i
+
+<
+
+N
+;
+
+i
+
++=
+
+stride
+)
+
+{
+
+float
+
+x
+
+=
+
+__uint_as_float
+((
+unsigned
+
+int
+)
+i
+);
+
+float
+
+y
+
+=
+
+expf
+(
+x
+);
+
+if
+
+(
+isnan
+(
+y
+))
+
+{
+
+nanCt
+++;
+
+}
+
+else
+
+if
+
+(
+isinf
+(
+y
+))
+
+{
+
+infCt
+++;
+
+}
+
+else
+
+{
+
+finCt
+++;
+
+}
+
+unsigned
+
+int
+
+ybits
+
+=
+
+__float_as_uint
+(
+y
+);
+
+sumBits
+
++=
+
+(
+unsigned
+
+long
+
+long
+)
+ybits
+;
+
+xorBits
+
+^=
+
+ybits
+;
+
+}
+
+atomicAdd
+(
+d_nan
+,
+
+nanCt
+);
+
+atomicAdd
+(
+d_inf
+,
+
+infCt
+);
+
+atomicAdd
+(
+d_finite
+,
+
+finCt
+);
+
+atomicAdd
+(
+d_sumBits
+,
+
+sumBits
+);
+
+atomicXor
+(
+d_xorBits
+,
+
+xorBits
+);
+
+}
+
+int
+
+main
+()
+
+{
+
+unsigned
+
+long
+
+long
+
+*
+d_nan
+,
+
+*
+d_inf
+,
+
+*
+d_finite
+,
+
+*
+d_sumBits
+;
+
+unsigned
+
+int
+
+*
+d_xorBits
+;
+
+cudaMalloc
+(&
+d_nan
+,
+
+sizeof
+(
+unsigned
+
+long
+
+long
+));
+
+cudaMalloc
+(&
+d_inf
+,
+
+sizeof
+(
+unsigned
+
+long
+
+long
+));
+
+cudaMalloc
+(&
+d_finite
+,
+
+sizeof
+(
+unsigned
+
+long
+
+long
+));
+
+cudaMalloc
+(&
+d_sumBits
+,
+
+sizeof
+(
+unsigned
+
+long
+
+long
+));
+
+cudaMalloc
+(&
+d_xorBits
+,
+
+sizeof
+(
+unsigned
+
+int
+));
+
+cudaMemset
+(
+d_nan
+,
+
+0,
+
+sizeof
+(
+unsigned
+
+long
+
+long
+));
+
+cudaMemset
+(
+d_inf
+,
+
+0,
+
+sizeof
+(
+unsigned
+
+long
+
+long
+));
+
+cudaMemset
+(
+d_finite
+,
+
+0,
+
+sizeof
+(
+unsigned
+
+long
+
+long
+));
+
+cudaMemset
+(
+d_sumBits
+,
+
+0,
+
+sizeof
+(
+unsigned
+
+long
+
+long
+));
+
+cudaMemset
+(
+d_xorBits
+,
+
+0,
+
+sizeof
+(
+unsigned
+
+int
+));
+
+const
+
+int
+
+threadsPerBlock
+
+=
+
+256;
+
+const
+
+int
+
+blocks
+
+=
+
+1024;
+
+printf
+(
+"Launching
+␣
+%d
+␣
+blocks
+␣
+of
+␣
+%d
+␣
+threads\n"
+,
+
+blocks
+,
+
+threadsPerBlock
+);
+
+testExpAndHash
+<<<
+blocks
+,
+
+threadsPerBlock
+>>>(
+
+d_nan
+,
+
+d_inf
+,
+
+d_finite
+,
+
+d_sumBits
+,
+
+d_xorBits
+);
+
+cudaDeviceSynchronize
+();
+
+unsigned
+
+long
+
+long
+
+h_nan
+,
+
+h_inf
+,
+
+h_finite
+,
+
+h_sumBits
+;
+
+unsigned
+
+int
+
+h_xorBits
+;
+
+cudaMemcpy
+(&
+h_nan
+,
+
+d_nan
+,
+
+sizeof
+(
+h_nan
+),
+
+cudaMemcpyDeviceToHost
+);
+
+cudaMemcpy
+(&
+h_inf
+,
+
+d_inf
+,
+
+sizeof
+(
+h_inf
+),
+
+cudaMemcpyDeviceToHost
+);
+
+cudaMemcpy
+(&
+h_finite
+,
+
+d_finite
+,
+
+sizeof
+(
+h_finite
+),
+
+cudaMemcpyDeviceToHost
+);
+
+cudaMemcpy
+(&
+h_sumBits
+,
+
+d_sumBits
+,
+
+sizeof
+(
+h_sumBits
+),
+
+cudaMemcpyDeviceToHost
+);
+
+cudaMemcpy
+(&
+h_xorBits
+,
+
+d_xorBits
+,
+
+sizeof
+(
+h_xorBits
+),
+
+cudaMemcpyDeviceToHost
+);
+
+cudaFree
+(
+d_nan
+);
+
+cudaFree
+(
+d_inf
+);
+
+cudaFree
+(
+d_finite
+);
+
+cudaFree
+(
+d_sumBits
+);
+
+cudaFree
+(
+d_xorBits
+);
+
+printf
+(
+"Results
+␣
+over
+␣
+all
+␣
+%llu
+␣
+float
+␣
+bit-patterns:\n"
+,
+
+total
+);
+
+printf
+(
+"NaN
+␣
+outputs:
+␣
+%llu\n"
+,
+
+h_nan
+);
+
+printf
+(
+"Inf
+␣
+outputs:
+␣
+%llu\n"
+,
+
+h_inf
+);
+
+printf
+(
+"Finite
+␣
+outputs:
+␣
+%llu\n"
+,
+
+h_finite
+);
+
+printf
+(
+"Sum
+␣
+check:
+␣
+%llu\n"
+,
+
+h_nan
+
++
+
+h_inf
+
++
+
+h_finite
+);
+
+printf
+(
+"Output-bits
+␣
+hash:\n"
+);
+
+printf
+(
+"Sum
+␣
+of
+␣
+bits:
+␣
+%llu\n"
+,
+
+h_sumBits
+);
+
+printf
+(
+"XOR
+␣
+of
+␣
+bits:
+␣
+0x%08X\n"
+,
+
+h_xorBits
+);
+
+return
+
+0;
+
+}
+
+This results in the following output on all tested architectures:
+
+Results over all 4294967296 float bit-patterns:
+NaN outputs: 16777214
+Inf outputs: 1020169705
+Finite outputs: 3258020377
+Sum check: 4294967296
+Output-bits hash:
+Sum of bits: 4602279786742895247
+XOR of bits: 0x45ABDA35
+
+Architectures tested:
+
+•
+
+GTX 980 Ti (sm_52)
+
+•
+
+GTX 1060 (sm_61)
+
+•
+
+RTX 4090 (sm_89)
+
+•
+
+GH 200 (sm_90)
+
+•
+
+B200 (sm_100)
+
