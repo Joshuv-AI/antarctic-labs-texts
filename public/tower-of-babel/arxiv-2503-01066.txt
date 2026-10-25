@@ -1,0 +1,1644 @@
+Alchemist : Towards the Design of Efficient Online Continual Learning System
+Yuyang Huang, Yuhan Liu, Haryadi S. Gunawi, Beibin Li, Changho Hwang
+
+Abstract
+. Continual learning has become a promising solution to refine large language models incrementally by leveraging user feedback. In particular, online continual learning — iteratively training the model with small batches of user feedback — has demonstrated notable performance improvements. However, the existing practice of separating training and serving processes forces the online trainer to recompute the intermediate results already done during serving. Such redundant computations can account for 30%–42% of total training time. In this paper, we propose Alchemist , to the best of our knowledge, the first online continual learning system that efficiently reuses serving activations to increase training throughput. Alchemist introduces two key techniques: (1) recording and storing activations and KV cache only during the prefill phase to minimize latency and memory overhead; and (2) smart activation offloading and hedging. Evaluations with inputs of varied token length sampled from ShareGPT dataset show that compared with a separate training cluster, Alchemist significantly increases training throughput by up to 1.72x, reduces up to 47% memory usage during training, and supports up to 2x more training tokens — all while maintaining negligible impact on serving latency.
+
+
+
+1.
+Introduction
+
+Large Language Model (LLM) services, widely adopted in modern cloud ecosystems, power applications, such as chatbots, search engines, recommendation systems, and API offerings. The market is projected to grow from $6.5B (2024) to $140.8B (2033), as 92% of Fortune 500 companies integrate cloud-hosted LLMs for generative AI workflows
+(
+TechTarget Editorial, 2023
+;
+Topics, 2024
+;
+Company, 2023
+)
+.
+To ensure these models remain accurate and continue to enhance user experiences, organizations must regularly retrain them to learn the latest data and refine performance.
+
+One of the most popular and promising training approaches is continual learning
+(
+Gabriel, 2020
+;
+Zhang et al., 2023a
+;
+Sun et al., 2020
+;
+Zhang et al., 2023b
+;
+Cheng et al., 2024
+;
+Gabriel, 2020
+;
+Zan et al., 2022
+;
+Song et al., 2023
+;
+Cossu et al., 2022
+;
+Gururangan et al., 2020
+)
+, due to its capability of allowing models to be refined frequently, without training from scratch. It incrementally adapts the models with up-to-date real-world information and interactions with users or models that mimic user preferences
+(
+Guo et al., 2024
+;
+Lee et al., 2024b
+;
+DeepSeek-AI et al., 2025
+;
+Xiang et al., 2025
+)
+.
+For example, chatbots with web searching capability can learn from the newest searched context (
+e.g.
+, latest news, financial data,
+et al.
+) to provide the latest information in future responses. Or, code completion applications allow users to accept or reject suggested code, and this user feedback can be used to allow models to continuously learn their preference, providing better and more personalized code completion and debug suggestions.
+
+One of the most popular continual learning approach,
+online continual learning
+(§
+2.4
+),
+iteratively trains
+the model based on a small batch of user feedback or model-generated labels collected
+each time
+the model updated
+(
+Guo et al., 2024
+;
+Qi et al., 2024a
+;
+Gao et al., 2024b
+;
+Shaikh et al., 2024
+;
+Xu et al., 2024
+;
+Carta et al., 2024
+;
+Gaven et al., 2024
+)
+.
+
+Figure 1.
+
+Lifecycle of modern AI services.
+
+In this context, we observe a significant gap between the modern need for iterative and frequent updates in LLM services and the conventional paradigm for LLM training.
+As illustrated in Figure
+1
+, existing systems typically separate training from serving to maintain low latency for serving.
+This separation occurs both temporally (
+i.e.
+, data collected during serving is only used for training after a considerable delay) and spatially (
+i.e.
+, training is carried out on machines that are distinct from those used for serving).
+However, such hard separation loses substantial opportunities to reduce computational costs.
+
+An important and interesting observation we made is that, with such design, online continual learning trainer needs to
+repeat the same computation that has already been conducted
+by the serving process, and this redundant computation often contributes to a significant portion of the entire computation for training.
+In reality, the trainer would spend 30%–42% of the total time for the computations that have already been done during serving, depending on the loss functions.
+
+This observation reveals a key insight of our approach:
+the intermediate results (i.e., activations) generated during serving can be directly re-used in the forward pass of training
+. Specifically, we reuse these
+activations
+from serving to eliminate redundant forward-pass computations.
+
+However, if the training and serving processes are separate on different machines as existing systems designed, to reuse the serving actions, they need to be sent to the training machines via the network,
+posing large network transmission overhead given the large size of activations.
+
+An intuitive and straightforward design is to
+remove
+the hard separation between serving and training and co-locate serving and training on the same machine, leveraging GPU multiplexing techniques (
+e.g.
+, either temporal sharing or spatial sharing).
+So, once there is idle time in the serving process (
+e.g.
+, during off-peak hours at night time), the serving activations can be used directly by the trainer,
+without
+any transmission delay across machines.
+
+A potential concern around this design is whether the serving workload offers sufficient idle resources. Nowadays, the serving resource is typically over-provisioned
+(
+Kubernetes, 2025
+)
+to ensure end users’ experience (
+e.g.
+latency service-level objectives (SLOs) guarantee). This indicates that a significant amount of idle resources is always available and can be harvested for training usage.
+Another concern is whether the newly collected serving data is safe to be immediately incorporated into model updates and whether the updated model can be immediately deployed to users. To address potential safety risks, multiple studies
+(
+Kim and Lee, 2024
+;
+Inan et al., 2023
+;
+Morimura et al., 2024
+;
+Ousidhoum et al., 2021
+;
+Ji et al., 2024
+)
+have proposed safeguards to ensure only safe data can be trained by the model. Many other works
+(
+Guo et al., 2024
+;
+Qi et al., 2024a
+;
+Gao et al., 2024b
+;
+Shaikh et al., 2024
+;
+Xu et al., 2024
+;
+Carta et al., 2024
+;
+Gaven et al., 2024
+;
+Wang et al., 2023b
+)
+focus on ensuring that the updated models neither drift too far away from the pre-trained model, losing its generality, nor generate unethical or unlawful responses.
+
+However, there is still
+a system-level challenge
+that remains unsolved.
+Specifically, co-locating serving and training on the same machine may incur extra overhead in saving and reusing the serving activations.
+First of all, although reusing activations can reduce training latency, the serving process needs to record and store the activations produced by
+each layer
+and the forward computation graph, to be used in the backward pass for gradient computation (§
+4.1
+).
+This procedure incurs additional latency overhead to the forward passes during serving, which could potentially violate serving latency SLO.
+Concretely, such latency overhead can be up to 35% when storing and recording activations and computation graphs.
+Secondly, in a normal serving procedure, each layer’s activations are overwritten by the next layers’ activations to reduce overall memory footprint
+(
+Kwon et al., 2023
+)
+. Hence, storing each layer’s activations for reusing in training also incurs extra memory overhead and severely limits the serving capacity due to the large size of activations.
+
+To address the above challenges, we propose
+Alchemist
+, to the best of our knowledge, the
+first efficient system that reuses serving activations in training
+to increase online training throughput, with minimal impact on both serving latency and capacity.
+
+Alchemist
+entails two techniques:
+
+\bullet
+
+Minimal activation recording during serving
+: To minimize the activations recording overhead during LLM serving, we only record the activations when processing user input,
+i.e.
+, prefill phase, and disable it when generating new tokens,
+i.e.
+, decoding phase.
+This can be effective because in real-world scenarios
+(
+anon8231489123, 2025
+)
+, the
+total
+decoding time is often the majority of the end-to-end time.
+Furthermore, in the case where activations are required for both input and model response,
+Alchemist
+reuses the KV cache (one kind of intermediate results) generated by prefill in serving to avoid activations recording for the entire generation procedures while still managing to reuse part of the activations calculated during serving (§
+4.1
+).
+
+\bullet
+
+Offloading of serving activations
+: To guarantee serving capacity, when the serving requires more GPU memory based on an offline memory capacity profiler,
+Alchemist
+frees the serving activations in a
+as needed
+fashion.
+Based on the insight that the activations of earlier layers are needed at last during the backward pass,
+Alchemist
+frees activations in
+forward order
+and loads them in
+the reverse order of the layers
+, maximizing the overlap between the backward computation and activations loading.
+
+We compare
+Alchemist
+with the baseline that separates the training and serving processes on different machines, and show that on input with varied token length sampled from a popular dataset, ShareGPT
+(
+anon8231489123, 2025
+)
+:
+
+\bullet
+
+Alchemist
+increases the training throughput by 1.26x–1.72x, across two different example continual learning methods with three types of LLMs.
+
+\bullet
+
+Compared to naïve loss calculation, by removing duplication in memory with KV cache reuse,
+Alchemist
+saves memory by 32% – 47% depending on the trained token length and supports up to 2x more maximum trainable tokens.
+
+\bullet
+
+Alchemist
+achieves the performance gains with very minimal impact on serving latency.
+
+2.
+Background & Motivation
+
+2.1.
+Model Inference and Tuning
+
+Modern LLMs and Transformers rely on transformer architectures
+(
+Vaswani et al., 2017
+)
+, where inference occurs in two phases.
+During the
+prefill phase
+, the model processes the entire input prompt (e.g., a user’s query) in parallel, computing
+key-value (KV) caches
+that capture contextual relationships between tokens. These caches persist to accelerate subsequent steps.
+During the
+decoding phase
+, the model generates output tokens auto-regressively by using the KV caches. Each new token’s attention scores reuse the cached keys/values from the prefill, minimizing redundant computation.
+
+In both phases, the model computes
+activations
+, the intermediate outputs from each layer’s linear operations (e.g., matrix multiplications) and non-linearities (e.g., ReLU). As illustrated in Figure
+2
+, these activations are critical for training: back-propagation uses them to compute gradients. However, serving systems discard activations immediately after inference to save memory, wasting computational work that training could reuse.
+
+Figure 2.
+
+Activations in forward and backward passes of model training.
+
+Activations,
+a
+, computed during forward pass will be stored and reference during backward pass to avoid redundant recomputation. The figure does not fully reflect what actually happen during training but is simplified only for illustration purpose. §
+2.1
+
+2.2.
+Parameter Efficient Fine-Tuning (PEFT)
+
+With the rapid growth in LLMs’ size, the cost of continually adapting models with the new information also skyrockets due to the requirements of a large number of GPUs.
+PEFT
+methods
+(
+Li and Liang, 2021
+;
+Lester et al., 2021
+;
+Kopiczko et al., 2024
+;
+Qiu et al., 2023
+;
+Liu et al., 2023a
+;
+Blau et al., 2024
+;
+Liu et al., 2023b
+)
+mitigate training costs by freezing the base model and only updating low-rank adapters with much smaller parameter sizes, hence reducing the memory and computation requirements. Consequently, these methods, especially
+LoRA
+
+(
+Hu et al., 2021
+)
+, have become the most favorable methods for fine-tuning LLMs.
+
+2.3.
+Continuous Adaptation
+
+With the help of PEFT method like LoRA, LLM services increasingly adopt
+continual learning
+to keep updated with latest information. Two paradigms dominate:
+
+Continual Pretraining:
+
+Models ingest fresh data (news, user prompts, code commits) to update factual knowledge
+(
+Sun et al., 2020
+;
+Zhang et al., 2023b
+;
+Cheng et al., 2024
+;
+Gabriel, 2020
+;
+Zan et al., 2022
+;
+Cossu et al., 2022
+;
+Gururangan et al., 2020
+)
+. For example, a financial LLM might retrain daily on earnings reports to improve stock analysis.
+
+Continual Preference Alignment:
+
+User feedback (e.g., accepting/rejecting code suggestions) fine-tunes models to individual or collective preferences
+(
+Zhang et al., 2023a
+;
+DeepSeek-AI et al., 2025
+;
+Askell et al., 2021
+;
+Schulman et al., 2017
+;
+Ziegler et al., 2020
+;
+Stiennon et al., 2022
+;
+Kenton et al., 2021
+;
+Go et al., 2023
+)
+Techniques like Direct Preference Optimization (DPO)
+(
+Qi et al., 2024b
+)
+excel here due to its simplicity — it leverages pairwise preferences to align outputs
+without
+requiring to design and train a separate reward model.
+
+2.4.
+Online Continuous Learning
+
+Typical procedure in continuous learning often aggregates data from the serving side over weeks or months, known as offline learning.
+But these delayed updates face challenges, for instance:
+concept drift
+occurs as user preferences shift, such as changes in coding style trends;
+factual obsolescence
+arises when news, APIs, or regulations become outdated.
+
+Ideally, we want the model to be continuously trained on almost a real-time
+stream of information and feedback.
+This means that, instead of infrequent, large updates, model is frequently retrained and updated with small batches of latest.
+Users (or LLMs that mimic users’ preferences), in turn, provide the latest feedback or information based on the response generated by the updated version to further update and improve the model’s performance
+iteratively
+.
+
+This cyclic and iterative training process is often referred to as
+online continuous learning
+
+(
+Guo et al., 2024
+;
+Qi et al., 2024a
+;
+Gao et al., 2024b
+;
+Shaikh et al., 2024
+;
+Xu et al., 2024
+;
+Carta et al., 2024
+;
+Gaven et al., 2024
+)
+.
+Unlike the traditional offline continuous learning procedure which trains the models based on a single large batch of stationary data for every iteration, online continuous learning pipeline emphasizes its nature in
+iterative improvement over time
+based on a micro-batch of newest information and feedback collected each time after the model is updated.
+
+2.5.
+Online Continuous Learning System
+
+Implementing an online continuous learning system introduces the practical
+question of
+where
+to run training. A straightforward solution might be
+to maintain a separate training cluster, but this approach entails substantial
+business and operational tradeoffs. A reserved training cluster can be
+underutilized, tying up resources that could have been allocated to improve
+serving capacity or quality. On the other hand, an on-demand training cluster
+(spun up only when user-serving traffic is low) incurs orchestration
+complexity and repeated overhead each time training is triggered. Both
+approaches can lead to inefficiencies and added costs.
+
+2.5.1.
+Reusing Activations
+
+Furthermore, in an online continuous learning scenario, since user prompts or user feedback will be the training input (or part of the input), the forward passes during serving have already calculated the activations we need for backpropagation. Such forward passes can cost as much as 43% of the total training time, shown in red color in Fig
+3
+.
+Hence, intuitively, it is
+more efficient to reuse
+the activations calculated from the serving forward pass during backpropagation rather than re-calculate them again.
+
+Figure 3.
+
+Continual training time breakdown.
+
+When continual training on served inputs, each iteration of training with DPO loss spends 30% of the total time, shown in hatched red color, recomputing the same activations that have been calculated during serving.
+For pre-training with cross entropy loss, this number increases to 43%.
+This substantial amount of recomputation time greatly motivates us to reuse the activations that has been calculated during serving. §
+2.5
+
+However, this schema can be challenging and suboptimal in the design of separated training and serving clusters.
+As the model size (
+i.e.
+, number of parameters) rapidly increases, so does the size of activations as well as the number of activations.
+Attempt to reuse the activations calculated by the serving cluster on a separate training cluster requires transmitting a large amount of data (
+i.e.
+, activations) over the network and could incur significant transmission overhead.
+It is likely that such overhead can eventually surpass the benefits of reusing the activations (
+i.e.
+, transmission latency is higher than the recomputation latency).
+Consequently, this design then has to face a dilemma where it has to choose either to transmit activations with high network cost or to recompute the activations with high computation cost.
+Both
+of which are inefficient.
+
+Obviously, a more resource-efficient strategy here is to
+co-locate
+training and serving on the same infrastructure to avoid either transmission or re-computation costs.
+This co-location design enables a powerful key insight: model activations computed during serving can be re-used to reduce or even remove the forward passes in the training loop.
+
+2.5.2.
+Harvesting Idle GPU Resource
+
+In addition to activations reuse, training and serving co-location can harvest the idle resource on the serving cluster.
+When allocating resources for application services, it is common practice to
+overprovision
+to ensure that Service Level Objectives (SLOs) are met during unexpected demand spikes.
+In the case of serving LLMs, this conservative measure often results in idle GPU computation cycles and/or memory left on the serving cluster.
+By co-locating training with serving, the training job can harvest these idle resources, further helping reduce the cost of online continual learning.
+
+3.
+Design Requirements & Assumption
+
+Reusing activations for online continual learning and leveraging idle computation cycles is an appealing strategy for cost efficiency.
+However, designing such a system is non-trivial.
+Due the intensive computation and large memory requirements from training, the key challenge lies in how to
+preserve serving latency and capacity
+while performing training at the same time.
+Hence, we envision that the system should, at a minimum, meet the following design requirements:
+
+\bullet
+
+R1
+: The system must be able to reuse the activations calculated during serving users to improve the training efficiency compared to a separate training cluster setup.
+
+\bullet
+
+R2
+: With activation reuse enabled, the system should have
+minimal or no impact on serving latency
+.
+In other words, integrating training into the serving system should not significantly increase the serving SLO violation rate.
+
+\bullet
+
+R3
+: Similarly, the system should have
+minimal or no impact on the serving capacity
+, meaning the context length and the batch size that originally can be supported should be limited.
+
+In addition to these requirements, we also make the following assumptions:
+
+\bullet
+
+A1
+: Due to its computation and memory efficiency, as well as its popularity, Parameter Efficient Fine-Tuning, like LoRA, is practiced on the system.
+
+\bullet
+
+A2
+: GPUs’ computation and memory resources are overprovisioned to ensure service quality in peak or unexpected spikes in workload.
+
+Figure 4.
+
+Alchemist
+system overview.
+
+➊
+Alchemist
+injects preemption hooks to switch from training context to
+serving context upon query arrival.
+➋
+Alchemist
+saves activations and other cache-able data specified by users calculated during serving jobs for later training when labels are ready.
+➌
+Alchemist
+asynchronously copies serving activations to host memory.
+➍
+Alchemist
+trainer calls users customized training function which pulls activations and labels when ready.
+➎
+Alchemist
+frees activations when serving query arrives amid training job and requires more memory. §
+4
+
+4.
+Alchemist
+Design
+
+This section introduces
+Alchemist
+, the first online continual learning system that efficiently reuses serving activations, to the best of our knowledge. Figure
+4
+shows the flow and interactions among
+Alchemist
+’s components. In the following sections, we detail how each component meets the design requirements.
+
+Figure 5.
+
+Latency overhead of activations recording.
+
+Due to the cost in recording and saving activations and computation graphs,
+autograd frameworks like
+torch.autograd
+could bring
+up 21% overhead to the prefill phase and 35% overhead to each forward
+pass in the decode phase (i.e., 35% increment in each token’s generation
+time). If enabled for each token generated, it will significantly prolong
+the serving latency, violating our latency requirement. §
+4.1
+
+4.1.
+Record and cache activation
+
+To simplify the design process, we set aside
+R3
+for now by assuming we have more than enough GPU memory to co-locate serving and training.
+To fulfill
+R1
+of reusing serving activations for training, the first step is to record the required activations and cache them for later training use.
+Although this may sound straightforward, under the requirements of
+R2
+, this can be rather non-trivial. Due to the overhead from the autograd frameworks (
+e.g.
+,
+torch.enable_grad
+), shown in Figure
+5
+, thoughtlessly enabling activation recording during the generation process can severely impact serving latency, clearly violating
+R2
+.
+
+Continual pre-train:
+
+In the case of continual pre-train, model is learning from users’ input prompts or the searched context. Hence, loss calculation and backpropagation only require the activations calculated when processing the input (
+i.e.
+, prefill phase).
+This tells that we only need to
+enable activation recording during prefill phase
+.
+Since prefill only happens once and is the
+minority of the total serving time
+, such overhead can then be amortized in the end-to-end latency as decode proceeding.
+
+Continual preference alignment:
+
+In the case of continual preference alignment, this problem can be complicated.
+In preference alignment algorithms like DPO and its other variations, since they directly compare the chosen and rejected responses, it would require the full response from the model to calculate the loss.
+Hence, naïvely reusing all the activations of the model generated responses (either it is the chosen or the rejected one) would require us to record and save the activations
+until the end of generation
+during serving.
+This could introduce prohibitive overhead.
+
+As aforementioned, enabling activation recording could incur up to 35% latency overhead in the decoding phase.
+If we enable it for both prefill and decode phases, this overhead would apply to every forward pass, eventually leading to
+35% latency overhead end-to-end
+.
+On the other hand, completely disabling activations recording for both prefill and decode phase to maintain serving latency eliminates the possibility of reusing activations calculated from serving.
+The loss calculation then would require full prefill on the prompt concatenated with chosen and rejected responses
+twice
+, leading to redundant computation.
+
+Nevertheless, a balanced approach is possible: we can enable activation recording for
+only the prefill phase
+, and
+save the KV cache and the activations
+associated with it.
+This design allows loss calculation to only attend to the response texts, skipping the prompts and reusing part of the activations calculated during serving.
+Similar to the case of continual pretrain, such overhead then only applies to the prefill phase and will be amortized as generation proceeds.
+
+Since both the chosen response and the rejected response share the same prompt, the two forward passes can share the KV cache as well, further reducing redundant computation.
+Besides the computation saving, sharing KV cache also means sharing the activations associated with it among the two forward passes, hence also reducing unnecessary
+duplication in memory
+.
+
+4.2.
+Schedule activation reuse
+
+With the required activations recorded and cached, the next step is to reuse them for training.
+However, simply overlapping training computations with serving computations can severely increase the serving job’s latency due to contention, violating the latency requirement specified in
+R2
+.
+
+To address this issue,
+Alchemist
+employs a straightforward yet effective strategy: it
+preempts the training job
+and immediately switches to the serving job as soon as a serving query arrives, temporally sharing GPU resources among serving and training jobs.
+Leveraging the hook functionality provided by frameworks such as
+PyTorch
+,
+Alchemist
+injects preemption hooks at the start of each layer’s backward function call.
+These hooks check for any serving forward pass that is currently running or queued.
+If so, the backward pass is paused until the serving forward operations have completed and the queue is empty.
+
+In the case like DPO loss calculation, where both backward passes and forward passes are required during training, similarly, preemption hooks will be injected into each layer’s forward.
+Through this approach,
+Alchemist
+minimizes the overlap between training and serving processes, effectively minimizing the impact on serving latency from the training side.
+Together with the design in §
+4.1
+,
+Alchemist
+could fulfill the latency and activation reuse requirement from both
+R1
+and
+R2
+.
+
+4.3.
+Alchemist
+activation offloader
+
+While the prior designs address activation reuse requirement from
+R1
+
+and the latency requirement from
+R2
+, another fundamental challenge is
+the memory overhead brought by storing the activations when colocating
+training with serving. As
+R3
+pointed out,
+Alchemist
+should only bring
+minimal or no impact on serving capacity, (
+i.e.
+, context length and batch
+size limits).
+
+However, saving all the activations can risk out-of-memory (OOM). As the context length grows, even if only saving LoRA
+adapter’s activations and de-duplicate activations by sharing input prompt KV cache as described in §
+4.1
+, the activations from both the prefill phase and
+DPO loss calculation can easily reach 40 GB as shown in Figure
+6
+
+when total trained token (
+i.e.
+, both prompt and responses) is 3000 tokens. If we
+save all these activations while serving at the same time, such large memory
+overhead can severely limit the context length or the batch size for the
+serving side.
+
+Figure 6.
+
+Peak memory usage with DPO loss.
+
+Even if leveraging the input prompt’s KV cache as described in
+§
+4.1
+, naively saving all required activations in
+GPU memory on the train side can still introduce significant memory
+overhead. This could severely limit the supported context length or batch
+size on the serving side before OOM. §
+4.3
+.
+
+Naively offloading every activation to CPU memory, on the other hand, will
+leave GPU memory underutilized since serving queries does
+not
+necessarily always
+require the full memory space. When offloading more
+activations than we actually need, we introduce unnecessary loading
+overhead when we load the activations that could have been kept on GPU memory back
+to the GPU.
+
+Hence, the goal of
+Alchemist
+’s offloader is to offload activations
+as
+needed
+rather than offloading every single activation to CPU memory. To
+achieve this,
+Alchemist
+asynchronously
+copy
+the activations during
+the forward pass to a pre-allocated and pinned CPU memory. Unless, even if without overlapping with serving jobs, the activations themselves are too large to be fitted, we will not immediately free the copied activations from GPU memory.
+Only when we determine a serving query requires more GPU memory, we then dynamically
+free
+activations in GPU memory until there is enough memory to serve the incoming queries.
+
+Importantly, as physically deallocating GPU memory and reallocating can
+be expensive at runtime, the underlying storage buffer for freed
+activations is not physically deallocated from the GPU memory, similar to the
+memory allocators like
+PyTorch
+’s cache allocator
+(
+PyTorch Contributors, 2025a
+)
+. Instead,
+the underlying buffer is marked as
+reserved
+. When a new tensor needs to
+be allocated on the GPU next time, the cache allocator
+reuses
+the
+reserved buffer for the new tensor, given the reserved buffer can accommodate
+the new tensor. In the case of
+Alchemist
+, after we free the required number of
+activations, the underlying buffer can be immediately reused by the serving
+query with no or minimal overhead.
+
+4.3.1.
+Offloading map
+
+To free activations only as needed, we first need to understand
+how many
+
+activations we should free. When a new serving query arrives, we see that the
+memory consumption — and whether
+Alchemist
+risks running out of memory — is
+determined by the following parameters, (1) token
+length of cached activations, (2) incoming serving token length, and (3)
+incoming serving batch size. As the model size and architecture are known
+beforehand, all three parameters have a
+deterministic mapping
+to
+the memory consumption. This means, for instance, the memory requirement for
+all serving queries with token length
+x
+and batch size
+y
+remains at a size
+of
+z
+GB and will not change when the input text or token changes. Similarly,
+activations’ size for prefilling input with
+a
+token length remains at
+b
+GB, invariant to the inputs or the tokens.
+
+Hence, before runtime, with a given model and GPU, we can profile a mapping,
+namely
+offloading map
+, with these three parameters as input and the
+number of bytes to free as the output. In the real system, for the system’s
+simplicity, we restricted the minimum unit for freeing to
+one layer’s
+activations
+, instead of bytes or activations. By referring to this profile
+mapping, when we start each serving forward at runtime, we may know how many
+layers’ activations we must free to avoid the risk of OOM while serving.
+In addition, we may also know if there will be OOM
+during activations recording
+due to the size of activations itself. In this case, we directly offload the activations to CPU memory without retaining them in GPU memory at all.
+
+To reduce the profiling effort, during profiling, these three parameters are
+incremented by a configurable step size each time. By default, token length of
+cached activations and incoming serving are incremented by 500-token steps
+while serving batch size is incremented by 5. At runtime, when querying the
+mapping, the input value is
+rounded up
+to the nearest recorded step.
+For instance, an incoming query with 420 tokens will be rounded to 500 tokens,
+as well as its corresponding memory consumption.
+Even though this means we always free slightly more than we actually need, it could significantly reduce the offline profiling cost.
+
+4.3.2.
+Pipelining
+
+With offloading map, we know how much we need to offload each time.
+The next question is
+which
+activations we should free and
+which
+we should retain in GPU memory.
+
+Since backpropagation proceeds from the output layer to the input layer, the optimal strategy to minimize the wait time is to prioritize
+retaining the activations of the higher layers
+(
+i.e.
+, layers close to the output layer).
+In other words,
+Alchemist
+should free the activations in the order of forward pass (
+i.e.
+, from input layer to the output layer).
+This ensures that, when backpropagation begins, the gradients for the higher layers can be computed immediately, as their activations remain in GPU memory.
+Meanwhile, as backpropagation operates on the layers with activations ready in GPU memory, we can pipeline and prefetch lower layers’ (
+i.e.
+, layers closest to the input layer) activations.
+
+Ideally, as illustrated in Fig
+7
+, when backpropagation reaches the layers whose activations were previously freed, the activations have already been loaded back, allowing backpropagation to operate on this layer immediately without waiting for its activations.
+This
+effectively hides
+the delay of loading the activations of these layers.
+
+Figure 7.
+
+Alchemist
+backward and activations loading pipeline.
+
+Freeing activations in the forward order and loading them in reverse maximizes the interval between the start of the training job and each layer’s backward pass. Since early layers (those closest to the input) are processed last during backpropagation, this approach increases the likelihood that freed activations are reloaded and ready when needed.
+
+4.3.3.
+Hedging map
+
+However, due to the size and the number of activations, it is likely that
+computation cannot entirely hide the loading time, even if overlapping
+computation and loading. This means that when backpropagation proceeds to the
+layers whose activations were freed, those activations may not yet be fully
+loaded to GPU, leading to a certain wait time for backpropagation. As the size
+and number of activations needed to be loaded increase, the wait time will
+prolong as well, and eventually could exceed the time required to recompute
+the forward passes from the text input.
+
+To address this issue, we first profile the time required to load activations
+back when we free a certain number of layers’ activations. Since the
+recomputation time solely depends on the token length and is invariant to the
+input content, we can also profile the recomputation time offline. We, then, compare
+whether loading time is longer than recomputation time. This allows us to
+build another map, named
+hedging map
+, that provides a binary decision
+for whether we should load the activations or recompute the forward pass given
+the token length of cached activations and the number of layers we freed.
+
+Note here, for loss functions that require multiple forward passes with the same prompt, even if
+Alchemist
+needs to recompute the forward passes, it still leverages the KV cache sharing technique introduced in §
+4.1
+. This means that it will prefill the user prompts only once and share the corresponding KV cache across multiple forward passes to accelerate the recomputation process and reduce the memory footprint.
+
+4.3.4.
+Alchemist
+offloader overall
+
+To integrate all components in
+Alchemist
+offloader, right before a new serving
+forward starts,
+Alchemist
+will first determine the new serving forwards’ token
+length and batch size, as well as the token length of the cached activations.
+Then, it will query the offloading map to determine how many layers’
+activations need to be freed.
+Alchemist
+then will consult the hedging map to
+determine, with the given number of layers’ activations to free, if it is more
+efficient to load the activations back or just recompute forward passes. If
+recomputation is better,
+Alchemist
+will free all the activations from both GPU
+and CPU memory. Otherwise, in the order from the input layer to the output
+layer,
+Alchemist
+will free the given number of layers’ activations from GPU
+memory. During training
+Alchemist
+will overlap loading the computation to mask
+as much loading time as possible.
+
+4.4.
+Cache policy
+
+For simplicity of the system, we currently only allow
+Alchemist
+to cache one
+query’s activations. Upon new queries’ arrival, we disable recording and
+caching for the new queries rather than evicting the older queries’
+activations. This design poses no issue in the case of continual pretrain.
+Because continual pretrain only requires the user’s prompts or the search
+context to start the training job and the activations cached can be
+immediately used after the corresponding serving finished.
+
+However, this can be problematic in the case of continual preference
+alignment. Continual preference alignment, on the other hand, requires labels
+from users’ feedback whose
+arrival time can be nondeterministic
+. It is
+possible that a user never submits feedback. The corresponding cached
+activation becomes entirely unusable, and the occupied memory space prevents
+caching of activations for other queries that have received labels.
+
+To avoid such starvation in caching, we set a configurable timeout threshold
+for the cached activations. If cached activations’ label does not arrive
+before the timeout, we allow the next serving job’s activations to be
+recorded, overwriting the old cached activations.
+
+5.
+Implementation
+
+Following the design depicted in §
+4
+, we implemented a prototype of
+Alchemist
+with 1.5K LOC in Python.
+We rely on commonly used third-party libraries, like
+PyTorch
+and Hugging Face’s
+transformers
+
+(
+Wolf et al., 2020
+)
+in
+Alchemist
+’s implementation. To ensure
+Alchemist
+’s accessibility and usability, instead of providing it as a standalone serving engine, we implement
+Alchemist
+as a plugin that can be integrated into existing state-of-the-art serving engines like vLLM
+(
+Kwon et al., 2023
+)
+, SGLang
+(
+Zheng et al., 2024
+)
+,
+et al.
+.
+
+Alchemist
+cache class:
+
+Different training methods as well as different loss functions may require different inputs that we can cache from serving.
+For example, with continual pretrain using cross-entropy loss, the loss function only requires the prefill output and prompt text, but for continual preference alignment with DPO loss, it would require prefill phase KV cache, the accepted response, and rejected response text.
+To make
+Alchemist
+extensible to all possible training methods and loss functions, we provide
+AlchemistCacheBase
+abstract class, allowing users to wrap different kinds of cache they would like to store from serving.
+In the class, we also implement synchronization functions indicating the label, if needed, for the corresponding cache is ready, for instance,
+is_ready()
+or
+wait_ready()
+.
+
+Alchemist
+class:
+
+Users of
+Alchemist
+are expected to make their model class inherit from
+Alchemist
+class. This will ensure that, at model initialization,
+Alchemist
+will register all the scheduling hook functions described in §
+4.2
+.
+
+\bullet
+
+push(cache: AlchemistCacheBase)
+: Within the serving loop, users call this function to push the serving activations and other values wrapped in
+AlchemistCacheBase
+.
+
+\bullet
+
+push_label(label: str)
+: If labels are required, users call this function to push the label to
+Alchemist
+.
+
+\bullet
+
+pull() -> AlchemistCacheBase
+: When implementing customized training methods and loss functions, users use this function to pull the cached activations and other values that are required by the training method and loss calculation (
+e.g.
+, prompt text, label,
+et al.
+).
+This function is blocking as it calls
+AlchemistCacheBase
+’s
+wait_ready()
+to wait until the label is ready when it is required.
+
+\bullet
+
+train_on_cache()
+: This is an abstract function where users can implement their own training logic, which will be called by
+Alchemist
+on a separate trainer thread.
+
+With this implementation, besides users’ customized training implementation, the users of
+Alchemist
+are only expected to make
+minimal changes
+to their existing serving engines and model implementations.
+
+Alchemist
+offloader:
+
+As a model inheriting from
+Alchemist
+, we also register
+PyTorch
+’s
+saved_tensor_hook
+
+(
+PyTorch Tutorials, 2025
+)
+to each layer of the models.
+This hook function is called each time an activation is recorded by
+PyTorch
+’s autograd framework.
+We use this hook to (1) asynchronously copy the activations from GPU memory to CPU memory as described in §
+4.3
+and (2) record the ownership of the activations (
+i.e.
+, which layer’s backward requires this activation).
+This ensures we free the correct activations when certain layers’ activations are required to be freed.
+We use a CUDA Stream different from
+PyTorch
+’s default stream to overlap the computation and data movement between GPU and CPU
+(
+PyTorch Contributors, 2025b
+)
+.
+We primarily rely on PyTorch’s cache allocator
+(
+PyTorch Contributors, 2025a
+)
+to virtually free the memory instead of physically de-allocating activations’ underlying buffer from GPU memory.
+This allows the serving job to immediately reuse the underlying buffer by overwriting the value in the buffer as needed.
+
+6.
+Evaluation
+
+Baseline:
+We evaluate
+Alchemist
+’s performance by comparing it with a separate training cluster that does not reuse serving activations nor share the prompt’s KV cache, which serves as our baseline.
+
+Hardware:
+The evaluation testbed is equipped with an Nvidia A100 80GB SXM GPU
+(
+NVIDIA, 2025
+)
+and two AMD EPYC 7V12 64-Core CPUs
+(
+AMD, 2025
+)
+, along with a total of 1.73 TB of CPU memory.
+As offloading may require a relatively large amount of memory, we use
+taskset
+
+(
+Love, 2025
+)
+to set the evaluation process affinity to one NUMA node to avoid possible NUMA effects.
+
+Models:
+We use Llama-3.1-8B
+(
+Touvron et al., 2023
+)
+, Mistral-v0.2-Instruct
+(
+Jiang et al., 2023
+)
+, and Phi-4
+(
+Abdin et al., 2024
+)
+as our evaluation models.
+
+Dataset:
+We randomly sampled the prompts from ShareGPT
+(
+anon8231489123, 2025
+)
+, which were collected from real users’ conversations with ChatGPT, as our input dataset.
+We set the output length to be 128 tokens for all queries.
+In the case where we evaluate
+Alchemist
+under various serving loads (
+i.e.
+, varied queries-per-second, QPS), since ShareGPT does not provide timestamps, following the approach used in many prior works
+(
+Kwon et al., 2023
+;
+Zheng et al., 2024
+;
+Miao et al., 2024a
+)
+, we generate traces by sampling from a Poisson distribution at varying request rates.
+
+Serving:
+We implement a naïve serving engine for fast prototyping and integration with
+Alchemist
+using Hugging Face.
+
+Training:
+For continual pretrain, we use CrossEntropy loss as an example. For continual preference alignment, we use DPO loss as an example training method.
+For DPO loss, we assume model-generated responses are the rejected responses and generate a random tensor with the same length as the chosen response.
+We generate the chosen one with minimal delay after the model finishes generating to mimic users providing feedback immediately once they see the model output or auto-labeling LLM.
+Models are attached with a LoRA adapter of rank 8 as the example training settings for the evaluation process.
+
+Memory profiler settings:
+For Llama-3.1-8B and Mistral-v0.2-Instruct, we use a step size of 500 tokens for cached token length and incoming query token length and a batch size of 5 when profiling memory consumption. For Phi-4, due to its larger model size, to reduce the profiling error, we decrement the step size to 250 tokens for cached and incoming query.
+
+Metrics:
+We use token-per-second trained to evaluate the training throughput. Since the time
+Alchemist
+can start its training jobs depending on the actual serving workload, to isolate this factor and focus on
+Alchemist
+’s sole efficiency, we only count the serving idle time when calculating training throughput. When evaluating the serving side, we use time-per-token (TPT) output as the metric.
+
+Figure 8.
+
+Training throughput improvement.
+
+In continual pretrain (CPT) with cross entropy loss (upper figure),
+Alchemist
+(blue bars) consistently outperforms baseline (red bars) with 1.7x training throughput improvement.
+While in continual preference alignment (CPA) with DPO loss (lower figure),
+Alchemist
+shows upto 1.68x training throughput improvement before baseline runs out-of-memory (shown with red “x”). §
+6.1
+.
+
+6.1.
+Training throughput improvement
+
+We first evaluate
+Alchemist
+’s training throughput when
+no offload is needed
+(
+i.e.
+, serving workload is light).
+We sample various lengths of input tokens from the ShareGPT dataset to understand
+Alchemist
+’s performance under various token lengths.
+As shown in Figure
+8
+), when performing continual pretraining (CPT) with cross-entropy loss (upper figure),
+Alchemist
+(in blue) consistently outperforms the baseline (in red), delivering over a 1.72x improvement in throughput regardless of token length. For continual preference alignment (CPT) with DPO loss,
+Alchemist
+achieves between 1.26x and 1.68x improvement, depending on the token length.
+
+This variation arises because the latency of the prefill phase grows linearly—or even super-linearly—with token length. By leveraging the serving layer’s KV cache to bypass the prefill phase during training,
+Alchemist
+saves more time as the prompt length increases.
+
+Moreover, while the baseline runs out of memory (OOM) for token lengths exceeding 3000 tokens for Llama-3.1-8B and Mistral and 1500 tokens for Phi-4(marked in red “x”),
+Alchemist
+can support up to 7000 tokens and 2500 tokens respectively, thanks to the memory savings from reusing the KV cache.
+
+6.2.
+Offloading’s impact
+
+Figure 9.
+
+Impact of offloading activations with DPO loss.
+
+Alchemist
+’s improvement drops as we increase QPS requiring
+Alchemist
+to offload more activations to CPU memory due to the larger serving batch size and corresponded higher memory requirements.
+This is expected since more activations offloaded means
+Alchemist
+must load more activations back from CPU memory to GPU memory which can be expensive.
+
+Next, we evaluate
+Alchemist
+’s performance when offloading is required to accommodate incoming queries’ memory requirement due to either larger QPS or longer input token length.
+We use
+Alchemist
+with DPO loss as the evaluation example since DPO loss requires two forward passes hence having a larger memory footprint.
+We increase the QPS until there is no idle time for
+Alchemist
+to run training jobs.
+To better illustrate the impact of offloading, when sampling prompts from ShareGPT dataset, we set a minimal token length of 4000 for Llama-3.1-8B and Mistral-v0.2-Instruct and 2500 for Phi4. These numbers were chosen as they are the minimum token length we started to observe the impact of offloading under aforementioned QPS and training settings.
+
+As Figure
+9
+shows, as we increase the QPS, due to the larger batch size during serving,
+Alchemist
+is required to offload more layers to CPU memory. This, as expected, will reduce the training throughput because of the delay when loading the activation back from CPU memory to GPU memory. Especially, in the case of Phi-4, due to its larger model size with higher memory requirements, when at 1.7 QPS,
+Alchemist
+decides to recompute the majority of the forward passes after querying its hedge mapping as described in §
+4.3.3
+.
+
+Since, during recomputation,
+Alchemist
+still only prefills the input prompt once and shares the KV cache across two responses, it can significantly reduce the memory footprint and avoid OOM, unlike the baseline.
+Hence, even with offloading,
+Alchemist
+is still better than the baseline.
+
+6.3.
+Alchemist
+’s impact on serving latency
+
+To understand
+Alchemist
+’s impact on the serving side, we start by measuring the TPT distribution under the average request rate of 1.7 queries per second (QPS) with Llama-3.1-8B and DPO loss.
+As the left figure in Fig.
+10
+,
+Alchemist
+poses only minimal impact on the TPT distribution and does not introduce large tail latency during serving.
+
+We further evaluate
+Alchemist
+’s impact on the average TPT at various request rates. The result, shown in the right figure in Fig
+10
+, demonstrates that
+Alchemist
+increases the average TPT by at most 3%.
+
+During the attempt to further reduce such overhead, we observe the bulk of the overhead actually comes from the
+PyTorch
+’s invocation on the registered hook functions.
+In other words, even if we register an empty hook function, such overhead would still incur.
+If we are willing to sacrifice the usability of
+Alchemist
+and add the currently used hook functions as part of models’ implementation directly, we can further reduce the latency overhead.
+
+Figure 10.
+
+Alchemist
+’s overhead on serving latency.
+
+The left figure evaluates the distribution of serving time-per-token (TPT) when enable
+Alchemist
+(blue).
+The CDF shows that
+Alchemist
+does not introduce large tail latency and has minimal impact on the TPT’s distribution overall compared to disable
+Alchemist
+(red).
+The right figure compares the average TPT at various request rate.
+The results also indicating
+Alchemist
+has almost no impact at low request but only introduces at most 3% overhead at high request when serving system starts to backlog. §
+6.3
+.
+
+6.4.
+Memory saving with KV reuse
+
+In the case of continual preference alignment with DPO loss and Llama-3.1-8B model,
+Alchemist
+leverages the serving prompt’s KV cache reuse to reduce the memory duplication of the activations. To evaluate the memory saving, we start by comparing the max token length before OOM. As illustrated in the left figure of Fig.
+11
+, without reusing the input prompt’s KV cache, baseline can only support up to 3000 tokens with our hardware setup. Meanwhile, with the same setup, by removing the duplication in memory with KV cache reuse,
+Alchemist
+can support up to 7000 tokens.
+
+We then directly compare the peak memory usage shown in the right figure of Fig.
+11
+. Reusing prompt’s KV cache when calculating DPO loss can save 33% to 47% peak memory usage depending on the trained token length.
+
+Figure 11.
+
+Memory saving when reusing KV cache.
+
+By reducing activations duplications, reusing input prompt’s KV cache
+during training significantly reduce the peak memory consumption, as much
+as 47% with 3000 trained token length. With such memory saving,
+Alchemist
+can train 2x longer sample before out-of-memory error. §
+6.4
+.
+
+7.
+Discussion
+
+In this paper,
+Alchemist
+, as an online continual learning system, focuses on addressing the system-side performance issue in reusing the serving activations. However, activation reuse for training may introduce other questions as well. We will address some of the possible questions in this section.
+
+Safety of Online Continual Learning at Serving:
+Obtaining new information and new feedback (either from human users or model) on the updated model implies models continuously trained in online manner are directly deployed to serve future queries.
+This could raise concerns about whether the data used for model training is sufficiently safe for deployment.
+Fortunately, numerous techniques have been developed to filter training data, ensuring that only safe data points are fed into the training process
+(
+Kim and Lee, 2024
+;
+Inan et al., 2023
+;
+Morimura et al., 2024
+;
+Ousidhoum et al., 2021
+;
+Ji et al., 2024
+)
+.
+Additionally, many online learning algorithms already factor in the safety concerns by adding regularization terms or similar paradigms to safeguard continual model learning, ensuring that re-trained models do not drift too far from the pre-trained model while improving generation quality
+(
+Guo et al., 2024
+;
+Qi et al., 2024a
+;
+Gao et al., 2024b
+;
+Shaikh et al., 2024
+;
+Xu et al., 2024
+;
+Carta et al., 2024
+;
+Gaven et al., 2024
+;
+Wang et al., 2023b
+)
+.
+
+Availability in Idle Resource in Serving Workloads:
+This paper assumes that idle resources in serving workloads allow training jobs to be co-located on the same machine. In practice, serving resources are often over-provisioned to ensure serving quality and capacity under workload spikes. For instance, common autoscaling policies target an average utilization ratio
+(
+Kubernetes, 2025
+)
+, typically well below 100%—often around 60–80%—to prevent saturation during peak demand.
+
+Impact of lower-precision inference:
+A rising line of work serves LLMs in lower-bit precisions so that the models can fit in GPU memory more easily, and able to hold more inference requests, thus improving the inference throughput
+(
+Lin et al., 2024b
+;
+Ramachandran et al., 2024
+;
+Zhao et al., 2024
+)
+.
+A possible concern is whether the activations saved from lower-bits LLMs during serving can be used in training without degrading the quality achieved after training.
+Fortunately, a great many works propose low-bit training that takes in activations with lower precision and shows that it can achieve similar quality as full precision training
+(
+Wang et al., 2025
+;
+Peng et al., 2023
+;
+Sun et al., 2019
+)
+.
+
+Parallelism Strategy Across Training and Serving Processes:
+
+A possible concern is that different optimal parallelism strategies between serving and training may impact the training throughput when co-locating serving and training. We leave this as future work.
+
+8.
+Related Works
+
+Serving systems:
+
+One of the most popular lines of LLM systems research focuses on developing
+efficient serving systems for LLMs, to improve the serving
+throughput
+(
+Kwon et al., 2023
+;
+Anonymous, 2024
+;
+Yu et al., 2022
+;
+Srivatsa et al., 2024
+;
+Zhong et al., 2024a
+;
+Patel et al., 2023
+;
+Lin et al., 2024a
+;
+Cao et al., 2025
+;
+Kwon et al., 2023
+)
+, or reduce the inference
+latency
+(
+Liu et al., 2024
+;
+Yao et al., 2024
+;
+Miao et al., 2024b
+;
+Qiao et al., 2024
+;
+Dao et al., 2022
+)
+.
+Common optimizations include caching and reusing the KV cache of other
+prompts
+(
+Liu et al., 2024
+;
+Gao et al., 2024a
+;
+Jin et al., 2024
+)
+, offloading KV cache to CPU
+or storage devices
+(
+Lee et al., 2024a
+;
+Liu et al., 2024
+;
+Qin et al., 2025
+)
+, better parallelization
+strategies that minimize network communication overhead
+(
+Zhong et al., 2024a
+;
+Qin et al., 2025
+;
+Microsoft, nd
+)
+, and faster attention CUDA kernels
+(
+Dao et al., 2022
+;
+Ye et al., 2025
+;
+Lefaudeux et al., 2022
+)
+.
+
+Alchemist
+is orthogonal to this line of work. The above optimizations
+developed by previous work can be easily adapted to
+Alchemist
+to make its
+inference part faster and more efficient.
+
+Training systems:
+
+Another line of LLM system work aims at designing efficient systems for LLM
+training. Some works improve parallelism strategies, such as designing
+different distributed parallelism for different submodules in multi-modal
+model training
+(
+Huang et al., 2024
+)
+, designing dynamic parallel strategies
+according to input sequence
+length
+(
+Li et al., 2024
+)
+, or reducing idle
+bubbles in pipeline parallelism
+(
+Huang et al., 2019
+)
+. Other works improve
+fault tolerance in distributed training by efficient model
+checkpointing
+(
+Lian et al., 2024
+;
+Wan et al., 2024
+)
+, or quickly detecting faulty machines in
+distributed training
+(
+Deng et al., 2024
+)
+and
+fastly recovering from failure
+(
+Wang et al., 2023a
+)
+. Finally, an emerging line of
+works builds faster training frameworks for RLHF, such as employing intra-stage
+and inter-stage fusion to improve GPU
+utilization
+(
+Zhong et al., 2024b
+)
+, or designing APIs
+for decoupling and orchestrating computation and data dependencies in RLHF
+dataflows.
+
+Alchemist
+is also complementary to this line of work, as the optimizations they
+bring up can be applied to the training part of
+Alchemist
+to make its training
+faster or higher throughput.
+
+GPU multiplexing for training and serving:
+
+Efforts on co-locating inference and training in video analytics relate well
+to
+Alchemist
+. Specifically, Ekya and RECL
+(
+Bhardwaj et al., 2020
+;
+Khani et al., 2023
+)
+enable continuous
+retraining on new video samples, and jointly host it with inference on the
+same device by letting them share GPU resources with technologies like Nvidia MPS
+(
+nvi, 2025
+)
+. Co-locating inference and
+training in LLMs is much harder than that for video analytics because these
+works assume the workload is deterministic. For example, the resolution and
+frame rate of the incoming stream are known. Hence, Ekya and RECL understand
+how much resource (
+e.g.
+, memory and computation cycles) the training side
+should occupy.
+
+A more related work, flexLLM
+(
+Miao et al., 2024a
+)
+, co-locates LLM inference and LoRA
+fine-tuning by fusing serving and training kernels, effectively sharing the GPU’s computation unit spatially. However, it only considers offline fine-tuning on different input
+data than that to the serving jobs, thus failing to reuse activations from
+serving, leading to redundant forward recomputation. This work can be complementary to
+Alchemist
+as its techniques in kernel fusion can further help
+Alchemist
+harvesting the idle computation units even when serving jobs are running.
+
+Continuous learning:
+
+Continual learning for large language models has rapidly evolved, with works like Ernie
+(
+Sun et al., 2020
+)
+and Don’t Stop Pretraining
+(
+Gururangan et al., 2020
+)
+demonstrating that continuous pre-training enables models to integrate new domain-specific knowledge without forgetting previous capabilities. Complementary approaches — ranging from reformulated domain adaptation frameworks
+(
+Zhang et al., 2023b
+)
+and reading comprehension-based domain tuning
+(
+Cheng et al., 2024
+)
+to strategies for mitigating forgetting across modalities
+(
+Cossu et al., 2022
+)
+— have further highlighted the effectiveness of incremental learning.
+
+In parallel, research has increasingly focused on aligning LLM outputs with human preferences and values. Studies on fine-tuning from human feedback
+(
+Ziegler et al., 2020
+;
+Stiennon et al., 2022
+;
+Qi et al., 2024b
+;
+Schulman et al., 2017
+)
+, optimal policy fitting
+(
+Zhang et al., 2023a
+)
+, and f-divergence minimization for preference alignment
+(
+Go et al., 2023
+)
+underscore the importance of ethical and user-aligned model adaptation. Moreover, parameter-efficient tuning techniques such as multi-task prompt tuning
+(
+Liu et al., 2023b
+)
+and ConPET
+(
+Song et al., 2023
+)
+offer promising solutions to balance continuous learning demands with computational efficiency.
+
+9.
+Conclusion
+
+By reusing intermediate activations produced during serving,
+Alchemist
+bridges the gap between real-time application demands and resource-intensive model updates. This approach not only increases training throughput by up to 1.72x and reduces memory overhead by as much as 47%, but it also maintains the stringent latency requirements essential for high-quality service delivery.
+
+These findings underscore the potential of reusing serving activations to unlock performance gains in online continual learning scenarios. Moving forward, further optimization of gradient recording techniques and dynamic activation management could pave the way for even more efficient LLM systems, ultimately enabling more scalable AI services.
+

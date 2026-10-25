@@ -1,0 +1,1648 @@
+SLOs-Serve: Optimized Serving of Multi-SLO LLMs
+Siyuan Chen, Zhipeng Jia, Samira Khan, Arvind Krishnamurthy, Phillip B. Gibbons
+
+Abstract
+. This paper introduces SLOs-Serve, a system designed for serving multi-stage large language model (LLM) requests with application- and stage-specific service level objectives (SLOs). The key idea behind SLOs-Serve is to customize the allocation of tokens to meet these SLO requirements. SLOs-Serve uses a multi-SLO dynamic programming-based algorithm to continuously optimize token allocations under SLO constraints by exploring the full design space of chunked prefill and (optional) speculative decoding. Leveraging this resource planning algorithm, SLOs-Serve effectively supports multi-SLOs and multi-replica serving with dynamic request routing while being resilient to bursty arrivals. Our evaluation across 6 LLM application scenarios (including summarization, coding, chatbot, tool calling, and reasoning) demonstrates that SLOs-Serve improves per-GPU serving capacity by 2.2x on average compared to prior state-of-the-art systems.
+
+
+
+1.
+Introduction
+
+Large Language Models (LLMs) are becoming increasingly popular.
+Current LLM applications, such as interactive chatbot
+(
+OpenAI, 2023
+)
+, coding assistant
+(
+Microsoft, 2023
+)
+, document summarizer
+(
+OpenAI, 2024b
+)
+, often feature
+multi-stage
+processing: A
+prefill
+stage processes the input text, and a
+decode
+stage generates tokens one by one. More recent
+Reasoning LLMs
+
+(
+Guo et al., 2025
+)
+introduce a new thinking stage between prefill and decode for solving highly complex problems. And, when moving to agentic scenarios where LLMs are given access to a list of tools to solve real-world problems
+(
+Qin et al., 2023
+)
+, a request is returned after rounds of internal processing stages between the LLM and the tools.
+
+Table 1
+.
+Multi-stage LLM applications with diverse SLOs.
+
+Application
+
+Stages
+
+SLOs
+
+Summarization
+
+•
+
+Long, fast prompt processing
+
+•
+
+Short reading-speed response
+
+Tight on prefill
+
+Loose on decode
+
+Coder
+
+•
+
+Normal length/speed prompt
+
+•
+
+Long, fast response
+
+Loose on prefill
+
+Tight on decode
+
+ChatBot
+
+•
+
+Normal length/speed prompt
+
+•
+
+Reading-speed response
+
+Loose on prefill
+
+Loose on decode
+
+LLM with Tools
+
+•
+
+Normal length/speed prompt
+
+•
+
+Fast toolCall-toolResponse loop
+
+•
+
+Reading-speed response
+
+Tight on prefill
+
+Tight on pref./dec.
+
+Loose on decode
+
+Reasoning LLM
+
+•
+
+Normal length/speed prompt
+
+•
+
+Long fast thinking
+
+•
+
+Reading-speed response
+
+Tight on prefill
+
+Tight on decode
+
+Loose on decode
+
+Figure 1
+.
+Serving Capacity comparison for LLM applications with heterogeneous SLOs, on a server with 4 A100s (experimental details in Tables
+2
+and
+4
+of §
+6
+). N/S: not supported.
+
+An LLM serving system, hosted on shared cloud servers, delivers online responses to LLM requests under service level objectives (SLOs).
+Meeting SLOs plays a key role in ensuring a positive user experience. As summarized in Table
+1
+, different stages in LLM serving often demand stage-specific SLOs for the best user experience.
+For example, in prefill-decode-based applications, document summarization demands high prefill throughput to digest lengthy documents, chatbot demands smooth decoding flow to match a human’s reading speed, and coding assistant demands lower per-token decode latency for code generation. What’s more, to respond to the user sooner, reasoning models may want to squeeze the time for the thinking stage, and an LLM-with-tools application may want to minimize the latency back and forth between the LLM and the tools.
+
+Supporting application-specific SLOs across multi-stage processings presents unique challenges in LLM serving due to complex resource sharing across requests and stages. State-of-the-art (SOTA) serving systems
+(
+Kwon et al., 2023
+;
+Agrawal et al., 2024
+;
+Zhong et al., 2024
+;
+Patel et al., 2024
+;
+Sun et al., 2024
+;
+Hu et al., 2024b
+)
+adopt continuous batching
+(
+Yu et al., 2022
+)
+to maximize the serving throughput by forming batches comprising of
+tokens
+from different stages and requests.
+Moreover, LLM serving systems use either co-located or disaggregated approaches to map processing stages to GPUs. Both approaches exhibit unique challenges for the scheduler to meet per-stage SLOs (§
+2.3
+). Co-location runs all stages on the same GPUs, with schedulers like vLLM
+(
+Kwon et al., 2023
+)
+and Sarathi-Serve
+(
+Agrawal et al., 2024
+)
+prioritizing different stages in isolation. This greedy approach causes significant SLO violations, especially during traffic spikes, as illustrated later in Fig.
+3
+.
+The disaggregation approach
+(
+Patel et al., 2024
+;
+Zhong et al., 2024
+;
+Qin et al., 2024
+;
+Hu et al., 2024a
+;
+Hu et al., 2024b
+)
+, on the other hand, separates stages onto different devices with customized configurations. But the approach struggles when load distribution changes dynamically due to varying input/output lengths or shifts in application domains (as illustrated later in Fig.
+4
+).
+
+In this paper, we propose
+SLOs-Serve
+, an LLM serving system designed to handle LLM applications with per-stage or per-request SLOs, overcoming all the above challenges. SLOs-Serve introduces an SLO-optimized scheduling algorithm tailored for LLM requests (§
+3
+). The key idea is to customize token allocation to meet stage- and request-specific SLO requirements.
+Unlike prior schedulers that greedily attain the SLO of a single stage, SLOs-Serve’s scheduler identifies a set of requests with attainable SLOs and, for that set, guarantees to satisfy every stage’s SLO until completion.
+Specifically, SLOs-Serve designs a multi-SLO dynamic programming-based algorithm (§
+3.2.1
+) to continuously optimize token allocations in batches under stage- and request-dependent SLO constraints by exploring the full design space of chunked prefill and dynamic batch-size tuning (§
+3.2.2
+).
+Additionally, we propose
+SLO-adaptive speculative decoding
+(§
+3.2.3
+), which customizes the speculation length in speculative decoding to meet stage- and request-dependent SLOs.
+The accuracy of our optimization depends on a profiling-based characterization of the target GPU’s capabilities on LLM workloads, which varies across GPU families (e.g., A100s vs. H100s).
+
+Building on top of the scheduling algorithm, we prototype SLOs-Serve, a distributed LLM serving system that supports multi-SLOs and multi-replica serving, while being resilient to bursty arrivals.
+During temporary high request loads, SLOs-Serve delays requests with unattainable SLOs to secure the SLO attainment of the rest (§
+4.1
+), whereas existing schedulers’ greedy approaches results in a cascading effect where every request fails to meet its SLO.
+In multi-replica serving, our system runs a centralized scheduler that virtualizes every replica, and proactively routes requests with unattainable SLOs at a replica to another with minimal scheduling overhead (§
+4.2
+). In this way, SLOs-Serve implements a form of
+soft admission control
+, in which “admitted” requests are guaranteed to meet their multi-stage SLOs and other requests are serviced either best effort (in single GPU settings) or routed to a different GPU for servicing (in multi-GPU settings).
+
+In evaluation, we benchmark SLOs-Serve against state-of-the-art (SOTA) serving systems (vLLM, Sarathi-Serve, DistServe) on 6 LLM application scenarios with customized SLOs. As displayed in Fig.
+1
+, SLOs-Serve improves the serving capacity (defined as the maximum request load per GPU while maintaining 90% SLO attainment) by a geo-mean of 2.2x compared to the best of Sarathi-Serve and vLLM and 2.4x compared to DistServe.
+In multi-replica serving, we observed that under bursty arrivals SLOs-Serve is able to serve up to 6.2x capacity with 4-replica serving compared with 1-replica serving. The linear scaling underscores SLOs-Serve scheduling algorithm’s effectiveness in load balancing.
+
+In summary, this paper makes the following contributions:
+
+•
+
+We identify the challenges in multi-SLO LLM serving under fine-grained resource sharing and propose a multi-SLO dynamic programming-based scheduling algorithm to resolve the challenges. Our scheduler explores the full design space of chunked prefill, speculative decoding, and dynamic batch-size tuning, and leverages soft admission control.
+
+•
+
+We build our design into SLOs-Serve, an LLM serving system that supports multi-SLOs, multi-replica serving, and is more robust to bursty arrivals than SOTA systems.
+
+•
+
+Comprehensive evaluations across 6 application scenarios, including the first comparison study on modern tool-based and reasoning LLMs, show that SLOs-Serve is able to improve SOTA serving system’s capacity by 2.2x on average.
+
+2.
+Background and Motivation
+
+In this section, we first summarize the current trend of LLM applications. We then articulate scheduling challenges introduced by emerging LLM applications while identifying pitfalls of current SOTA LLM schedulers.
+
+2.1.
+LLM Applications and Serving
+
+Multi-Stage LLM Applications
+
+Emerging LLM applications are evolving beyond the traditional two-stage model (prefill and decode) toward multi-stage processing. While classic applications like chatbots and summarizers follow this basic pattern, reasoning models add a thinking stage for problem-solving. Agentic applications demonstrate even greater complexity through iterative tool interaction loops. This evolution necessitates more sophisticated resource management to handle diverse execution patterns. Table
+1
+summarizes characteristics of five multi-stage LLM applications.
+
+Multi-SLOs Serving
+
+Complex LLM processing can be modularized into prefill and decode phases with distinct service level objectives (SLOs). The prefill stage (initial prompt processing, reasoning, tool interaction) is measured by Time-To-First-Token (TTFT), which impacts user wait time. The decode stage (token generation) is measured by Time-Per-Output-Token (TPOT), affecting response delivery speed.
+
+Stage-dependent SLO enforcement improves user experience. For reasoning models, prioritizing low TPOT in the thinking stage minimizes perceived latency, while the decode stage can tolerate higher TPOT aligned with human reading speeds. Similarly, agentic applications benefit from low TTFT and low TPOT during tool interactions and reading-speed TPOT for final responses. This granular control enables tailored optimization across different stages.
+
+Our goal is to maximize
+serving capacity
+, the maximum request load each GPU can process while maintaining a target SLO attainment rate (e.g., 90% attainment).
+
+2.2.
+LLM Serving Optimizations
+
+Continuous batching
+
+(
+Yu et al., 2022
+)
+improves throughput by combining processing stages from different requests. Since individual stages often underutilize hardware, batching increases simultaneous request handling with minimal latency overhead.
+Batches contain tokens from various stages and requests—prefill contributes prompt-length tokens, while decode adds one token at a time.
+Token batch size
+determines the throughput-latency tradeoff, with larger batches increasing throughput at the cost of latency, as shown in Fig.
+2
+.
+
+Figure 2
+.
+Throughput-latency trade-off for batching. Each data point–Green for the OPT-7B model
+(
+Zhang et al., 2022
+)
+on A100, Red for the OPT-13B model
+(
+Zhang et al., 2022
+)
+on H100–is a batch executed in SLOs-Serve’s scheduling with both prefill and decode tokens.
+
+Batch composition is diversified through:
+
+•
+
+Chunked prefill
+
+(
+Agrawal et al., 2024
+)
+breaks long prefill stages into smaller chunks, preventing decode stages from stalling. Instead of using fixed maximum token sizes that limit throughput, batch sizes are dynamically adjusted based on system load (§
+3.2.2
+).
+
+•
+
+Speculative decoding
+
+(
+Leviathan et al., 2023
+)
+uses a smaller "draft" model which speculates multiple token steps. Drafted tokens are verified in a single batch by the main model. The verification step processes multiple tokens simultaneously, creating new batching opportunities. While not always beneficial due to potential errors and overhead, adapting speculation lengths to SLOs can surprisingly improve throughput (§
+3.2.3
+).
+
+2.3.
+Challenges
+
+Supporting application-specific SLOs for multi-stage processing in LLM requests presents complex challenges due to the resource contention and diversified optimizations within continuous batching.
+We re-visit existing scheduling approaches and understand how they fail to meet the challenges.
+
+Co-located Scheduling.
+
+Figure 3
+.
+Comparison between different co-located scheduling approaches.
+
+Current
+co-located
+schedulers (all GPUs run a mix of stage types) suffer from a fundamental flaw: they prioritize attaining SLOs at individual stages in isolation. For instance, vLLM
+(
+Kwon et al., 2023
+)
+employs a
+prefill-oriented scheduling
+approach, which eagerly executes each request’s prefill stage to minimize TTFT. But this strategy often leads to widespread TPOT violations due to the low priority assigned to decode processing. Conversely, Sarathi-serve attempts to mitigate this issue by breaking the prefill process into smaller chunks, but its
+decode-oriented scheduling
+prioritizes filling batches with decode tokens, resulting in TTFT violations.
+
+To illustrate these shortcomings, consider the scenario in Fig.
+3
+where the system can process six tokens per time unit, and a burst of four requests arrives, each with six prefill tokens. At the time of arrival, the system has three ongoing decodes.
+The SLOs are set at six time units for TTFT and one time unit for TPOT. In a prefill-oriented scheduling scheme, the scheduler preempts ongoing decoding requests to execute incoming prefill requests, causing decoding stalls and subsequent TPOT violations. As the number of decoding requests overwhelms the system’s processing capacity, some requests are guaranteed to miss their TPOT SLOs. In our example, requests three and four fail to meet their TPOT requirements. In contrast, a decode-oriented scheduler prioritizes filling available resources with decode tokens, leading to prolonged prefill stages and severe TTFT violations. E.g., when the first request’s prefill completes, the scheduler allocates a token budget per time unit for decoding, delaying the second request’s prefill. This delay propagates, causing requests three and four to miss their TTFT SLOs, with request three’s prefill completion delayed to the 11th time slot (TTFT violation) and request four’s delayed even further.
+
+The greedy nature of these scheduling approaches motivates our design of balanced scheduling with soft admission control. As shown later, our scheduler allocates tokens by taking into account the SLOs across stages (§
+3
+) and employs special handling for requests whose SLOs are inherently unattainable (§
+4
+). In the Fig.
+3
+example, we successfully attain the SLOs for all existing requests, as well as three out of the four new requests.
+Thus, our multi-SLO attainment rate is higher than the prior approaches.
+Note that in general, some form of SLO-aware request prioritization (e.g., soft admission control) is required to prevent cascading-lateness effects and to maximize attainment rates (and serving capacity).
+
+Disaggregated Scheduling
+
+In
+disaggregated
+scheduling
+(
+Zhong et al., 2024
+;
+Patel et al., 2024
+)
+, different stage types are separated onto different (groups of) GPUs. In this way, one can specialize for every stage’s SLO by adjusting the hardware configurations
+(
+Zhong et al., 2024
+)
+, and balance workloads across stages by adjusting the GPUs allocated to every stage.
+
+Figure 4
+.
+Capacity in DistServe with different prefill (PF), decode (DCD) device ratios when serving the OPT-13B model with H100 GPUs. The capacity is normalized to 1 PF:1 DCD.
+
+However, the flexibility of disaggregated scheduling is limited by the fact that optimal hardware configurations depend on the stage’s loads, which are highly dynamic in our setup. As illustrated in Figure
+4
+, decode-heavy applications such as ChatBot require a higher allocation of decoding devices (1 decode: 2 prefills), whereas prefill-heavy workloads like Coder benefit from more prefill device allocation (2 prefills: 1 decode). Consequently, a single static allocation strategy is ineffective for serving multiple applications, as well as attaining request-dependent SLOs.
+
+In fact, to achieve optimal serving capacity, the ideal prefill-to-decode device ratio in disaggregated scheduling can be expressed as:
+
+\frac{n_{prefill}}{n_{decode}}=\frac{(1-\frac{C}{TPOT})E[prefillLength]}{E[decodeLength]}
+,
+which is dependent on both the SLO requirement and the stage loads. See Appendix
+A
+for detailed discussions.
+
+3.
+SLOs-Serve Scheduler
+
+In this section, we introduce SLOs-Serve’s scheduler that addresses the challenges discussed in §
+2.3
+.
+
+3.1.
+Scheduling with Soft Admission Control
+
+To ensure multi-stage SLO attainment, SLOs-Serve’s scheduler introduces a
+soft admission control
+mechanism that guarantees SLO attainment for admitted requests and handles declined requests (say, 2%) with fallback mechanisms.
+Periodically, the scheduler selects an optimal subset of new requests that can attain their SLOs.
+Then, it determines execution plans, integrating these selected requests into future batched executions.
+
+Algorithm
+1
+shows the pseudocode of SLOs-Serve’s scheduling with soft admission control. The scheduler is invoked upon the occurrence of a timeout or when the number of new or completed requests surpasses a predefined threshold. Upon invocation, the scheduler takes in states for running and new requests, as well as a performance model, to generate admission decisions and future batch schedules (Line
+1
+). Declined requests are (Line
+1
+) specially handled, as elaborated later in §
+4
+.
+For accepted requests, the batch schedules ensure SLO attainment. Each batch is represented as:
+
+(1)
+
+\displaystyle Batch:=[(ID_{i},S_{i}\in\{Prefill,Decode\},\#Token_{i})_{i}],
+
+where each entry specifies the processing of
+\#Token_{i}
+tokens for request
+ID_{i}
+in state
+S_{i}
+. A batch supports chunked prefill by processing less than full tokens for prefill requests, as well as speculative decoding by verifying more than one token for decode requests.
+The computed batches are executed using a stateless
+BatchForward
+function (Line
+1
+), which we elaborate in Algorithm
+3
+in the Appendix.
+
+Algorithm 1
+
+SLOs-Serve’s LLM Serving
+
+Input:
+
+Reqs_{new}
+
+State:
+
+Reqs_{running},thresh_{new},thresh_{finished},\mathcal{M}:\ Perf.\ Model
+
+1
+
+Infinite Run:
+
+2
+
+Reqs_{admitted},Reqs_{declined},Batches\leftarrow
+Schedule(
+Reqs_{running}
+,
+Reqs_{new}
+,
+t
+,
+\mathcal{M}
+)
+
+3
+
+Reqs_{running}\leftarrow Reqs_{running}+Reqs_{admitted}
+
+4
+
+Reqs_{new}\leftarrow\emptyset
+
+5
+
+foreach
+
+request in
+Reqs_{declined}
+
+do
+
+6
+
+Perform best effort serving (§
+4.1
+) or route to another replica (§
+4.2
+).
+
+7
+
+\#finished\leftarrow 0
+
+8
+
+for
+
+batch
+in Batches
+
+do
+
+9
+
+Call
+BatchForward
+(
+batch
+);
+
+10
+
+foreach
+
+request in
+Reqs_{running}
+
+do
+
+11
+
+if
+
+request is finished
+
+then
+
+12
+
+Reqs_{running}\leftarrow Reqs_{running}-request
+
+\#finished\leftarrow\#finished+1
+
+13
+
+if
+
+TimeOut or
+\#finished>thresh_{finished}
+or
+|Reqs_{new}|>thresh_{new}
+
+then
+
+14
+
+Goto line
+1
+.
+
+3.1.1.
+Performance Modeling for Batch Execution.
+
+To make scheduling decisions, the scheduler relies on a performance model that accurately characterizes per-batch execution times.
+We design our model to work for different hardware architectures by adopting a generalized Roofline model
+(
+Williams et al., 2009
+)
+.
+Specifically, the execution time of a
+BatchForward
+call is modeled as:
+
+\displaystyle\hat{T}(\texttt{BatchForward}
+
+\displaystyle(batch))=
+
+\displaystyle max_{l}\ (k^{l}_{1}
+
+\displaystyle\#Tokens+k^{l}_{2}\#SpecStep+b_{l})
+
+\displaystyle\#Tokens
+
+\displaystyle:=\Sigma_{i\in batch}\#Token_{i}
+
+\displaystyle\#SpecStep
+
+\displaystyle:=max_{i\in batch,\ S_{i}\ \text{is prefill}}\#Token_{i}
+
+where the
+k^{l}_{1},k^{l}_{2},b_{l}
+s are parameters obtained by regression on profiled data from runs on (multi-)GPU backends.
+Each term (
+l=2
+in practice) within the max function represents a source of execution time, such as
+k^{l}_{1}\#Tokens
+for computation time, constant
+b_{l}
+for fixed memory access to the model weights, and
+k^{l}_{2}\#SpecStep
+for the speculative model’s overhead.
+The max operation identifies the bottleneck that limits performance, assuming sufficient parallelism.
+We validate the fidelity of the performance model against empirical measurements on A100s and H100s in Fig.
+10(b)
+.
+
+3.2.
+SLOs-Serve’s scheduling algorithm
+
+We now present SLOs-Serve’s dynamic-programming based scheduling algorithm (Line
+1
+of Algorithm
+1
+).
+
+(a)
+
+Valid Scheduling with admission control.
+
+(b)
+
+Invalid Scheduling w/o admission control.
+
+(c)
+
+Gain from Dynamic Batch Size Tuning.
+
+Figure 5
+.
+Illustration of the scheduling algorithms
+
+An Example
+
+We use a toy example in Fig.
+5
+to provide the intuition.
+This example requires the scheduler to make scheduling decisions on three new requests, SLOs of which are represented by lines.
+The line for request
+R_{i}
+starts at point
+(pDDL_{i},p_{i})
+, representing that
+p_{i}
+tokens must be allocated to
+R_{i}
+before the prefill deadline
+pDDL_{i}
+,
+and then grows at rate
+k_{i}
+tokens/s, representing token generation with speed
+k_{i}
+.
+This representation encodes multi-SLOs across requests and stages.
+For example,
+R2
+may represent a chatting request with smooth decoding speed,
+R1
+as a coding request with higher generation speed demand, and
+R3
+as a summarization request with a longer input.
+
+The
+accumulated token budget
+line (red) depicts the total available tokens, the slope of which represents the token throughput decided by the launched batches.
+In Fig.
+5(b)
+,
+5(a)
+, we assume a fixed token batch size over time, which results in a linear budget increase.
+Fig.
+5(c)
+demonstrates a more efficient approach through
+dynamic batch size tuning
+, enabling non-linear budget growth with higher token throughput.
+
+The scheduling problem—admission control and batch schedule determination—is equivalent to finding a subset of lines whose cumulative demand always remains below the accumulated token budget.
+Violation of this condition, where the cumulative demand of admitted requests surpasses the budget, negates feasible schedules.
+Meeting the condition, on the other hand, ensures that the system can satisfy the decoding token requirements of all admitted requests, as their combined generation rate is less than the budget’s slope, and the available budget at each request’s prefill deadline exceeds the accumulated prefill demand.
+
+For example, admitting all three requests in Fig.
+5(b)
+(indicated by ACC) results in demand exceeding the budget before
+R3
+’s prefill deadline, leading to a violation. However, admitting only
+R1
+and
+R3
+(Fig.
+5(a)
+) keeps the cumulative demand within the budget, indicating a valid batched schedule.
+Furthermore, implementing dynamic batch size tuning allows the attainment of SLOs for all three requests because of the enlarged token budget (Fig.
+5(c)
+).
+
+3.2.1.
+Scheduling via Dynamic Programming
+
+To make admission control and batching decisions, SLOs-Serve uses a multi-SLO dynamic programming (DP) algorithm.
+
+We use the following notations. Suppose there are
+N
+requests in total, request
+R_{i}
+arrives at
+t_{i}
+with prompt of length
+p_{i}
+and a memory requirement
+m_{i}
+.
+R_{i}
+comprises a prefill stage followed by a decode stage. Every request has a deadline for its prefill stage
+pDDL_{i}
+. For the decode stage, a request can enforce the TPOT SLO for every token from a vector of choices
+TPOT_{1},TPOT_{2},...,TPOT_{L}
+.
+We say that a request’s SLO is attained if and only if the SLO for every stage is satisfied. Successfully attaining
+R_{i}
+’s SLO yields value
+v_{i}
+.
+
+The scheduling algorithm optimizes batch schedules to maximize the total value gained from attaining requests’ SLO.
+We solve the problem using dynamic programming that incrementally calculates
+DP[i,m,pb,n]
+, defined as the best value a scheduler can ever get from serving the first
+i
+requests with earliest prefill deadlines, while generating
+pb
+
+prefill budget
+by the end of
+R_{i}
+’s prefill deadline (
+pDDL_{i}
+) within
+m
+memory units.
+The prefill budget, defined as the token budget remaining after satisfying the decode SLOs for accepted requests, is always positive and is used to attain the prefill SLOs for unscheduled requests, i.e., requests with later prefill deadlines.
+The state transition function is
+
+\displaystyle DP[i,m,pb,n]
+
+\displaystyle=\max_{\begin{subarray}{c}j,\\
+pDDL_{j}<pDDL_{i},\\
+\Delta pb\geq 0,\ m\geq m_{i}\end{subarray}}\left\{DP[j,m-m_{i},pb+p_{i}-\Delta_{i,j}^{n-1}pb,n-1]+v_{i}\right\}.
+
+This equation enumerates over the last accepted request
+j
+, whose prefill deadline precedes
+i
+’s, to find the optimal prior state that leads to the highest value.
+To generate
+pb
+prefill tokens by
+pDDL_{i}
+, the prefill budget at
+pDDL_{j}
+must be at least
+pb+p_{i}-\Delta_{i,j}^{n-1}pb
+. Here,
+p_{i}
+is prefill budgets consumed by
+R_{i}
+’th prefill stage, and
+\Delta_{i,j}^{n-1}pb
+represents the newly generated prefill budgets during the interval between
+R_{i}
+and
+R_{j}
+’s prefill deadlines, with
+n-1
+accepted requests. Specifically, SLOs-Serve solves a constrained optimization problem to calculate the
+\Delta_{i,j}^{n}pb
+:
+
+(2)
+
+\displaystyle\Delta_{i,j}^{n}pb=PB^{*}(pDDL_{i}-pDDL_{j},n),\text{and }
+
+\displaystyle PB^{*}(t,n)=\max_{\text{partial batches}}\sum_{b\in\text{partial batches}}b.\text{prefillBudget},
+
+(3)
+
+\displaystyle\quad\text{subject to attaining decode SLOs for }n\ \text{requests}.
+
+The equation above solves for partial batches that maximizes total prefill budgets while attaining decode SLOs in a time interval
+t
+.
+A partial batch specifies its total token budget, allocates them to decode requests and leaves the rest as prefill budget.
+The partial batch’s total token budget and decode token allocation can be used by the performance model in §
+3.1.1
+to estimate the per-batch execution time.
+Using the performance model, a solver identifies the optimal list of partial batches that maximize the remaining prefill budgets after satisfying the decode SLOs of accepted requests.
+We later present two solvers: one for auto-regressive decoding based serving (Algorithm
+2
+), and another for speculative-decoding based serving (§
+3.2.3
+).
+
+The Optimal Solution.
+
+The optimal value
+v^{*}
+is identified by
+(i^{*},n^{*}),v^{*}=\operatorname{arg}\max_{i,n}DP[i,M,0,n]
+, where
+M
+denotes total memory units. Here,
+R_{i^{*}}
+is the last accepted request, and
+n^{*}
+is the total number of accepted requests.
+We reconstruct the optimal schedule by tracking
+j^{*}[i^{*},M,0,n^{*}]
+from Eqn.
+5
+for admission decisions, and
+B^{*}[i^{*},M,0,n^{*}]
+from Eqn.
+3
+for the scheduled partial batches.
+Since tokens in partial batches are only allocated to decode requests, we allocate the prefill budget in every batch by prioritizing requests with earlier prefill deadlines.
+It is guaranteed to have sufficient prefill budgets for allocation, because the DP algorithm requires the prefill budget to be non-negative by every prefill deadline.
+
+Continuous Optimization.
+
+The scheduler, previously discussed for a new-request-only scenario, can be extended to accommodate running requests through forced admission.
+Forcing admission for running requests maintains SLOs-Serve’s invariant of guaranteeing SLOs for all admitted requests.
+Specifically, during enumeration in Eqn.
+5
+, the last admitted request before
+R_{i}
+is constrained to either the latest running request with a prior prefill deadline or any request within their respective deadlines.
+Continuous optimization, as shown in §
+6.4
+, minimizes the overhead imposed by running requests.
+
+Multi-Decode SLOs.
+
+For a request with multiple decode SLOs (e.g., a reasoning request with a tight SLO for thinking and a loose SLO for response), its tightest SLO is taken to upper-bound the resource demand. When requests have different decode SLOs, the DP scheduler tracks the accepted requests per TPOT SLO, updating its state to include SLO-specific request counts:
+(i,m,pb,(n_{1},n_{2},...,n_{L}))
+. This information enables the solver to generate optimal batch schedules across varying decode SLOs.
+
+Time Complexity
+
+Given
+N
+total requests,
+N_{new}
+new requests,
+L
+decode tiers, and
+M
+memory units, since every transition enumerates at most
+N_{new}
+previous states, the total time complexity is bounded by
+O(|States|\times N_{new})=O(N\cdot N_{new}^{L+1}\cdot M\cdot\Sigma_{i}p_{i})
+. When the optimization goal is request throughput under SLOs, the time complexity is reduced to
+O(N\cdot N_{new}^{L+1}\cdot M)
+(see Appendix
+C
+).
+In practice, with typical workloads of zero to ten new requests and dozens to hundreds of running requests, our scheduler introduces negligible overhead (see more in §
+6.4
+).
+
+3.2.2.
+Batch Formation with Dynamic Size Tuning
+
+We now describe our approach to form batches in Eqn.
+3
+with auto-regressive decoding (top row in Figure
+3.2.3
+) that maximizes the prefill token budgets subjecting to the decode SLO constraints.
+Since token throughput increases monotonically with batch sizes (Fig.
+2
+), we form batches by
+selecting the largest possible batch size that satisfies the decoding SLOs of all running requests.
+
+Algorithm
+2
+details this process. First, the tightest TPOT SLO among running requests is determined (line
+2
+), which sets the latency for all scheduled batches. Subsequently, tokens are allocated to decoding requests in an early deadline first priority queue (lines
+2
+-
+2
+), ensuring their SLOs are met. Compared to Sarathi-Serve, which globally caps batch sizes based on the tightest TPOT SLO, this algorithm improves token throughput by dynamically adapting batch sizes to the current set of running requests.
+
+Algorithm 2
+
+Batch Formation
+
+Input:
+
+t
+,
+Reqs_{Decoding}
+,
+\mathcal{M}:\text{Perf. Model}
+
+Output:
+
+Batches
+
+1
+
+t_{0}\leftarrow\min_{req\in Reqs_{Decoding}}req.TPOT
+;
+
+2
+
+for
+
+req\in Reqs_{Decoding}
+
+do
+
+3
+
+req.schDDL\leftarrow 0
+;
+
+4
+
+Q\leftarrow\text{PrioQueue}(Reqs_{Decoding},\text{schDDL})
+;
+
+5
+
+batches\leftarrow[]
+;
+
+6
+
+for
+
+i\leftarrow 0...\lfloor t/t_{0}\rfloor-1
+
+do
+
+7
+
+b\leftarrow\text{Batch}(prefillBgt=\mathcal{M}.time2bs(t_{0}))
+;
+
+8
+
+while
+
+Q.\text{front()}.schDDL\geq i\cdot t_{0}\wedge b.prefillBgt>0
+
+do
+
+9
+
+req\leftarrow Q.\text{pop}()
+;
+
+10
+
+b.\text{scheduleDecode}(req)
+;
+
+11
+
+b.prefillBgt\leftarrow b.prefillBgt-1
+;
+
+12
+
+req.schDDL\leftarrow req.schDDL+req.TPOT
+;
+
+13
+
+Q.\text{push}(req)
+;
+
+14
+
+batches.\text{append}(batch)
+;
+
+15
+
+return
+
+batches
+;
+
+3.2.3.
+SLO adaptive Speculative Decoding
+
+Figure 6
+.
+SLO-adaptive Speculative Decoding
+
+We extend the batch formation technique to incorporate speculative decoding for enhanced efficiency.
+With speculative decoding, token throughput is increased by relieving the per-batch latency constraint through processing more tokens per batch.
+This is because, as illustrated in Fig.
+6
+, auto-regressive decoding constrains batch token capacity based on the tightest decode SLO.
+In contrast, speculative decoding permits the processing of multiple decode tokens per request within a batch, thereby relaxing per-batch latency constraints (e.g.,
+2\times TPOT
+when generating two tokens per batch) and increasing token throughput. Furthermore, with multiple decode SLOs, token allocation can be dynamically adjusted per request, enabling SLOs-Serve to maximize the prefill token budget within a defined time frame. A contemporary work
+(
+Li et al., 2025
+)
+proposes a similar idea to customize token allocation in speculative decoding for multi-decode SLOs. However, they are focusing on a decode-only setup, while SLOs-Serve targets multi-stage scenarios and utilizes speculative decoding to enable higher token throughput.
+
+Specifically, suppose there are
+n_{1},...,n_{L}
+requests in the decoding stage running with TPOTs
+TPOT_{1},...,TPOT_{L}
+, we decide the batch in Eqn.
+3
+with the maximum prefill token throughput by solving the following problem (see details in Appendix.
+D
+):
+
+\displaystyle\max_{\begin{subarray}{c}sl_{1:L}\end{subarray}}prefillTpt
+
+\displaystyle:=\frac{\text{PrefillBgtPerBatch}}{\text{Batch Time}}
+
+PrefillBgtPerBatch
+
+\displaystyle=Time2BS(T(sl_{1:L}),sl_{1:L})-\sum_{i}n_{i}sl_{i}
+
+Batch Time
+
+\displaystyle=T(sl_{1:L})=\min_{l\in 1,2,...,L}(TPOT_{l}\cdot Acc(sl_{l}))
+
+Here,
+sl_{1:L}
+are per-decode SLO speculation lengths, and
+Acc(sl_{l})
+is the expected number of tokens generated for requests with
+TPOT_{l}
+. Then, the optimal speculation lengths and prefill budget are used to construct batches used in the DP algorithm.
+
+To account for the uncertainty in speculative decoding’s prediction, we dynamically adjust the request’s decode SLOs. For example, we strengthen its SLO when a request falls behind its SLO in the decoding stage.
+
+4.
+SLOs-Serve
+
+Building on top of the soft admission control mechanism, we design SLOs-Serve with two fallback mechanisms that enable
+burst resilient scheduling
+and
+SLO-driven request routing
+.
+
+4.1.
+Burst Resilient Scheduling
+
+When request bursts occur, resulting in instantaneous loads exceeding server capacity, SLOs-Serve introduces
+burst resilient scheduling
+. This mechanism delays requests with unattainable SLOs to ensure SLO attainment for the remaining requests.
+
+In addition to standard services with defined SLOs, SLOs-Serve incorporates a cost-effective best-effort service tier. This tier utilizes any leftover resources after fulfilling SLO-guaranteed requests, similar to OpenAI’s batch API
+(
+OpenAI, 2024a
+)
+, which offers lower costs with a longer response time. The scheduler seamlessly integrates this best-effort tier by batching requests to consume surplus token budgets and executing them when sufficient memory is available. To prioritize SLO-guaranteed requests, the scheduler can preempt best-effort requests upon new arrivals. Preemption overhead is minimized by discarding only the cached states (KV Cache), while retaining the generated tokens. This allows preempted requests to resume with a single prefill step, recomputing the cache for the original prompt and previously generated tokens, rather than repeating the entire decoding process.
+
+SLOs-Serve then employs the best-effort service tier to handle bursts and requests with unattainable SLOs. After the admission decision by the scheduler, requests with unattainable SLOs are offloaded to the best-effort tier. While this tier lacks SLO guarantees, it is shown later that these requests are efficiently handled during low or zero-load periods following the burst (Fig.
+11
+), maximizing system utilization.
+
+Figure 7
+.
+SLOs-Serve’s Multi-Replica Serving.
+
+4.2.
+Multi-replica Serving with SLO-driven Request Routing
+
+SLOs-Serve’s scheduler and performance modeling provide the foundation for a scalable multi-replica LLM serving system with high per-GPU utilization.
+
+Fig.
+7
+shows the architecture of SLOs-Serve’s multi-replica serving framework. Each replica is associated with a scheduler operating within a centralized controller, which virtualizes execution using the performance model. Upon arrival of a new request at a replica (dispatched by a load balancer), the scheduler determines SLO attainability. If the current replica cannot meet the SLO, the request is routed to the next replica sequentially. When the routing counts reach a pre-configured limit, a backup policy is invoked, deciding whether to decline the request or offload it to lower-tier resources. While previous works on LLM load balancing always rely on device profiling with indirect metrics (e.g., device loads and memory consumption)
+(
+Sun et al., 2024
+;
+Stojkovic et al., 2024
+;
+Hu et al., 2024b
+)
+, SLOs-Serve directly balances the load based on SLO attainment, looking forward to full GPU utilization and rigorous SLO attainment. Note that sequential routing is one of many ways
+(
+Gawlick, 1995
+)
+to leverage SLOs-Serve’s admission control mechanism in multi-replica routing, and we leave the exploration of this to future work.
+
+5.
+Implementation
+
+We build SLOs-Serve as a distributed LLM serving system that supports multi-SLOs, multi-replica serving, while being resilient to request bursts.
+Currently, we support vLLM as our backend but it is easy to extend to other backends as long as they comply with our batched execution model.
+We utilize PagedAttention
+(
+Kwon et al., 2023
+)
+for memory management and Ray
+(
+Moritz et al., 2018
+)
+for the orchestration between the scheduler and the backend. The implementation of the scheduling orchestrations with the executor interface, serving frontend, takes 10K lines of Python Code, whereas the resource planning algorithm is highly crafted in C++ with 1.5K LoC.
+
+6.
+Evaluation
+
+We evaluate SLOs-Serve on a total of six scenarios (Tab.
+2
+) and five datasets (Tab.
+4
+). We consider vLLM, Sarathi-Serve, DistServe as our baselines as they represent SOTA for LLM serving. Our evaluation seeks to answer these questions:
+
+•
+
+What is the maximum capacity (i.e., request load) a single GPU can serve under specific SLO constraints with different serving systems, and how well does SLOs-Serve stay resilient with bursty arrivals (§
+6.1
+)?
+
+•
+
+In multi-replica serving, how does SLOs-Serve scales with the number of replicas (§
+6.2
+)?
+
+•
+
+How do SLOs-Serve’s individual optimizations in isolation contribute to its performance (§
+6.3
+)?
+
+Table 2
+.
+Experiment Scenarios.
+
+Scenarios
+
+Arrival Pattern
+
+Prompt Dataset
+
+Model
+
+ChatBot
+
+Azure-Chatting
+(
+Patel et al., 2024
+)
+
+ShareGPT
+(
+sha, [n. d.]
+)
+
+Main: OPT-7B/13B/30B
+(
+Zhang et al., 2022
+)
+
+Coder
+
+Azure-Coding
+(
+Patel et al., 2024
+)
+
+HumanEval
+(
+Chen et al., 2021
+)
+
+Summarizer
+
+Azure-Chatting
+
+Arxiv Summary
+(
+Cohan et al., 2018
+)
+
+Spec: OPT-125m
+
+Mixed
+
+ChatBot + Coder + Summarizer
+
+ToolLLM
+
+Azure-Coding
+
+ToolBench
+(
+Guo et al., 2024
+)
+
+ToolLlama-7B
+(
+Qin et al., 2023
+)
+
+Reasoning
+
+Azure-Chatting
+
+s1K
+(
+Muennighoff et al., 2025
+)
+
+Deepseek-R1-Qwen-1.5B
+(
+Guo et al., 2025
+)
+
+Setup.
+
+We evaluate SLOs-Serve across different models: OPT series
+(
+Zhang et al., 2022
+)
+for standard scenarios (ChatBot, Coder, Summarizer), ToolLlama
+(
+Qin et al., 2023
+)
+for ToolLLM, and a distilled Deepseek-R1-Qwen model
+(
+Guo et al., 2025
+)
+for the reasoning scenario—these models are either used in evaluation by previous work
+(
+Leviathan et al., 2023
+;
+Zhong et al., 2024
+)
+or well-suited for the application.
+For the end-to-end capacity evaluation, we use the Google a2-highgpu-4g VM with 4 NVIDIA 40GB A100 GPUs, connected with pairwise NVLINK. For the OPT-13B (OPT-30B) model, we run with 2-way (4-way) tensor parallelism. For the OPT series, we use OPT-125m as the speculative decoding model and replicate it on every GPU.
+For the OPT-7B model, we run SLOs-Serve with up to 4 replicas.
+For other models, we run SLOs-Serve with a single replica.
+We run SLOs-Serve with a best-effort tier across all scenarios.
+For memory management, we assume prior knowledge on decode lengths available to all baselines, which can be well-approximated from previous works
+(
+Sun et al., 2024
+;
+Qin et al., 2024
+;
+Hu et al., 2024b
+;
+Prabhu et al., 2024
+)
+.
+For the scalability evaluation, we use an additional Google a3-highgpu-8g with 8 NVIDIA 80GB H100 GPU to perform multi-replica serving for the OPT-13B model.
+
+(a)
+
+Coding Trace.
+
+(b)
+
+Chatting Trace.
+
+Figure 8
+.
+Traces from Azure Dataset
+(
+Patel et al., 2024
+)
+used in evaluation.
+
+Workloads
+
+We used Azure LLM inference traces
+(
+Patel et al., 2024
+)
+for realistic request arrival patterns: Coding shows bursty arrivals, while Chatting is more stable (Fig.
+8
+). Request lengths are based on Azure traces, supplemented by Arxiv Summary
+(
+Cohan et al., 2018
+)
+, ToolBench
+(
+Guo et al., 2024
+)
+, and s1K
+(
+Muennighoff et al., 2025
+)
+for specific scenarios (Tab.
+4
+). ChatBot and Reasoning are decode-heavy with long outputs, Summarizer is prefill-heavy, and Coder and ToolLLM exhibit the largest input/output length variations.
+
+SLOs.
+
+We enforce the SLO based on the specification in Tab.
+1
+. Particularly, we focus on the max TTFT slowdown compared to zero-load setup for the prefill stages and max TPOT for the decode stages. Because speculative decoding outputs more than one token at a time, we measure the TPOT every 10 tokens.
+
+Baseline
+
+We consider vLLM
+(
+Kwon et al., 2023
+)
+(commit
+c38eba30
+), Sarathi-Serve
+(
+Agrawal et al., 2024
+)
+(enabled with vLLM), and DistServe
+(
+Zhong et al., 2024
+)
+(commit
+0a2d0c99
+) as our baseline as they represent the SOTA serving frameworks. For vLLM, we additionally evaluate its speculative decoding version (vLLM (Spec)). For Sarathi-Serve, we configure the batch size to the maximum size without violating the tightest decode SLO. For DistServe, we experimented with different prefill-decode device allocations (1:1, 2:1, 1:2) and report the best result.
+
+Metric
+
+We evaluate serving capacity (maximum GPU request load with less than 10% SLO violations
+(
+Zhong et al., 2024
+;
+Agrawal et al., 2024
+)
+). For multi-GPU systems, we normalize the request rate by dividing the total request rate by the number of GPUs.
+
+Table 3
+.
+SLOs for different model configurations.
+
+Max TTFT Slowdown
+
+Max TPOT
+
+Tight SLO
+
+3x
+
+50ms
+
+Loose SLO
+
+5x
+
+100ms
+
+Table 4
+.
+Datasets used for evaluation. For the reasoning task, we list the number of tokens for thinking/response. For the ToolLLM, there is 2.7 +- 1.1 prefill-decode pairs in a request.
+
+Prompt Tokens
+
+Output Tokens
+
+Mean
+
+P99
+
+Std.
+
+Mean
+
+P99
+
+Std.
+
+ChatBot
+
+763
+
+1591
+
+424
+
+266
+
+619
+
+160
+
+Coder
+
+847
+
+2010
+
+617
+
+26
+
+232
+
+47
+
+Reasoning
+
+127
+
+421
+
+83
+
+4693/803
+
+7297/1650
+
+1442/280
+
+Summarizer
+
+1333
+
+1946
+
+444
+
+202
+
+1508
+
+234
+
+ToolLLM
+
+690
+
+2131
+
+356
+
+116
+
+363
+
+66
+
+Figure 9
+.
+End-to-End evaluation of SLOs-Serve.
+
+(a)
+
+Cumulative Execution Time along Batch Sizes for the OPT-7B with Summarization Scenario at 3.0 request/s.
+
+(b)
+
+Predicted Time vs. Real Time for the performance model across LLMs, #Tensor Parallel (TP), and hardwares (A100 if unmarked).
+
+Figure 10
+.
+Analysis.
+
+6.1.
+End-to-end Capacity Evaluation
+
+The end-to-end evaluation (Fig.
+9
+) demonstrates that SLOs-Serve consistently outperforms baseline systems. Specifically, it achieves a 1.76x capacity improvement over vLLM, 1.94x over Sarathi, and 2.6x over DistServe. The performance gain is attributed to SLOs-Serve’s optimizations, including SLO-optimized, burst-resilient scheduling, as well as request routing. Even when enforcing a stringent 2% SLO violation constraint, which mitigates the impact of delaying requests with unattainable SLOs, SLOs-Serve maintains a capacity advantage in the ChatBot scenario: 1.91x over vLLM, 2.19x over Sarathi, and 2.4x over DistServe. These results underscore SLOs-Serve’s robust support for multi-stage SLOs.
+
+With stable request arrival rates in both ChatBot and Summarizer scenarios (Figure
+9
+), maximizing token throughput under multi-stage SLOs is the key to high serving capacity.
+Among baselines, vLLM prioritizes prefill, resulting in widespread decode SLO violations. SLOs-Serve and Sarathi multiplex stages, but Sarathi’s fixed batch size limits throughput, particularly in the Summarizer scenario with longer input text and tight prefill SLOs. SLOs-Serve addresses this with SLO-adaptive speculative decoding and dynamic batch size tuning, enabling larger batches. Specifically, shown in Figure
+10(a)
+, SLOs-Serve utilizes batches exceeding 512 tokens for up to 25% of execution time, while Sarathi is capped at 512. Consequently, SLOs-Serve achieves 1.41-1.70x and 1.14-1.17x serving capacity than baselines across OPT-7B, 13B, and 30B models for ChatBot and Summarizer, respectively.
+
+Figure 11
+.
+System Load (# Req. in System) across time for Coder under high-load (4.5 Req/s) scenario. Ours separates into standard services (STD) and the best effort service (BE).
+
+Figure 12
+.
+TTFT/TPOT Comparison for Mixed Scenario serving 13B model. Ours shows the requests belonging to the standard service tier.
+
+Figure 13
+.
+Capacity Scaling in SLOs-Serve’s multi-replica Serving on 4 A100 GPUs with OPT-7B model.
+
+Coder and ToolLLM scenarios feature bursty request arrivals (Figure
+8(a)
+) and short outputs, highlighting SLOs-Serve’s burst-resilient scheduling. SLOs-Serve effectively manages load spikes (Figure
+11
+) by deferring requests with unattainable SLOs (red line) during surges and processing them in low-load periods, maintaining SLO attainment for others (green line). Baselines, lacking this capability, suffer from cumulative delays during bursts, leading to violations of all request SLOs. Consequently, SLOs-Serve achieves up to 2.1x and 1.90x serving capacity than baselines in Coder and ToolLLM scenarios (Figure
+9
+, third row and leftmost figure on the last row), respectively. This demonstrates robust burst handling, especially notable in ToolLLM where SLOs-Serve operates without the benefit of a speculative decoding model.
+
+The Mixed scenario simulates diverse application workloads, testing system adaptability to varied patterns and SLOs. Shown in Figure
+12
+, at 1.5 requests/second, vLLM and Sarathi exhibit significant p99 TTFT degradation, exceeding SLOs. Conversely, SLOs-Serve admission control mechanism maintains p99 TTFT and TPOT near specified SLOs for the standard services.
+
+Lastly, the reasoning scenario has long generation lengths with customized SLOs for the thinking stage and the decode stage.
+The longer per-request lifespans indicate more concurrent requests in the system, magnifying the stalls caused by greedy schedulers.
+In contrast, SLOs-Serve’s SLO-optimized scheduling algorithm ensures multi-stage SLO attainment, as well as improving throughput by tuning the batch sizes to fit the per-request SLOs. As a result, even without a speculative model, SLOs-Serve supports 2.4x serving capacity compared to baselines (Figure
+9
+, second on the last row).
+
+6.2.
+Scaling Evaluation
+
+Now, we evaluate SLOs-Serve’s multi-replica on the cluster with 4 A100 GPUs, serving the OPT-7B model with up to 4 replicas.
+Figure
+13
+shows the serving capacity across five scenarios.
+Following the mechanism in Figure
+7
+, a request is first routed to a replica in by a one-shot round-robin dispatcher.
+Afterwards, depending on the admission decision of SLOs-Serve’s scheduler for that replica, the request either gets served or routed to the next replica.
+
+Across five cases, SLOs-Serve exhibits linear or higher scaling. For example, in the ChatBot scenario, SLOs-Serve sustains 2.18x, 3.36x, and 4.61x higher capacity with 2,3,4 replicas when serving an OPT-7B model.
+
+SLOs-Serve’s super-linear scalability, while seems counter-intuitive, is the result of its scheduling mechanism (Algorithm
+1
+). Although SLOs-Serve’s scheduler makes locally optimal admission decisions upon each invocation, it is inherently greedy to currently present requests. When scaling to a multi-replica configuration, while each individual replica’s scheduler maintains a constant request rate, the aggregate of all schedulers across replicas observes a linearly increasing number of requests. This expanded global view, facilitated by request routing, enables the combined scheduler network to make more informed, globally optimized admission decisions. Consequently, in scenarios like ToolLLM and Coder, where requests exhibit significant variance in input/output lengths, this multi-replica serving strategy mitigates the limitations of local greedy decisions, resulting in a 5.44x and 6.2x increase in served load on four replicas, respectively.
+
+Figure 14
+.
+Ablation Study. We measure the serving capacity by gradually removing SLOs-Serve’s optimizations.
+
+Figure 15
+.
+Schedule Overhead.
+
+6.3.
+Ablation Study
+
+We conducted an ablation study (Figure
+14
+) to quantify the individual contributions of SLOs-Serve’s optimizations. Starting from full SLOs-Serve, we remove multi-replica serving with request routing, SLO-adaptive speculative decoding, and the burst-resilient scheduling across four scenarios. For the baseline case, we implemented a prefill-oriented scheduling approach in SLOs-Serve for apple-to-apple comparison.
+
+We found that request routing, SLO-adaptive speculative decoding, and burst-resilient serving independently improve serving capacity by 1.19x, 1.66x, and 1.34x.
+SLO-adaptive decoding demonstrated its largest gains in decode-heavy workloads (2.01x for ChatBot and 2.02x for Summarizer) by enabling larger token batch sizes.
+Conversely, request routing (1.92x) and burst-resilient serving (1.66x) were most effective in the bursty, variable-length Coder scenario, where they balanced instance load and deferred request with unattainable SLOs to secure the SLOs of the rest, respectively.
+
+6.4.
+Scheduling Overhead
+
+Last but not least, we assess the scheduling overhead of SLOs-Serve’s scheduling algorithm. As depicted in Figure
+15
+, the scheduling overhead for each call to SLOs-Serve’s resource planning algorithm, profiled from real scheduling scenarios, consistently remains under 10 milliseconds, with the majority of overheads concentrated below 2 milliseconds. Considering that the scheduler typically plans 1-5 future batches, and each batch requires at least 25 milliseconds to complete, the overhead introduced by the scheduling algorithm is minimal. This ensures that the low-overhead request routing is in multi-replica serving.
+
+6.5.
+Fidelity of the performance model
+
+To validate our performance model, we conducted evaluations across diverse configurations (models, tensor parallel setups, speculative decoding, hardware architecture). Figure
+10(b)
+shows that the model consistently achieved high fidelity, with R-squared scores ranging from 0.82 to 0.93.
+
+7.
+Related Work
+
+LLM Serving System.
+
+There are a variety of recent works on serving Large Language Models (LLM). These works have diverse research focus, including optimizing attentions
+(
+Kwon et al., 2023
+;
+Prabhu et al., 2025
+;
+Wu et al., 2024
+)
+, prefill/decode disaggregation
+(
+Zhong et al., 2024
+;
+Patel et al., 2024
+)
+, KV cache
+(
+Qin et al., 2024
+;
+Zheng et al., 2024
+;
+Hu et al., 2024a
+)
+, heterogeneous serving
+(
+Mei et al., 2025
+)
+, on-device serving
+(
+Song et al., 2024
+;
+Heo et al., 2024
+)
+, serverless serving
+(
+Zeng et al., 2025
+)
+, and serving emerging LLM model variations
+(
+Cao et al., 2025
+;
+Dai et al., 2024
+)
+.
+A few previous works focus on similar goals (optimizing for SLOs) as SLOs-Serve, including Llumnix
+(
+Sun et al., 2024
+)
+, DynamoLLM
+(
+Stojkovic et al., 2024
+)
+, ExeGPT
+(
+Oh et al., 2024
+)
+and VTC
+(
+Sheng et al., 2024
+)
+. Comparing to these works, SLOs-Serve uses admission control paired with a dynamic programming alaogirithm to guarantee attainment of multi-stage SLOs.
+
+Admission Control.
+
+Admission control
+is often needed when the server is under high request load.
+By rejecting some incoming requests, admission control ensures SLOs of running requests are satisfied.
+In the literature, admission control is used in cloud services
+(
+Sajal et al., 2023
+;
+Gawlick, 1995
+)
+, elastic training
+(
+Gu et al., 2023
+)
+. Along serving frameworks like vLLM
+(
+Kwon et al., 2023
+)
+may decline requests when the memory is not sufficient, SLOs-Serve admission control directly focuses on SLO-attainment.
+
+8.
+Conclusion
+
+In this work, we built SLOs-Serve, a distributed LLM serving system that supports multi-SLOs and multi-replica serving, while being resilient to burst arrivals.
+Particularly, we solve the key challenge of serving under application- and stage-dependent SLOs in a resource-sharing environment by customizing token allocations in batches.
+SLOs-Serve then designs a dynamic programming-based algorithm that effectively detects requests with unattainable SLOs and continuously optimizes the token compositions by exploring the full design space of chunked prefill and (optional) speculative decoding.
+Built on top of the scheduler, SLOs-Serve enabled burst handling and low overhead routing in multi-replica serving.
+In evaluation, comprehensive studies across six applications showed on average 2.2x improvement in serving capacity. In multi-replica serving, SLOs-Serve embodied super-linear scaling with bursty arrivals, underscoring the effectiveness of dynamic request routing.
+
+9.
