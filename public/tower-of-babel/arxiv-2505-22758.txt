@@ -1,0 +1,1105 @@
+FlashFormer: Whole-Model Kernels for Efficient Low-Batch Inference
+Aniruddha Nrusimha, William Brandon, Mayank Mishra, Yikang Shen, Rameswar Panda, Jonathan Ragan-Kelley, Yoon Kim, [0.5em] Massachusetts Institute of Technology
+
+Abstract
+The size and compute characteristics of modern large language models have led to an increased interest in developing specialized kernels tailored for training and inference. Existing kernels primarily optimize for compute utilization, targeting the large-batch training and inference settings. However, low-batch inference, where memory bandwidth and kernel launch overheads contribute are significant factors, remains important for many applications of interest such as in edge deployment and latency-sensitive applications. This paper describes FlashFormer , a proof-of-concept kernel for accelerating single-batch inference for transformer-based large language models. Across various model sizes and quantizations settings, we observe nontrivial speedups compared to existing state-of-the-art inference kernels. † † Code: https://github.com/aninrusimha/flashformer
+
+
+
+1
+Introduction
+
+As the utility and popularity of deep learning models has increased dramatically over the past decade and a half, there has been an increasing interest in low-level
+kernel design
+, i.e. developing specialized programs tailored to optimize particular workloads on the target hardware.
+This has been particularly true for transformer and transformer-like architectures. This is due to a dramatic increase in task performance across domains for these models as well as the increased
+model scaling
+(i.e. increasing parameter counts and computational costs per forward pass) and
+inference scaling
+(i.e. generating more tokens) needed to achieve these results.
+
+While most accelerator vendors develop high performance kernels for common linear algebra routines such as matrix multiplication, these general-purpose kernels are often not sufficient for LLM inference.
+Consequently, there has been much recent work on kernels that accelerate the inference of transformer-based LLMs, such as
+FlashDecoding
+
+[
+Dao et al. 2023
+]
+and
+PagedAttention
+
+[
+Kwon et al. 2023
+]
+. These kernels achieve efficiency gains by optimizing parts of operations common to the transformer inference pipeline. For example,
+FlashDecoding
+modifies the work partitioning in
+FlashAttention
+
+[
+Dao et al. 2022
+]
+for better parallelization during transformer decoding, while
+PagedAttention
+saves GPU memory by organizing the KV cache, thus allowing larger batch sizes.
+
+Figure 1
+:
+Depiction of the key benefit of
+FlashFormer
+. The top half depicts normal Transformer execution with multiple kernels. After all chunks of Layer 1 have been loaded into the SM cache, we cannot start loading Layer 2 (top left). This, coupled with kernel overhead, leads to a break in memory loads and computation (top right). With
+FlashFormer
+, we fuse kernels to enable overlapping across prior kernel barriers (bottom left). This leads to more efficient overlapping and faster runtime (bottom right).
+
+Most kernels are optimized to maximize throughput for large matrix-matrix multiplications. The key to doing so on modern accelerators is to maximize the utilization of special matrix-multiply units (MMU)—called Tensor Cores on NVIDIA hardware and MXUs on TPUs—which provide most of the computational performance of the chip.
+In either large-batch inference or training, this design choice optimizes the primary bottleneck of these kernels, i.e. the computational cost of matrix multiplications with large arithmetic intensity (i.e., computation per element of data movement).
+
+However, many use cases operate under different constraints. For example, low-batch inference is primarily bottlenecked by the memory bandwidth costs of parameter and cache movement and depending on the size of the model, kernel launch overheads that arise from launching multiple separate kernels for each transformer layer. Low-batch inference workloads arise in many real-world applications, such as edge deployment, latency-sensitive applications, and more recently, inference-time scaling via longer rollouts. Moreover, low-batch inference does not obtain significant benefits from using MMUs on the hardware since the problem sizes are not bottlenecked by compute.
+
+Writing fast kernels for these workloads requires further innovation along two common directions in kernel development research: 1) Increased operator fusion, or packing an increasing number of instructions and operations into a single kernel and 2) Increased specialization, or generating kernels that more closely optimized for the particular problem.
+This paper describes
+a strategy for writing a highly optimized inference kernel that runs the entire forward pass of a transformer-based large language model in a single kernel, and is specialized for a particular model configuration (such as the number of attention heads, embedding dimension etc) and the target hardware architecture.
+We use meta-programming, a shared pipelined buffer, and fast synchronization mechanisms to create a fully fused and specialized kernel. The resulting kernel, which we call
+FlashFormer
+, exploits increased overlapping of memory movement and the single fused kernel amortizes the launch overhead for the kernel over the entire forward pass. We apply this kernel to accelerate single-batch inference of Llama models
+[
+Grattafiori et al. 2024
+]
+, and find that it offers respectable speedups over state-of-the-art decoding kernels.
+
+2
+Background
+
+2.1
+Transformer Architecture
+
+We target the Llama-3
+[
+Grattafiori et al. 2024
+]
+family of models, which make use of the transformer architecture with pre-RMSNorm
+[
+Jiang et al. 2023
+]
+, Grouped Query Attention
+[
+Ainslie et al. 2023
+]
+, RoPE
+[
+Su et al. 2021
+]
+, and SwiGLU FFN layers
+[
+Shazeer 2020
+]
+.
+Each layer of a transformer model consists of six matrix operations, commonly grouped into five sublayers. Each sublayer has one matrix operation, except for the ‘‘core attention’’ layer,
+1
+1
+
+1
+
+Since “attention layer” could be ambiguous, we use “core attention” to refer to the operation
+\operatorname{softmax}(\alpha{\bm{Q}}{\bm{K}}^{\top}){\bm{V}}
+.
+which has two.
+The matrix operations per layer with their respective input and output activations are listed in
+Table
+
+1
+.
+
+During autoregressive token-by-token generation, each matrix operation takes as input a large matrix stored in global memory as well as an activation computed by a previous operation.
+Transformer models are parameterized by their number of layers, model dimension, FFN dimension, head dimension, and the number of attention and key-value heads. The models we generate kernels for in this work are shown in
+Table
+
+2
+.
+
+Matrix Operation
+
+Matrix Load
+
+Input
+
+Output
+
+\bm{QKV}
+Projection
+
+{\bm{W}}_{\bm{QKV}}
+
+\text{RMSNorm}({\bm{x}})
+
+{\bm{Q}}[i],{\bm{K}}[i],{\bm{V}}[i]
+
+{\bm{Q}}{\bm{K}}^{\top}
+computation
+
+{\bm{K}}[\hskip 0.85358pt:\hskip-1.99168pti]
+
+{\bm{Q}}[i]
+
+{\bm{S}}[i]
+
+\bm{PV}
+computation
+
+{\bm{V}}[\hskip 0.85358pt:\hskip-1.99168pti]
+
+\text{softmax}(\alpha{\bm{S}}[i])
+
+{\bm{O}}
+
+Attention Output Projection
+
+{\bm{W}}_{{\bm{a}}_{out}}
+
+\text{vector}({\bm{O}})
+
+{\bm{a}}_{out}
+
+GLU In/Gate Projection
+
+{\bm{W}}_{FFN1}
+
+\text{RMSNorm}({\bm{x}}+{\bm{a}}_{out})
+
+{\bm{g}}_{inter}
+
+GLU Output Projection
+
+{\bm{W}}_{FFN2}
+
+\text{SwiGLU}({\bm{g}}_{inter})
+
+{\bm{g}}_{out}
+
+Table 1
+:
+Llama matrix operations for decoding. Here
+i
+is the current sequence position, and
+{\bm{x}}
+is the residual stream.
+{\bm{W}}_{\bm{QKV}},{\bm{W}}_{{\bm{a}}_{out}}{\bm{W}}_{FFN1}
+and
+{\bm{W}}_{FFN2}
+represent corresponding parameter matrices, and
+{\bm{Q}},{\bm{K}}
+and
+{\bm{V}}
+represent the query, key, and value matrices respectively.
+{\bm{S}}
+represents the attention logits,
+{\bm{P}}
+the attention weights, and
+{\bm{a}}_{out}
+the output of attention.
+{\bm{g}}_{inter}
+and
+{\bm{g}}_{out}
+represent the output of the GLU input/gate projection and the final GLU output of the GLU layer respectively.
+
+Model
+
+Layers
+
+d_{model}
+
+d_{inter}
+
+d_{head}
+
+n_{q\_heads}
+
+n_{kv\_heads}
+
+Llama 3.1 8B
+
+32
+
+4096
+
+14336
+
+128
+
+32
+
+8
+
+Llama 3.1 70B
+
+80
+
+8192
+
+28672
+
+128
+
+64
+
+8
+
+Table 2
+:
+Configuration of Llama 3.1 8B and 70B, for which we develop
+FlashFormer
+kernel.
+
+2.2
+GPU Programming and Architecture
+
+GPU programming optimizes over three interleaved hierarchies: the program hierarchy, the hardware hierarchy, and the memory hierarchy. The program hierarchy structures computations into kernels, thread blocks, warps, and threads to effectively expose parallelism.
+2
+2
+
+2
+
+Note that we use the NVIDIA GPU hardware terminology in this section, other architectures use different terms for similar hardware components.
+The hardware hierarchy maps thread blocks onto streaming multiprocessors (SMs) which is sub-divided into multiple warp schedulers responsible for running a warp which is a collection of 32 threads
+3
+3
+
+3
+
+This is configurable on some hardware but not on NVIDIA GPUs.
+executing the same instruction. Individual threads are responsible for the core computations. Finally, the memory hierarchy manages the placement of data in registers, shared memory, and global memory to minimize latency and maximize throughput.
+
+Table
+
+3
+provides an overview of the three hierarchies.
+
+At each level except the thread level, it is possible for multiple elements of the program hierarchy to exist on the same hardware if they satisfy certain hardware and memory constraints. In particular, multiple warps can exist on one warp scheduler provided there is enough space in registers, multiple thread blocks can co-locate on an SM if there is enough shared memory and register space.
+
+Program Level
+
+Hardware Level
+
+Count
+
+Memory Pool
+
+Capacity
+
+Kernel
+
+GPU
+
+1
+
+Global (HBM)
+
+80 GB
+
+Threadblock
+
+SM
+
+132
+
+Shared
+
+228KB/SM
+
+Warp
+
+Warp Scheduler
+
+4/SM
+
+-
+
+-
+
+Thread
+
+Cuda Core
+
+32/Warp
+
+Registers
+
+256KB/SM, 1KB/thread
+
+Table 3
+:
+The hierarchies of the GPU and and capacities on an H100 GPU. SM stands for Streaming Multiprocessor. Note that multiple thread blocks can coexist on an SM, and multiple warps on a warp scheduler.
+
+2.3
+Decoding Workload and GPU Overlapping
+
+The general strategy for overlapping in most GPU workloads is to partition the workload at each program level such that the corresponding hardware level is oversubscribed, i.e., the hardware has more work that it can execute.
+This oversubscription allows tasks to overlap: when one task is stalled awaiting resources—such as data loading from global to shared memory—other tasks continue executing arithmetic computations. Similarly, when one warp is waiting on a shared memory load, another warp can issue its computational instructions.
+
+However, this strategy does not work well for inherently sequential workloads such as the sequential computations of transformer layers. Each matrix operation in
+Table
+
+1
+depends on the completion of the operations before it, and each transformer layer depends on the the completion of the previous transformer layer. As a result, in normal execution there is no opportunity for overlapping between different kernels, as shown in
+Figure
+
+1
+. Furthermore, inference kernel launch overheads can cause a nontrivial slowdown for fast decoding kernels, as shown by
+Spector et al. 2023
+.
+
+2.4
+Operator Fusion
+
+One solution to the problem of overlapping is kernel fusion, which involves taking two or more kernels and combining them into a single kernel. Existing kernel fusions can be divided into two types.
+The first type fuses a single (or multiple) pointwise operations (such as an activation function) into a matrix operation.
+These pointwise operations are directly applied to either the input of the matrix or its output or both. These types of fusions are now commonly automated through tools such as XLA
+[
+Sabne 2020
+]
+or PyTorch Compile
+[
+Ansel et al. 2024
+]
+.
+
+The second type involves restructuring multiple operations to remove the need for global synchronization and reduce redundant data movement between multiple matrix operations.
+A notable recent example of this is the
+FlashAttention
+series of kernels
+[
+Dao et al. 2022
+,
+Dao 2024
+,
+Shah et al. 2024b
+]
+, which fuses the
+{\bm{Q}}{\bm{K}}^{T}
+computation, softmax calculation, and
+{\bm{P}}{\bm{V}}
+computation into one kernel, reducing the memory movement from HBM to SRAM and significantly increasing arithmetic intensity over an unfused attention implementation.
+
+3
+Methods
+
+3.1
+General Kernel Design Principles
+
+In this section, we elaborate on the key challenges in designing a family of whole-model kernels, and our implemented solutions.
+
+Python Implementation
+
+Generated CUDA Kernel
+
+⬇
+
+def
+
+test_mul2
+():
+
+@ch
+.
+kernel
+(
+ch
+.
+Params
+(
+n
+=
+ty
+.
+u32
+,
+
+x
+=
+ty
+.
+ptr_mut
+(
+ty
+.
+i32
+)))
+
+def
+
+kernel
+(
+n
+,
+
+x
+):
+
+i
+
+=
+
+ch
+.
+block_idx_x
+()
+
+*
+
+ch
+.
+block_dim_x
+()
+
++
+
+ch
+.
+thread_idx_x
+()
+
+with
+
+ch
+.
+if_
+(
+i
+
+<
+
+n
+):
+
+x
+[
+i
+]
+
+*=
+
+2
+
+return
+
+ch
+.
+render
+(
+kernel
+)
+
+⬇
+
+__global__
+
+void
+
+kernel
+(
+
+uint32_t
+
+n
+,
+
+int32_t
+*
+
+x
+
+)
+
+{
+
+uint32_t
+
+i
+
+=
+
+blockIdx
+.
+x
+
+*
+
+blockDim
+.
+x
+
++
+
+threadIdx
+.
+x
+;
+
+if
+
+(
+i
+
+<
+
+n
+)
+
+{
+
+x
+[
+i
+]
+
+=
+
+x
+[
+i
+]
+
+*
+
+2;
+
+}
+
+}
+
+Table 4
+:
+Left: Python kernel source. Right: Generated CUDA kernel. Our metaprogramming language generates CUDA kernels from a Python interface. We use this to automate index math, perform static workload scheduling, and build kernel metaprogramming tools.
+
+Metaprogramming for Static Optimization.
+
+New kernels need to be implemented for each model tested. Writing such kernels manually is time intensive and prone to bugs.
+Implemented kernels greatly vary with both the dimensions of the models and quantization setups. To address this, we developed a metaprogramming language that, given the dimension sizes of the model, performs static workload partitioning based on predetermined rules to optimize performance. See
+Section
+
+3.1
+for an example.
+4
+4
+
+4
+
+While describing this metaprogramming language in full detail is outside the scope of this paper, we believe that this language will be of interest for kernel development more generally, and intend to open source it.
+
+Because the exact workload is known at kernel generation, we can determine at compile time what all memory operations and computations are necessary.
+In the memory-bound regime, we can load every element of our network parameters and KV cache exactly once. While this requires fully replicating the input, the cost of input data movement is much less than parameter and cache data movement.
+To efficiently generate these static workload schedules, we write a metaprogramming language in Python which automates the index math and static workload distribution and outputs CUDA kernels.
+As seen in
+Figure
+
+2
+, the workload is divided among different thread blocks, then within a thread block into multiple chunks. Finally, each chunk is processed by a series of warps in a series of operations.
+Factors like inter-thread block workload partitioning, chunk sizes, and intra chunk workload partitioning are optimized to maximize utilization of hardware resources, especially global-to-shared memory bandwidth.
+
+Memory pipeline.
+
+Each layer has different sized matrices and different shared memory requirements. As shown in
+Figure
+
+2
+, we design and implement a unified memory pipeline that allows for the memory movement of arbitrary layers to overlap, and for memory movement to overlap all other operations. This overlapping of memory movement with computation is also referred to as a producer-consumer pipeline design and is used by generally used by fast GEMM-based kernels like FlashAttention-3 for Hopper GPUs
+[
+Shah et al. 2024a
+]
+.
+
+Specifically, each matrix listed in
+Table
+
+1
+is split into chunks of a fixed size in bytes. This chunk size remains the same throughout the model, although the data type of the chunk, number of elements, and matrix dimensions are subject to change.
+Each matrix’s chunks are split among thread blocks at compile time. While all weight matrix chunks are loaded every iteration, KV cache chunks are only loaded as needed.
+Due to this structure, different sections of the matrix buffer can store matrix chunks from different layers or sublayers.
+The number of matrix buffers stored at a given time is the “depth” of the pipeline, and the size of one matrix buffer is the size of each pipeline stage.
+
+Global memory ordering.
+
+One problem with our approach is that the inputs for subsequent layers rely on the outputs of prior layer. Given the relaxed memory ordering of CUDA computations, we use a per thread global memory fence coupled with an atomic-based global synchronization mechanism to synchronize volatile reads and writes.
+This application of a traditional atomic synchronization ensures all participating threads’ global memory operations are visible to all other participating threads before continuing execution to avoid a read-after-write race condition. While atomic-based synchronization is far from novel, we believe we are the first to use it to combine different transformer layers into a single fused kernel.
+
+Figure 2
+:
+Left: Work partitioning between and within thread groups.
+The work for the matrix in global memory is split between thread groups.
+The work for each thread group is split into chunks for the pipeline buffer.
+Within the chunk, the work is divided into chunks.
+Right: Thread Group A work partitioning. Producer warps manage the pipeline buffer asynchronously, while consumer warps work synchronously on sections of chunks.
+
+3.2
+Transformer-specific Kernel Design
+
+We now describe how the above principles are operationalized for the transformer architecture.
+
+Figure 3
+:
+
+Conceptual diagram of a standard attention forward pass and our method. Left: a standard attention forward pass in an inference pipeline, broken down into four kernels. Right: FlashFormer, where all operations are part of one kernel invocation. A detailed diagram of our attention setup can be found in
+Figure
+
+5
+.
+
+Attention.
+
+We divide the attention sublayer into three parts, each of which has synchronous global communication between them: QKV Projection, Core Attention, and Attention Output Projection.
+A comparison of standard workload partitioning to ours can be found in
+Figure
+
+3
+.
+A detailed diagram of the operations within each of these parts can be seen in
+Figure
+
+5
+of the appendix.
+
+Both QKV Projection and Attention Output projection are matrix vector operations in the batch one case. For these operations, we cache the input in shared memory, and each chunk of the matrix corresponds to some number of rows of the weight matrix.
+We compute RMSNorm, RoPE, and then QKV projection, and add the outputs of Attention Output projection directly to the residual stream.
+
+For Core Attention, we use a modified version of the
+FlashDecoding
+kernel
+[
+Dao et al. 2023
+]
+. Thread blocks are split among the different KV heads.
+For each KV head, each SM retains a replicated copy of queries which multiply with that particular KV head. The KV cache is then partitioned into matrix chunks, which are fed into the memory buffers. One problem with our pipelined approach is that we have no memory ordering that guarantees the elements of the KV cache correspond to the current token.
+We thus synchronously load the keys and values for the current token in.
+
+After the entire KV cache has been read and the partial core attention output computed, we perform a reduction per KV head before writing to a shared buffer. The reduction occurs in three stages. First, each thread block writes required metadata for the FlashDecoding reduction, e.g. the maximum logit and the softmax denominator.
+In the second stage, each thread block reads the combined metadata and computes the global softmax denominator. It then rescales its output by the ratio of the thread block’s softmax denominator to the combined softmax denominator, as in
+Milakov and Gimelshein 2018
+.
+Finally, all threads add their rescaled outputs to a cumulative sum in global memory. As opposed to the normal
+FlashDecoding
+kernel, the reduction is fused into the output computation kernel, removing one activation round trip.
+
+GLU.
+
+In our kernel, the GLU in/gate operation is a matrix vector operation very similar to the QKV and Attention Output Projection operations in Attention, as shown in
+Figure
+
+6
+.
+Unlike those operators, the output of each chunk of the GLU in/gate operation is not written to global memory.
+
+Instead, we compute the SwiGLU activation on the outputs of the GLU in/gate function and then multiply it with a matrix chunk of GLU out.
+We then keep a vector of size
+d_{model}
+for accumulating partial outputs.
+With this approach, we can iterate through the entirety of the GLU computation without needing to do any synchronization or reduction.
+At the end the computation, we reduce all of these partial outputs along with the input.
+
+4
+Experiments & Results
+
+Figure 4
+:
+Percentage improvements in decoding tokens per second (TPS) of our kernel over GPTFast.
+
+4.1
+Kernel Benchmark
+
+We apply our kernel to three models: Llama 3.1 8B unquantized, Llama 3.1 8B quantized, and Llama 3.1 70B quantized. We compare with two strong baselines that are widely used in practice: GPTFast
+5
+5
+
+5
+
+https://github.com/pytorch-labs/gpt-fast
+and vLLM
+6
+6
+
+6
+
+https://github.com/vllm-project/vllm
+
+[
+Kwon et al. 2023
+]
+.
+We enable all optimizations where possible.
+In particular, we enable CUDA graphs to decrease kernel launch overheads in our baselines.
+
+We test a variety of prefill lengths, and generate 128 tokens per output.
+We measure only the speed of decoding. As a result, we only need to generate enough tokens to achieve a good estimate of the per-token latency with a given amount of prefill. All experiments are performed on one H100 SXM GPU, and use bfloat16 precision
+[
+Kalamkar et al. 2019
+]
+unless otherwise specified.
+
+Unquantized Llama 3.1 8B:
+
+We first evaluate our kernel on an unquantized Llama 3.1 8B model.
+We find that our kernel achieves a 8-20% speedup over GPTFast, and up to a 61% speedup over vLLM at batch size 1. The results are in
+Table
+
+5
+.
+
+Prefill tokens (128 Output)
+
+GPTFast
+
+vLLM
+
+FlashFormer
+(Ours)
+
+128
+
+168
+
+146
+
+182
+
+1024
+
+159
+
+131
+
+181
+
+3072
+
+158
+
+123
+
+179
+
+6144
+
+143
+
+108
+
+174
+
+Table 5
+:
+Tokens ser second (TPS) for Llama 3.1 8B decoding.
+
+Quantized Llama 3.1 8B:
+
+We then compare a quantized version of Llama 3.1 8B. Our improvements over baselines in this arena are similar to the unquantized case, ranging from 7-32% as shown in
+Table
+
+6
+.
+We quantize using GPTQ
+[
+Frantar et al. 2022
+]
+to 4-bit weight only quantization with a group size of 128.
+While this computation is likely bottlenecked by the operations needed for dequantization and not memory bandwidth, our approach allows us better to overlap dequantization with memory movement and computation.
+
+Prefill tokens (128 Output)
+
+GPTFast
+
+vLLM
+
+FlashFormer
+(Ours)
+
+128
+
+290
+
+134
+
+311
+
+1024
+
+284
+
+156
+
+310
+
+3072
+
+266
+
+139
+
+307
+
+6144
+
+228
+
+124
+
+301
+
+Table 6
+:
+Tokens per second (TPS) for Llama 3.1 8b quantized (4-bit weight-only quantization) decoding.
+
+Quantized Llama 3.1 70B:
+
+We finally evaluate on a large quantized model, Llama 3.1 70B.
+This model is also quantized to 4 bits with GPTQ.
+Our expectation was that the gains at 70B would be smaller than at 8B.
+This is because larger models have more opportunities for overlapping within a kernel. This decreases the need for overlapping between kernel launches.
+The results, shown in
+Table
+
+7
+, are small improvements (2%) at short sequence lengths increasing to 13% at longer sequence lengths.
+
+Prefill tokens (128 Output)
+
+GPTFast
+
+FlashFormer
+(Ours)
+
+128
+
+47
+
+48
+
+1024
+
+45
+
+48
+
+3072
+
+43
+
+47
+
+6144
+
+40
+
+45
+
+Table 7
+:
+Tokens Per Second (TPS) for Llama 3.1 70b quantized decoding. vLLM is omitted due to crashes during quantization on our machine.
+
+4.2
+Ablation: Pipeline depth
+
+We investigate how increasing pipeline stages affects kernel performance for the unquantized Llama 3.1 8B model. Our kernel design requires a minimum of two concurrent memory buffers during GLU computation. Consequently, a two-stage pipeline cannot overlap memory operations during GLU in/gate operations.
+The kernel was primarily optimized for a 64KB pipeline stage size.
+Performance measurements comparing two versus three pipeline stages at 3072 sequence length reveal that three stages achieves a 5% speedup over two stages, as shown in
+Table
+
+8
+.
+
+Due to shared memory capacity constraints, we cannot implement four pipeline stages at 64KB per stage. To test deeper pipelines, we halved the pipeline stage size, though these configurations were not as thoroughly optimized as the larger stage implementations. Results indicate that while four pipeline stages outperform three, five stages do not yield further improvements over four. At this depth, pipeline management overhead negates the benefits of deeper pipelining.
+
+Pipeline Stage Size
+
+Number of Stages
+
+TPS
+
+64KB
+
+2
+
+170
+
+64KB
+
+3
+
+179
+
+32KB
+
+3
+
+135
+
+32KB
+
+4
+
+138
+
+32KB
+
+5
+
+130
+
+Table 8
+:
+Llama 3.1 8B Unquantized pipeline depth ablation at sequence length 3072. We primarily optimize for 64KB pipeline stage size, and thus have worse workload partitioning at 32KB.
+
+5
+Discussion, & Future Work
+
+5.1
+Performance analysis
+
+Two trends emerged in our experiments.
+First,
+FlashFormer
+had the largest speedups at the longest sequence lengths.
+We suspect this is due to our method of partitioning the KV cache. The size of our pipeline stages is 64KB, which corresponds to 256 keys or values with head dim 128 and bf16 precision.
+With 8 SMs per KV head, we need 4096 keys and values to provide one matrix chunk per participating SM.
+At longer sequence lengths this problem vanishes. Instead,
+FlashFormer
+overlaps more of the core attention computation and reduction with memory movement, avoiding inefficiency.
+Future work can explore better optimization of workloads at different sequence lengths.
+
+The second trend we observe is that smaller models benefit more from our technique than larger models.
+This is likely due to the fact that very large models have more opportunities for overlapping within each operation, and thus gain less benefit from overlapping between operations.
+
+5.2
+Comparison to Theoretical Peak
+
+Assuming our model is constrained by memory bandwidth, we can calculate the peak theoretical performance of our model, and what percentage of that performance we observe. If we compute bandwidth utilization as memory movement per token times throughput divided by bandwidth, we calculate that our kernel achieves roughly 82% bandwidth utilization, compared to the 68-75% of GPTFast.
+
+It is unclear what portion of the memory bandwidth is achievable in realistic workloads.
+A linear layer achieves 86% utilization, while a pure copy kernel achieves 90% bandwidth utilization.
+As a result, we suspect that our model is starting to approach the practical hardware limits for batch size 1 generation on an H100.
+
+5.3
+Compile vs Runtime optimization
+
+The work partitioning within our kernels—in particular, the partitioning of matrix chunks between thread blocks—is determined at compile time.
+This simplifies kernel logic and minimizes communication to global memory.
+
+However, there are drawbacks to this strategy.
+At every point of synchronization, the entire GPU is held back by the slowest SM.
+Furthermore, it can lead to inefficiency when the amount of work changes at runtime, which happens with the KV cache.
+For our workloads, we tried to avoid this problem through careful division of memory loads.
+Concurrent work like ThunderMLA
+[
+Spector et al. 2023
+]
+also implement a dynamic workload partitioning for a persistent
+FlashAttention
+style Multi Latent Attention
+[
+DeepSeek-AI 2024
+]
+kernel, controlled through a global instruction buffer.
+Their persistent kernel accesses a global memory buffer to determine what problem to work on next.
+
+We hope that future work explores dynamic runtime optimized versions of
+FlashFormer
+, and explores the tradeoff between increased inter thread block communication to better balance the workload and decreased inter thread block communication to minimize per thread block latency.
+
+5.4
+Limitations
+
+The single-batch setting we target is admittedly limited. We focus on this setting to demonstrate the practicality of the core ideas introduced in this paper, including aggressive specialization and the feasibility of a kernel design with a static workload schedule.
+We hope that future work applies these ideas to small batch and multi-GPU settings as well as to non-transformer models.
+Furthermore while we contribute a custom kernel metaprogramming library with customizable kernel templates, further work is needed to extend our abstractions to a greater variety of models and multi-batch / multi-GPU settings.
+
+6
+Related Work
+
+Specialized Transformer model kernels.
+
+Due to the fact that the linear / GLU layers are standard linear algebra operations, most of the focus of specialized transformer kernel design has focused on optimizing attention.
+The FlashAttention
+[
+Dao et al. 2022
+,
+Dao 2023
+,
+Shah et al. 2024b
+]
+
+restructures the attention computation to a numerically equivalent version that fused all of core attention.
+This general strategy is widespread and was used in many attention or attention-like operations.
+
+Accelerator Kernel DSLs, such as Triton
+[
+Tillet et al. 2019
+]
+, are used to simplify the kernel generation process by grouping computation into conceptual tiles. Specialized tools such as
+FlexAttention
+[
+Guessous et al. 2024
+]
+
+further allow for simple kernel generation for attention like workloads.
+Recently, automatic fusion of pointwise operators has continued to improve and become a staple of all modern machine learning libraries. XLA
+[
+Sabne 2020
+]
+and PyTorch Compile
+[
+Ansel et al. 2024
+]
+automate fusion of pointwise operations for Jax
+[
+Bradbury et al. 2018
+]
+and PyTorch respectively.
+
+Concurrent to this work, ThunderMLA
+[
+Spector et al. 2023
+]
+introduce a persistent kernel for MultiHead Latent Attention
+[
+DeepSeek-AI 2024
+]
+layers that has each thread block dynamically schedule its own workload.
+
+Low batch inference optimizations.
+
+Better kernel design is far from the only research area pursuing greater inference efficiencies.
+Two of the most important research directions in low batch inference are speculative decoding and quantization.
+
+Speculative decoding
+[
+Leviathan et al. 2022
+]
+performs autoregressive inference on a small model and multi-token inference on a larger model. This relies on similarity between the model distributions and the relative speed of the small model.
+The critical idea was that the large verifier model would run at an effective batch size as long as the number of consecutive tokens fed into the model. Conditioned on the tokens verification, a single large model load could generate multiple tokens.
+Further iterations
+[
+Cai et al. 2024
+,
+Ankner et al. 2024
+,
+Li et al. 2024
+]
+improved upon this formula by using draft heads computed on the model’s outputs instead of a separate draft model.
+
+Weight quantization methods
+[
+Frantar et al. 2022
+,
+Yao et al. 2022
+,
+Chee et al. 2023
+]
+have accelerated decoding by enabling lower and lower bit precisions for weight loads.
+This decreases the cost of memory movement, and thus improves inference speed.
+However, this is not perfect, as most of these methods utilize scarce GPU resources for dequantization.
+
+7
+Conclusion
+
+We introduce a new method for overlapping operations between layers for transformer decoding workloads.
+We develop a family of kernels that leverage this new method of overlapping, and
+empirically verify the performance of these models on real workloads.
+
