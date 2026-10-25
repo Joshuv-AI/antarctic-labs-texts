@@ -1,0 +1,1687 @@
+PyGraph: Robust Compiler Support for CUDA Graphs in PyTorch
+Abhishek Ghosh, Ajay Nayak, Ashish Panwar, Arkaprava Basu
+
+Abstract
+Machine learning (ML) workloads launch hundreds to thousands of short-running GPU kernels per iteration. With GPU compute throughput growing rapidly, CPU-side launch latency of kernels is emerging as a bottleneck. CUDA Graphs promise to address this by replaying a set of kernels with a single dispatch of the graph, removing per-kernel launch costs. However, CUDA Graphs remain surprisingly difficult to deploy correctly and efficiently. We present PyGraph — a compiler framework to maximize the coverage and benefits of CUDA Graphs for ML workloads. It introduces three novel optimizations: it applies automatic code transformations to make ML applications amenable to CUDA Graphs; it eliminates the parameter copy overheads for kernels executing in CUDA Graphs, and it selectively deploys CUDA Graphs guided by a cost–benefit analysis. For 25 ML workloads from TorchBench, HuggingFace, and TIMM, PyGraph more than doubles the benefit from deploying CUDA Graph compared to the most popular and widely used ML compiler, PyTorch2. PyGraph is built atop PyTorch2’s compilation framework and requires no programmer intervention.
+
+
+
+1
+Introduction
+
+The demand for GPU compute continues to skyrocket due to a surge in ML applications
+[
+8
+,
+2
+,
+3
+,
+88
+,
+64
+,
+33
+,
+31
+,
+65
+,
+66
+]
+.
+Catering to this growing demand through hardware enhancement
+alone
+is challenging in the post-Moore era of slowing transistor technology
+[
+12
+]
+.
+Consequently, hardware vendors increasingly rely on hardware-software co-design to improve efficiency.
+For example, NVIDIA continues to introduce new performance features in GPUs that need software enablement.
+Recent examples include scoped synchronization
+[
+27
+,
+26
+,
+35
+]
+that allow programmers to selectively enable faster synchronization, tensor cores for fast matrix multiplication
+[
+24
+]
+, lower- and mixed-precision computation
+[
+34
+]
+, and CUDA Graphs
+[
+17
+,
+83
+]
+for improving GPU utilization.
+
+Surprisingly, GPUs are often underutilized despite high demand
+[
+28
+]
+.
+Several hyperscalers, including Alibaba and Azure, report GPU utilization typically below
+50\%
+
+[
+73
+,
+72
+,
+15
+,
+23
+]
+.
+A major contributing factor is that CPUs cannot submit kernels fast enough to keep modern GPUs busy.
+An ML application typically invokes hundreds to thousands of GPU kernels per iteration, and each kernel launched from the CPU adds
+5
+-
+10
+microseconds of latency
+[
+11
+]
+.
+As a result, GPUs stall when they finish executing kernels faster than the CPU can dispatch subsequent ones.
+This problem is amplified by recent trends in distributed ML, particularly Tensor Parallelism (TP)
+[
+63
+]
+.
+TP shards model layers across GPUs, reducing the runtime of per-GPU compute kernels while introducing additional kernel launches for inter-GPU collective operations. Together, these effects push launch latency deeper into the critical path.
+
+CUDA Graphs can mitigate the kernel launch bottleneck.
+It allows software to
+capture
+kernel launches in a directed acyclic graph – a CUDA Graph.
+The CPU then launches the graph instead of individual kernels.
+This can significantly speed up applications that repeatedly execute the same set of kernels (e.g., training and inference). While useful in theory, CUDA Graphs come with several constraints.
+For example, the parameters to kernel are hardcoded during a graph’s capture.
+The same parameter values are passed to kernels during replays posing challenge to applications that compute over different data (tensors) across invocations.
+A CUDA Graph is also prohibited from using GPU-synchronizing operations.
+
+Effectively harnessing capabilities of CUDA Graph is further made challenging by the fact that most ML applications are written in high-level frameworks such as PyTorch
+[
+49
+]
+and TensorFlow
+[
+1
+]
+, and are semantically distant from their execution on the hardware.
+A key challenge, thus, is to effectively bridge the gap between the high-level program semantics and the low-level idiosyncrasies of hardware features.
+
+Our goal is to enable high-level programs, e.g., in PyTorch, to effectively harness CUDA Graphs in modern GPUs without needing programmer intervention.
+Upon qualitatively and quantitatively analyzing many tens of PyTorch programs, we observed three key shortcomings that either prevent the deployment of CUDA Graphs or fail to harness its benefits.
+
+1
+
+CUDA Graph-oblivious programs:
+
+Many important ML programs, e.g., in TorchBench
+[
+19
+]
+, are
+not
+written with CUDA Graph in mind.
+For example, it is common for programs, such as the text-to-image generator model DALLE-2
+[
+57
+]
+, to allocate a tensor on the CPU’s DRAM (say, address
+x
+) and then copy its content to GPU memory during computation, e.g., in the
+forward
+pass.
+A CUDA Graph captured for such computation would hardcode the address of the DRAM-resident tensor (
+x
+).
+Its content must then be copied to GPU memory during the graph’s replay.
+However, the host program may de-allocate the CPU tensor (
+x
+) after the graph’s capture, causing the application to crash intermittently during replays.
+Thus, CUDA Graph must be avoided in such programs. We notice similar pattern in other programs e.g., Vision Mask R-CNN
+[
+20
+]
+, Torch Multi-modal Clip
+[
+29
+,
+56
+]
+.
+
+Further, in many cases one or more kernel parameters are passed as
+scalar
+variables e.g., attention kernel in speech transformer
+[
+50
+]
+.
+A CUDA Graph captured with such kernels would record the value of the scalar as the kernel parameter.
+If the variable’s value should change across kernel invocations, it will receive
+stale
+values during graph replays.
+Thus, CUDA Graph must be avoided in such cases.
+
+While a single or a few lines of code changes can unlock hundreds of kernels being captured in CUDA Graphs, the challenge is to automatically find such opportunities and update the code accordingly.
+It is unrealistic to expect developers to continue evolving their programs to make them friendlier to new hardware features.
+Thus, we posit that frameworks, such as PyTorch2, JAX
+[
+6
+]
+, must step up to effectively harness advanced hardware features without burdening developers.
+
+2
+
+Parameter copy overheads in replaying CUDA Graphs:
+
+By design, CUDA Graphs captures GPU kernel parameters, including addresses of tensors
+by value
+.
+However, different invocations of the same kernel across a graph’s repeated replays often need to operate on different data. A simple strategy to enable this is to replace mutable parameters with
+placeholder
+parameters.
+Before each replay, actual parameter values for a given invocation are copied onto its placeholders.
+
+While this strategy allows correct replay of graphs and is employed by widely used PyTorch2 ML compiler, it adds the overhead of copying the parameter (data) into the placeholder in the critical path of every graph replay.
+We empirically found overheads of copying parameters constitute up to 24% of a CUDA Graph’s execution time, particularly when operating on large tensors (
+§2
+).
+Thus, there is a need to correctly deploy CUDA Graph but without slowing down graph replays.
+
+3
+
+CUDA Graphs may hurt performance:
+While CUDA Graph is a performance feature, we discovered that the overhead of replaying them can sometimes outweigh the benefits. Besides the latency of copying kernel parameters (tensors), the overhead of reusing/garbage collecting CUDA Graph’s memory after replay and reset of the GPU’s random-number generator state before each replay adds latency to the critical path.
+In our analysis, nearly a quarter of the total CUDA Graphs degrade performance (up to 397%).
+While a performance feature is not expected to speed up every application, it must not severely slow down many applications.
+
+PyGraph:
+Driven by these observations, we created a CUDA Graph-aware compilation framework for PyTorch programs.
+PyGraph embodies three key optimizations.
+
+1
+
+It employs CUDA Graph-aware code transformations such as hoisting memcopies, changing data placement for a wider deployment of CUDA Graphs. It analyzes the intermediate representation (IR) of programs to root cause the failures to capture kernel(s) in a graph (e.g., scalar variables).
+It then updates the IR to emulate changes in the source that would have enabled CUDA Graph.
+
+2
+It introduces an additional level of indirection in kernel parameters to convert tensor copies for parameters to
+pointer
+copies.
+While a tensor can be thousands of bytes, a pointer is only 8 bytes.
+For JIT-compiled kernels, PyGraph uses Triton compiler
+[
+47
+]
+to automatically update kernels to de-reference their indirect-ed parameters.
+For vendor-supplied immutable kernels (e.g., from cuBLAS), it introduces prelude kernels in the graph that perform de-reference of indirect-ed parameters on behalf of immutable kernels.
+
+3
+Finally, it adds automated profiling during graph capture (slow path) to analyze the cost-benefit of deploying CUDA Graphs.
+This guides PyGraph to
+selectively
+deploy CUDA Graph during replay (fast path) only when beneficial.
+The judicious deployment of CUDA Graphs not only enables better end-to-end performance but, crucially, ensures that no application slows down.
+PyGraph is integrated into PyTorch2 and requires
+no
+program modifications.
+
+On a diverse set of
+25
+ML applications, PyGraph provides geomean speed up of 29% over PyTorch2’s CUDA Graph feature (and up to 3.36
+\times
+) on an H100 GPU.
+Further, we studied PyGraph’s efficacy under distributed ML workloads by spreading a subset of applications over four GPUs using tensor parallelism.
+There, PyGraph speeds up applications up to
+3.56\times
+over PyTorch2’s CUDA Graph and by 75% on average.
+
+The key contributions of our work are as follows:
+
+\bullet
+
+We demonstrate subtle programming idiosyncrasies in popular PyTorch programs, coupled with the constraints of CUDA Graphs, limit wider deployment of CUDA Graphs.
+
+\bullet
+
+We show that overheads due to copying kernel parameters can be limited by introducing an additional layer of indirection in passing the parameters to kernels.
+
+\bullet
+
+We demonstrate the need to selectively deploy CUDA Graphs to achieve better end-to-end application performance.
+
+\bullet
+
+We create PyGraph atop PyTorch2’s compilation framework that achieves the above-mentioned optimizations without needing any manual modifications.
+
+2
+Background and Motivation
+
+This section elaborates on how CUDA Graphs have become indispensable for modern GPU platforms, along with the challenges involved in maximizing their utilization. We use the terms CUDA Graph(s) and CG(s) interchangeably.
+
+2.1
+The need for CUDA Graphs
+
+GPUs have become the workhorse accelerators for ML applications since they deliver massive compute throughput.
+NVIDIA’s GPU compute scaling highlights this: peak FP16 tensor throughput jumped from 312 TFLOP/s on A100
+[
+36
+]
+to
+\approx
+1 PFLOP/s on H100
+[
+41
+]
+, and
+\approx
+4 PFLOP/s on B200
+[
+45
+]
+.
+In contrast, CPU frequency has stagnated, and the number of cores has only doubled during that period.
+At the same time, ML workloads have expanded dramatically, with each iteration often launching hundreds to thousands of kernels.
+Further, modern deployments increasingly shard a model across multiple GPUs.
+As GPU throughput improves and models scale out, kernels become smaller and faster.
+
+A typical CUDA kernel launch takes
+\sim
+5-10 microseconds
+[
+11
+]
+, while many kernels now run for only a few microseconds. This turns CPU launch overhead into a significant fraction of the total time.
+Reducing or amortizing this overhead is therefore critical to achieving high GPU utilization. For example, in DALLE2
+[
+57
+]
+(inference, batch size 1), a segment of computation issues over 740 kernels whose combined GPU execution time is only 3.4 milliseconds on an H100 GPU, while the end-to-end time is 14 milliseconds—implying that 75% of the total latency is due to CPU launch delays.
+
+A CG can address this bottleneck by obviating the need to individually launch each kernel from the CPU.
+The top part of
+Figure 1
+shows traditional kernel launches, while the lower part shows steps involved in CG.
+Kernels are captured as part of a DAG (CG) once.
+The graph is launched from the CPU, and internally, the GPU hardware launches CG’s constituent kernels without CPU intervention.
+Applications that repeatedly launch the same set of kernels, e.g., inference tasks, can benefit substantially by capturing the graph once and replaying it many times.
+
+Figure 1
+:
+CUDA Graph reducing CPU launch overheads.
+
+2.2
+Deploying CUDA Graph and its challenges
+
+CUDA supports automatic capture of CGs through
+stream capture
+mechanism.
+The developer designates a capture region.
+The runtime automatically records all GPU operations (e.g., kernel launch, memcopy) issued within the region, producing a computation DAG.
+Once capture completes, the developer instantiates the graph and launches it, causing the GPU to
+replay
+the recorded GPU operations. Owing to its simplicity, stream capture is the dominant way developers use CGs.
+However, even this approach requires care: the runtime records kernel parameters
+by value
+.
+If the application replays the CG without updating parameters that change across iterations, execution proceeds with stale arguments—leading to silent data corruption, incorrect results, or crashes.
+Developers must therefore identify which values remain stable across replays and update any mutable parameters in the graph before launching it.
+Furthermore, CUDA does not permit capturing synchronous copies (
+cudaMemcpy
+), memory allocation (
+cudaMalloc
+) or any other API that implicitly synchronizes the device
+[
+43
+]
+.
+These constraints force developers to rethink data movement and memory management, making it difficult to incorporate CGs—especially in legacy codebases.
+
+We posit that compilers and
+not
+the programmers should reason about program structure, automatically satisfy graph constraints and judiciously apply optimizations.
+This is the only way to harness advanced hardware features without burdening the developers.
+Unfortunately, existing compilers fall well short. To substantiate, we investigate PyTorch2
+[
+4
+]
+—the most popular and widely used ML compiler.
+
+\minted
+
+[fontfamily=cmtt,escapeinside=@@,fontsize=
+]python
+import torch
+import numpy as np
+
+class ScaledDotProductAttention(nn.Module):
+def __init__(self, temperature, attn_dropout):
+...
+self.temperature = temperature
+...
+
+def forward(self, q, k, v, mask=None):
+attn = torch.bmm(q, k.transpose(1, 2))
+# Divide operation below with a numpy scaler on CPU
+attn = attn / @
+self.temperature
+@ # @
+offending line
+@
+...
+
+class MultiHeadAttention(nn.Module):
+def __init__(self, n_head, d_model, d_k, d_v, dropout):
+...
+@
+temp = np.power(d_k, 0.5)
+@ # @
+src of offending operand
+@
+self.attn = ScaledDotProductAttention(
+temperature=@
+temp
+@, attn_dropout=dropout)
+...
+
+def forward(self, q, k, v, mask=None):
+...
+output, attn = self.attn(q, k, v, mask=mask)
+...
+
+module = # Initialize the speech_tranformer model
+module = torch.compile(module)
+result = module(inputs)
+
+\endminted
+
+Figure 2
+:
+Simplified code snippet from speech transformer model with CPU-resident scalar (marked red).
+
+2.3
+CUDA Graphs are poorly harnessed
+
+We analyze over 60 common ML and HPC workloads to identify key impediments to effective CG deployment.
+First, many programs fail to use CGs because their implementations are unaligned to its requirements.
+Second, CG’s deployment strategy today adds significant but avoidable overheads.
+Further, even when CGs can be deployed, their deployment is not always beneficial — yet current frameworks deploy them blindly. We present a detailed analysis below.
+
+2.3.1
+Obstacles in harnessing CUDA Graphs
+
+We observe that CUDA Graphs are often not compatible with the way many ML workloads are written. For example, when a kernel is captured into a CG, all its arguments are recorded by value and baked into the graph. If those values change across iterations, replaying the captured graph would produce incorrect results. Consequently, a compiler would forgo CG deployment in these cases for correctness.
+
+We highlight one such example with a simplified PyTorch code snippet of the speech transformer model
+[
+50
+]
+(
+Figure 2
+). In the constructor of
+MultiheadAttention
+(line 19), the variable
+temperature
+is assigned the value returned by a
+numpy
+method
+[
+69
+]
+. Note that
+temperature
+hosts a
+scalar
+value and is allocated on the CPU DRAM. This variable is passed to the constructor of
+ScaledDotProductAttention
+(line 21) and ultimately used to update
+attn
+in its forward method (line 13). This update of
+attn
+is performed by a GPU kernel whose parameters are
+attn
+and
+temperature
+. While the former is the address to a GPU tensor, the latter is a
+scalar
+variable. If this kernel is captured as part of a CUDA Graph, the scalar value of the parameter
+temperature
+will be hardcoded as a kernel parameter. Later, if the captured graph is replayed, the kernel would execute with a stale value of
+temperature
+.
+
+We discovered other subtleties in PyTorch programs that limit CG deployment. A common case is when applications allocate a tensor on the DRAM (at address
+x
+) and copy its contents to GPU memory at the start of each iteration. A captured CG would hardcode the DRAM address
+x
+.
+However, CPU may de-allocate that tensor after capture, leaving the address invalid when the graph is replayed.
+
+Figure 3
+:
+Performance impact of moving tensors from CPU (unoptimized programs) to GPU (optimized programs).
+
+Quantifying the opportunity cost:
+
+The issues above stem from the fact that most ML programs are not written to meet CG constraints.
+In pre–CG era, choices about where to allocate tensors—CPU vs. GPU—had minimal impact on performance, so developers had little reason to care. With the introduction of CGs, these decisions suddenly matter: seemingly innocuous placement choices can make a dramatic impact on performance because even a single CPU-resident tensor can prevent the use of CGs for many kernels. To demonstrate this, we manually rewrote small portions of several PyTorch models—XLNetLMHeadModel (XLNET)
+[
+78
+]
+, SpeechTransformer (ST)
+[
+50
+]
+, DALLE2
+[
+57
+]
+, and Vision Mask R-CNN (VM)
+[
+20
+]
+—specifically targeting code regions whose structure prevented CUDA Graph deployment. The edits were minor (e.g., relocating a CPU-allocated tensors to the GPU) but made the code CG-compatible.
+Figure 3
+reports the results. (All results use inference batch size 1). In the absence of CGs, optimizing tensor placement had a modest impact on performance, averaging 6.29% and reaching up to 18% for XLNET. However, the same code changes lead to a dramatic speedup when using CGs. For example, XLNET and ST sped up by
+3.17\times
+and
+2.28\times
+!
+
+Furthermore, scaling out ML models to multiple GPUs makes CGs more critical for performance. For instance, in the XLNET model (inference at batch size 128), tensor-parallelism over four GPUs brings 48 additional collective kernels and reduces the runtime of more than 250 kernels by 50–75%. However, a few variable allocations in CPU DRAM render more than 450 kernels ineligible for capture in CGs, leaving significant performance on the table.
+
+(a)
+
+25\%
+of the total CUDA Graphs hurt performance in TorchBench.
+
+(b)
+
+About 50% of the applications contain CUDA Graph(s) that hurt performance.
+
+Figure 4
+:
+Cost-benefit analysis of CUDA Graphs.
+
+2.3.2
+Cost-benefit analysis of CUDA Graphs
+
+We also noticed that even when CGs can be deployed, they do not always improve performance. In fact, counterintuitively, we observed that CGs also hurt performance in many cases. This is unexpected; CGs are designed solely as a performance feature and should not slow down even a single application. To understand this behavior, we quantitatively analyze 116 CGs drawn from 63 PyTorch applications in TorchBench
+[
+19
+]
+.
+
+We make two key observations. First,
+4(a)
+shows the CDF of performance changes when enabling CGs across all applications, capturing both cases where CGs help (right side of 0 on the x-axis) and where they hurt (left side of 0). Overall, 25% of the graphs (29 of 116) degrade performance. A deeper inspection reveals that the dominant source of this slowdown is the latency of copying kernel parameters (data) into the static placeholders (addresses) during a graph’s replay.
+
+The reason this copying is required is fundamental to how CGs operate: every kernel parameter is captured by value in a CUDA Graph, whereas different invocations of a kernel typically operate on different data.
+A simple strategy to manage this scenario is to replace mutable parameters with
+place-holder
+arguments.
+Before each replay, the runtime must overwrite these placeholders with the current input values of all mutable arguments.
+This copy happens on the critical path of every replay and scales with the number of kernels and the size of their argument lists, making it a nontrivial overhead.
+For instance, in CUDA Graphs of DALLE2 and NVIDIA Deep Recommender, parameter copying accounts for 24% and 17% of their end-to-end execution time, respectively.
+These overheads substantially erode the benefits of CG deployment and can even lead to net slowdowns.
+
+Beyond parameter copy, replay of a CG suffers from other fundamental overheads.
+CGs cannot encode lifetimes of CPU-side objects.
+A language runtime that performs garbage collection, e.g., Python, must separate CG outputs from the host objects that originally produced them.
+The runtime snapshots only the GPU-side metadata of CG outputs (such as data pointers and layout) and discards the CPU-side tensor objects.
+This is necessary for the GPU memory to be safely reused across CG replays without memory bloat.
+However, on each replay, fresh CPU objects must be reconstructed from the saved metadata, adding further latency.
+
+Our second insight is that many applications consist of both useful and harmful CGs. For example,
+4(b)
+shows the CDF of 20 applications that contain one or more CGs.
+Of these, nearly half of them exhibit a mix of performance-aiding and performance-hurting CGs. For a specific example, in DALLE2 (inference, batch size 1), one of the captured CG executes in 75 microseconds, while the kernel in it when run without CG takes 70 microseconds—implying an overhead of 7% in CG deployment. At the same time, a different CG in the same workload reduces the runtime of 743 kernels to 3.4 milliseconds, compared to 14 milliseconds without CGs, resulting in more than 75% performance gain.
+Unfortunately, CG today are blindly deployed without a cost-benefit analysis.
+
+In summary, these expose a deeper problem: today’s ML software stack lacks both the semantic understanding needed to effectively harness CUDA Graphs and a cost model to decide when they are worthwhile.
+Applications often miss crucial opportunities to use CGs, or deploy them where they hurt performance.
+It begs for a compiler-driven approach to automatically enforce graph compatibility, reason about costs, and maximize the effective use of CGs.
+
+3
+PyGraph: Goals and Optimizations
+
+Motivated by the analysis, we present the goals of PyGraph, a framework that enables effective use of CUDA Graphs in ML applications. We then outline the optimizations that help PyGraph achieve the goals.
+
+Goals:
+
+1
+Expand the set of GPU kernels that can be captured in CGs.
+
+2
+Minimize runtime overheads introduced during CG replay, especially those stemming from parameter copy.
+
+3
+Selectively deploy CGs only when they improve end-to-end performance.
+
+4
+Achieve all of the above without requiring modifications or developer’s intervention.
+
+CUDA Graph-aware Code Transformation (CGCT):
+
+A large fraction of ML applications fail to utilize CUDA Graphs due to the presence of constructs—synchronous memory copies, CPU-resident scalars or tensors—that inhibit CG capture. These issues are often obscured by high-level frameworks and can easily escape a programmer’s attention.
+
+PyGraph addresses this by restructuring the program such that large sequences of kernels become eligible for graph capture, without altering application semantics.
+It first analyzes the compiler’s intermediate representation (IR) to identify code regions where CG capture fails and the root cause of the failure.
+It then performs targeted IR rewrites that make these regions compatible with CG capture.
+Conceptually, PyGraph ensures that variables and operations in a candidate region satisfy the constraints imposed by CGs: computations and necessary inputs are placed on the GPU, and incompatible operations are hoisted prior to candidate graph regions. For example, if a scalar parameter prevents graph capture, PyGraph alters the type of parameter as a GPU-resident tensor. During replays, the appropriate value of a parameter is copied into the tensor’s placeholder, enabling safe capture of the surrounding kernels. Likewise, if a DRAM-to-GPU memory copy prevents CG deployment, PyGraph hoists the copy above the sequence of kernels targeted for CG capture. This ensures that the copy is not captured as part of the CG and, thus, need not be replayed.
+
+Parameter Indirection (PI):
+
+A dominant source of overhead in a CG replay is the copying of kernel parameters (data) into the placeholders that were recorded during graph capture.
+We eliminate this cost by removing data copies from the replay path entirely: instead of copying potentially large parameter data, we introduce a layer of indirection.
+Consequently, the replay updates only the corresponding pointers (eight bytes per parameter) rather than the data itself, which can be thousands of bytes.
+This optimization rests on a simple observation: with the input data changing on each replay, as long as a kernel can read from these new data tensors—different from those it was captured with—the CG execution remains valid, without needing a parameter copy.
+
+(a)
+
+Baseline behavior in current ML frameworks.
+
+(b)
+
+After indirection.
+
+Figure 5
+:
+Converting data (parameter value) copy to pointer copy through indirection in Parameter Indirection.
+
+Figure 6
+:
+Implementation of PyGraph within PyTorch2’s compilation framework.
+
+Figure 5
+illustrates this mechanism with an example.
+
+5(a)
+shows the parameter (data) copy performed during the replay of a CG in the baseline.
+The kernel parameter recorded during graph capture (here, address
+x
+) is highlighted in red.
+During replay, the parameter for a given kernel invocation, residing at address
+y
+— must be copied into the memory location pointed to by
+x
+.
+5(b)
+shows how PyGraph converts the kernel parameter to pointer-to-pointer via indirection.
+These pointer-to-pointers are then recorded during graph capture. Before each replay, the pointers to the parameter (
+y
+) for the given invocation of the kernel are copied onto the address (pointer-to-pointer,
+px
+) recorded during the graph capture. The modified kernel then de-references these pointer-to-pointers before performing any computation (green).
+
+Our approach relies on the ability to rewrite kernels, which is feasible for JIT-compiled kernels (e.g., Triton
+[
+47
+]
+) but not for vendor-supplied libraries (e.g., CUTLASS
+[
+38
+]
+, cuBLAS
+[
+37
+]
+) or pre-compiled kernels. In
+§4
+, we describe an alternative mechanism that extends PI to these kernels based on recently introduced CG management APIs
+[
+16
+]
+, while meeting PyGraph’s goal of zero manual changes.
+
+Selective CUDA Graphs (SCG):
+
+Since CGs can also hurt performance (
+§2
+), they should not be used blindly. PyGraph employs automated profiling as part of the compilation and graph capture phase (slow path).
+Specifically, PyGraph measures the aggregate time to execute individual kernels encapsulated in a CG.
+It also profiles the execution time of the corresponding CG with and without Parameter Indirection.
+The profiler then automatically chooses the best-performing configuration for the given set of kernels in an application.
+This decision is made independently for each of the CGs. Also, note that this profiling happens during compilation and CG capture phase (slow path) and not during the graph replay (fast path).
+
+Taken together, these three optimizations push CUDA Graphs closer to their peak potential. CGCT broadens capture eligibility so that substantially more of the program can benefit from graph execution. PI removes a major replay bottleneck by eliminating parameter-copy overheads. SCG ensures that CGs are enabled only when they deliver end-to-end gains. The result is a system that captures larger kernel regions in graphs, executes them with lower overhead, and deploys CGs only where they improve performance.
+
+4
+Implementing PyGraph
+
+PyGraph is built into PyTorch2’s compilation workflow (slow path) that is responsible for CUDA Graph capture, enabling its optimizations to benefit fast-path execution (replay).
+While our prototype is implemented in the PyTorch2 compiler, its optimizations are generic and designed to address fundamental challenges of using CGs, making them applicable to most frameworks. We begin with a brief discussion of the compilation workflow of the PyTorch2 compiler and then discuss how PyGraph leverages it to apply its three optimizations.
+
+Compilation workflow in PyGraph:
+PyGraph follows a structure commonly found in modern ML compilers—such as PyTorch2
+[
+4
+]
+, JAX/XLA
+[
+6
+]
+.
+The typical compilation pipeline consists of
+
+1
+
+Computation Graph Construction Layer (Frontend)
+, where Python execution is symbolically traced, producing a computation graph in a high-level IR.
+
+2
+
+IR Lowering & Optimization Layer (Mid-Level Pass)
+, where the graph is lowered into a more uniform IR, enriched with metadata such as tensor shapes, device placement, and debug mappings.
+
+3
+
+Kernel Generation Layer (Backend)
+, where primitive operations are either dispatched to optimized GPU libraries (cuBLAS
+[
+37
+]
+, cuDNN
+[
+39
+]
+, CUTLASS
+[
+38
+]
+) or implemented through just-in-time (JIT) kernel generators such as Triton
+[
+47
+]
+.
+
+4
+
+Graph-Capture Layer
+, where the final compiled module is executed, and if eligible, captured as a CG. This layer maintains parameter placeholders and bookkeeping logic required to replay CGs.
+
+PyGraph adds targeted extensions to each of these layers.
+
+Figure 6
+provides an overview of PyGraph’s implementation, depicting how it extends selected components of the PyTorch2’s compilation workflow.
+The orange and purple background regions delimit the key components of the PyTorch2 compiler—its frontend (Torch Dynamo
+[
+52
+]
+) and backend (Torch Inductor
+[
+22
+]
+).
+Modifications for CGCT are shown in blue, while those for PI and SCG appear in yellow and green, respectively.
+Its three components—CGCT (blue), PI (yellow), and SCG (green)—extend different parts of the compilation workflow and are detailed in
+§4.1
+,
+§4.2
+, and
+§4.3
+, respectively.
+
+4.1
+CUDA Graph-aware Code Transformation
+
+PyGraph automatically finds and mitigates multiple factors that prevent deployment of CUDA Graphs. For ease of exposition, we describe the PyTorch2 components involved in deploying CGs first, and then PyGraph’s extensions to them.
+
+4.1.1
+Computation Graph Construction Layer
+
+Torch Dynamo (
+Figure 6
+, orange block on the left) intercepts Python execution and constructs computation graphs (FxGraphs
+[
+58
+]
+) consisting of TorchIR — a simplified IR that exposes Python and PyTorch operations for optimization.
+Dynamo symbolically traces operations until it encounters one that cannot be safely traced (e.g., input-dependent control flow).
+It terminates the current FxGraph, compiles it, and splices the compiled result back into the source program via bytecode rewriting.
+It resumes tracing after the offending operation, effectively partitioning the program into blocks, each of which is lowered independently to TorchIR (
+1
+in
+Figure 6
+).
+
+PyGraph’s extensions:
+
+Dynamo is extended to regenerate TorchIR from a modified code block (
+1
+in
+Figure 6
+), provided by the extensions to Torch Inductor described next.
+
+4.1.2
+IR-Lowering & Optimization Layer
+
+Torch Inductor (
+Figure 6
+, purple region), lowers the TorchIR produced by Dynamo into a lower-level IR comprised of primitive Aten/Prim
+[
+51
+]
+operations.
+Inductor then augments this IR with operand metadata–including tensor shapes, device placement (CPU or GPU), and debug mappings from InductorIR back to TorchIR–producing InductorIR (
+2
+in
+Figure 6
+). InductorIR serves as input to subsequent phases (
+§4.2
+) that apply further optimizations and code transformations.
+
+Inductor also decides whether a FxGraph represented by an InductorIR instance can be captured as a CUDA Graph.
+If the metadata shows that an operand of a FxGraph’a node is a CPU-resident scalar, a CPU–GPU memcopy, or an input mutation, it avoids encapsulating it in a CG.
+
+PyGraph’s extensions:
+
+To map more FxGraphs to CGs, PyGraph enhances Inductor’s decision routine for CG eligibility.
+When this routine determines that an FxGraph cannot be mapped to a CG, PyGraph inspects the cause of failure.
+If the failure is due to the presence of one or more scalar variables (e.g., a NumPy scalar as discussed in
+§2
+), it uses bytecode rewrites to cast the variables as GPU tensors, effectively removing the CPU operand/operation from the graph capture path.
+Dynamo then regenerates TorchIR for the modified block, which is re-lowered to InductorIR, enabling the FxGraph to be mapped to a CG.
+
+A CPU-to-GPU memcopy can also prevent Inductor from deploying a CG.
+Using debug metadata, PyGraph backtraces the InductorIR node to the Python object owning the offending CPU tensor and copies it to the GPU.
+This effectively changes the variable’s device placement, hoisting the memcopy into the object’s constructor so that it precedes any computation.
+As a result, memcopy gets removed from the graph-capture path, and the corresponding module can be mapped to a CG.
+Similarly, a CG may not get deployed if the output of an InductorIR node is a CPU tensor.
+In such a case, PyGraph updates the metadata of the TorchIR node to mark the output as a GPU tensor (i.e., setting
+device=‘cuda’
+).
+The updated TorchIR is then re-lowered to InductorIR (
+2
+in
+Figure 6
+), removing the CPU tensor from the graph-capture path and allowing the FxGraph to be mapped to a CG.
+
+4.2
+Parameter Indirection
+
+We detail how PyGraph achieves its goal of reducing parameter copy overheads through indirection.
+This needs modifying how kernels within CUDA Graphs obtain their parameters.
+
+4.2.1
+Kernel-Generation Layer
+
+The code generator (
+3
+in
+Figure 6
+) is responsible for generating an optimized executable (module) for an FxGraph.
+It uses different frameworks/libraries depending on the target hardware.
+Here, we focus on systems with NVIDIA GPUs.
+
+The code generator either invokes kernels from vendor-supplied external libraries (e.g., cuBLAS
+[
+37
+]
+) or generates kernels just-in-time (JIT) using frameworks such as OpenAI’s Triton
+[
+47
+]
+.
+It maintains a list of InductorIR ops (e.g., matmul, convolution) that use kernels from vendor-supplied libraries and emits direct calls to the relevant library routines.
+Remaining operations are implemented just-in-time using Triton.
+For such operations, the code generator constructs a Triton function in Triton’s Python-based DSL, decorates it with
+triton.jit
+for JIT compilation.
+It then invokes the Triton compiler to generate CUDA binaries.
+A module created for an FxGraph may contain both Triton and vendor-supplied kernels.
+After resolving all operations, the module builder assembles these components into a single, optimized module.
+
+PyGraph’s extensions:
+
+Recall that the goal of PyGraph is to enable repeated replay of a captured CG with different parameter values, but without adding the overhead of copying the parameter.
+It makes two changes to kernels to turn parameter (data) copies into pointer copies.
+First, it replaces each pointer argument with a pointer-to-pointer that holds the address of the data region the kernel will access.
+Second, before the kernel’s computation starts, it dereferences these pointers-to-pointers, allowing the rest of the kernel to access the actual data correctly.
+
+PyGraph employs two distinct implementation approaches to achieve the above objective, depending on whether the given kernel is generated just-in-time or is a vendor-supplied one.
+While the former can be updated during compilation, the latter is
+not
+– requiring two different approaches.
+
+Enabling PI in JIT-ed kernels:
+To apply indirection to eligible Triton-generated JIT kernels without manual intervention, PyGraph identifies the parameters that must undergo indirection during the code generation phase
+1
+1
+
+1
+
+Not all kernels or parameters require copying parameter data into placeholders.
+Outputs produced by earlier kernels in a CG can be passed directly to later kernels.
+Only kernels whose parameters originate from external sources (e.g., application inputs) require indirection.
+PyGraph selectively applies indirection only for such parameters.
+and attaches this information to the
+torch.jit
+decorator (yellow element in
+4
+in
+Figure 6
+).
+PyGraph’s custom LLVM
+[
+9
+]
+pass integrated into the Triton framework then retrieves this parameter list from the decorator and rewrites the PTX
+[
+42
+]
+code of the corresponding kernels.
+The pass updates the kernel signatures to use ‘pointer-to-pointer’ arguments for the designated parameters.
+Further, it inserts PTX instructions at the beginning of the kernel to de-reference these pointers before using them in computation.
+The rest of the kernel code remains unchanged.
+
+Enabling PI in vendor-supplied kernels:
+
+The approach of rewriting kernels is not feasible for those from vendor-supplied external libraries.
+These kernels are often supplied as compiled binaries.
+To workaround this fundamental limitation, PyGraph introduces an additional
+prelude
+kernel in the CUDA Graph at the start of the graph.
+The prelude kernel updates the parameters of the vendor-supplied kernel to point to actual data for a given invocation on the fly during replays.
+
+The prelude kernel is provided with pointer-to-pointers to the parameters of the vendor-supplied kernel, whose values change across graph replays.
+It is tasked with performing the dereferencing of the pointer-to-pointer argument for the immutable vendor-supplied kernel.
+PyGraph compiles the prelude kernel on the fly using NVRTC
+[
+46
+]
+, and re-records the CUDA Graph with this kernel inserted before other nodes.
+To achieve the effect of dereferencing, the prelude kernel must be able to update parameters to the vendor-supplied kernel on the fly during replay.
+
+Fortunately, CUDA runtime version 12.4, introduced new device-side APIs to update parameters of a node in CUDA Graph from within another kernel (
+cudaGraphKernelNodeSetParam
+)
+[
+16
+]
+.
+The prelude kernel uses this API to update the parameters of the vendor-supplied kernel during replay.
+
+The device-side APIs to update kernel parameters take three arguments:
+1
+the kernel-node handle,
+2
+a device-memory address (pointer) that holds the replacement pointer value, and
+3
+the offset within the kernel node’s parameter buffer.
+The API de-references the input pointer and writes the resulting value into the parameter buffer at the specified offset for the given kernel node.
+This operation performs a de-reference followed by a memory write.
+
+The next challenge is to find the offset of the argument to be updated within the kernel’s parameter buffer.
+For this purpose, PyGraph uses another CUDA API
+cuFuncGetParamInfo
+to obtain a handle to the kernel’s parameter buffer during compilation.
+Then, it performs a byte-pattern match with the known placeholder pointers within the buffer to identify the correct offsets.
+As with our earlier optimization, the transformation remains fully transparent to PyTorch programs and to the rest of the PyTorch2 compilation framework.
+
+Figure 7
+:
+Indirection in vendor-supplied kernels.
+
+Figure 8
+:
+Latency comparison of PI approaches.
+
+Figure 8
+illustrates this technique.
+Recall PyGraph’s aim to convert a kernel parameter (pointer
+x
+) into a pointer-to-pointer (
+px
+).
+During graph capture (
+§4.2.2
+), these pointer-to-pointers are recorded as parameters of the prelude kernel. Before each replay of the captured CG, the invocation-specific pointers to parameters are written into the recorded pointer-to-pointer locations (
+px
+).
+During replay, the prelude kernel de-references these pointer-to-pointers (
+1
+in
+Figure 8
+) and writes the resulting values into the parameter fields of the vendor-supplied kernel node (
+2
+) using the aforementioned parameter update APIs.
+
+A keen reader would note that this technique can also be used to achieve parameter indirection for JIT compiled kernels.
+While true, we empirically observed that it is noticeably slower than rewriting the kernel directly during compilation.
+
+Figure 8
+compares the latency of de-reference through JIT kernel rewrite and through prelude kernel techniques as the number of indirected parameters increases.
+PI through the prelude kernel is substantially slower and scales poorly, exceeding 10 µs at higher parameter counts. Consequently, we employ JIT-based kernel update where possible, falling back to using prelude kernels only for vendor-supplied kernels.
+
+4.2.2
+Graph-Capture Layer
+
+The CUDA Graph generator (
+4
+in
+Figure 6
+) captures the compiled module as a CG whenever prior analysis on InductorIR determines that the entire FxGraph can be mapped to a CG.
+PyTorch2 captures CGs only at the granularity of a whole-FxGraph. Because a CG records kernel parameters (e.g., pointer addresses) by value, the generator creates static placeholders for these parameters and substitutes them for the original parameters before capture.
+
+The graph generator must consider two types of kernel parameters:
+
+1
+those supplied externally (e.g., application inputs), and
+
+2
+those produced by preceding kernels within the CG.
+In the former, the placeholders do not initially contain the correct parameter value for each replay.
+It must be copied to the placeholders pointed to by the kernel parameters.
+In the second case, no copy is required, since the producer kernel writes directly into the placeholder.
+The CUDA Graph generator thus replaces the original parameters with static placeholders.
+It injects code that would perform the necessary parameter copies onto the static placeholder during a kernel’s invocation during replay.
+Finally, it uses the stream capture method (
+§2
+) to create a CG for the module.
+
+PyGraph’s extensions:
+
+To take advantage of PI, PyGraph enhances the CUDA Graph generator (yellow element in
+4
+in
+Figure 6
+).
+The enhanced generator receives the list of parameters that had undergone indirection by the code generator.
+For such parameters, PyGraph:
+
+1
+allocates static placeholders for
+pointers
+instead of data regions, and
+
+2
+injects code to perform pointer copies for these parameters instead of parameter (data) copies.
+Note that these pointer copies are host-to-device copies over the PCIe, as the list of pointers to parameters originally resides on the CPU.
+In contrast, original parameter copies are device-to-device within the GPU.
+This layer also places the prelude kernel into the captured graph.
+
+4.3
+Selective CUDA Graphs
+
+Recall that the overheads of a CUDA Graph can outweigh its benefits (
+§2
+).
+These overheads are due to parameter copies, as well as tasks such as garbage collection for graph replays (
+§2
+).
+While PI can reduce overheads due to parameter copies for kernels in a CG, the rest of the overheads remain.
+
+PyGraph introduces a profiler in the compilation phase (slow path) to judiciously decide whether to deploy a CG based on a cost-benefit analysis (colored green,
+5
+in
+Figure 6
+).
+The final outcome of the compilation is an optimized executable (module) corresponding to the given block of PyTorch code.
+It is then cached for use in the fast path.
+
+PyTorch2 greedily deploys CGs wherever one can be created.
+In contrast, PyGraph considers up to three possible choices:
+
+1
+A module
+without
+CG,
+
+2
+a module with CG but
+without
+PI, and
+
+3
+a module with CG and PI.
+The profiler runs each of the available modules as part of the compilation phase, measures their execution time, and caches the module with the best performance.
+
+One may wonder why PyGraph distinguishes between
+2
+and
+3
+.
+The subtlety is that PI replaces device-to-device (D2D) parameter (data) copies with host-to-device (H2D) pointer copies.
+When working with many small objects, it is possible that the overhead of copying pointers over the PCIe outweighs that of copying parameters (data) within the GPU’s memory.
+The profiler helps recognize such cases and PyGraph choose to cache the CG without PI.
+Overall, during compilation, the profiler help PyGraph judiciously choose which CGs to deploy during replay for the best performance.
+
+Summary:
+PyGraph extends Torch Dynamo and Torch Inductor to transparently update IRs for enabling more kernels to execute as part of CG (CGCT).
+It extends Triton’s kernel generator and PyTorch2’s CG generator to add indirections to convert data copies in CG to pointer copies (PI).
+Finally, it adds a profiler in the slow path that uses a cost-benefit analysis to decide when it is beneficial to deploy CG (SCG).
+
+5
+Evaluation
+
+Figure 9
+:
+Performance improvement of PyTorch2-CG and PyGraph against PyTorch2-No-CG.
+
+Suite
+
+Application (Short Name, Type, Batch Size)
+
+TorchBench
+
+Equation of State (EOS, I 1048576), Speech Transformer (ST, I, 1), DALLE2_pytorch (DALLE2, I, 1), Multi-modal Clip (MMC, I, 1), Turbulent Kinetic Energy (TKE, I, 1048576), Deep Recommender (DR-T, T, 256), Deep Recommender (DR-I, I, 8192), Vision MaskRCNN (VM, I, 1), AlexNet (ALNET, I, 2), dlrm (DLRM, I, 2048), TIMM Efficientdet (TEFD, T, 1), dcgan (DCGAN, T, 32), BERT (BERT, T, 16), densenet121 (DNET, I, 64),
+
+HuggingFace
+
+XLNet LM-head Model (XLNet-I, I, 1), XLNet LM-head Model (XLNet-T, T, 8), MT5ForConditionalGeneration (MTCG-T, T, 16), MT5ForConditionalGeneration (MTCG-I, I, 16), MobileBertForQuestionAnswering (MBERT, I, 128), DebertaV2ForQuestionAnswering (DBV2, I, 1), BlenderbotSmallForConditionalGeneration (BSCG, T, 64), DistillGPT2 (DGPT2, T, 16), Speech2Text2ForCausalLM (STCLM, T, 256), DebertaForMaskedLM (DMLM, T, 8)
+
+TIMM
+
+lcnet_050 (LCNET, I, 256)
+
+Table 1
+:
+Details of the workloads (T: Training, I: Inference).
+
+Our evaluation seeks to answer the following questions:
+
+\bullet
+
+How well does PyGraph exploit CUDA Graphs relative to the widely used PyTorch2 compiler?
+
+\bullet
+
+How much does each optimization in PyGraph contribute to end-to-end performance?
+
+\bullet
+
+How robustly does PyGraph generalize to distributed models and diverse GPUs?
+
+Workloads and metric:
+
+We evaluate a broad mix of training and inference workloads from TorchBench
+[
+19
+]
+, HuggingFace
+[
+21
+]
+, and TIMM
+[
+74
+]
+, spanning vision, NLP, and HPC. We focus on applications that are sensitive to CUDA Graph usage;
+Table 1
+summarizes these workloads. Because ML workloads are inherently repetitive, we use the runtime of a single iteration as our primary metric—one forward pass for inference and one forward–backward pass for training. All reported numbers are averaged over 100 runs.
+
+Environment:
+
+We conduct experiments on an NVIDIA H100 NVL GPU with 94GB HBM3, paired with a 64-core Intel Xeon 8462Y+ CPU and 512 GB of DDR5 memory. The software stack includes PyTorch 2.4
+[
+53
+]
+, CUDA 12.8
+[
+44
+]
+, cuDNN 8.9.2
+[
+40
+]
+, and NVIDIA driver 575.57.08. For multi-GPU benchmarks, we use a system with four 80GB H100s connected via high-bandwidth NVLink, running CUDA 12.4.
+
+Baselines:
+
+We compare PyGraph against two baselines: PyTorch2
+without
+CUDA Graphs, denoted PyTorch2-No-CG, and PyTorch2 with CUDA Graphs enabled, denoted PyTorch2-CG. All compilers are based on PyTorch v2.4.
+
+5.1
+End-to-end performance
+
+Figure 10
+:
+Ablation study on different optimizations of PyGraph (performance normalized against PyTorch2-No-CG).
+
+Figure 9
+compares PyGraph’s performance against that of PyTorch2-No-CG and PyTorch2-CG. The figure displays two bars for each application, where the first bar indicates the speedup of PyTorch2-CG over PyTorch2-No-CG, and the second reports the speedup of PyGraph over PyTorch2-No-CG.
+
+First, we find that although CUDA Graph was introduced purely as a performance optimization, its current deployment in PyTorch2 can significantly hurt performance.
+PyTorch2-CG slows down 4 of the 25 applications by at least 3% compared to PyTorch2-No-CG (bars with height
+<1
+), with worst-case regressions of 29% for EOS (HPC) and 15% for Deep Recommender (inference). These workloads consist of short kernels of tens of microseconds each for which the replay overhead (e.g., parameter copying and RNG management) dominates execution time (often around
+\sim 50\%
+). As a result, blindly deploying all CGs causes net slowdowns, and yet PyTorch2-CG deploys them anyway.
+In contrast, PyGraph is at least as good as the best of PyTorch2-No-CG and PyTorch2-CG for every application.
+This is important as it absolves a user from having to decide whether to enable CG for each of their programs.
+
+Second, even in cases where PyTorch2-CG improves performance over PyTorch2-No-CG, it still fails to effectively harness CUDA Graph as shown by the difference between bars for PyTorch2-CG and PyGraph.
+PyGraph improves performance over PyTorch2-CG by 29% on average and by up to
+3.36\times
+(XLNET-inference).
+While PyTorch2-CG fails to deploy any CUDA Graphs in XLNET-I, PyGraph deployed
+413
+kernels through CGs, thanks to its CG-aware code transformation.
+In another example,
+PyTorch2-CG improves DALLE2 (inference) by
+1.9\times
+whereas PyGraph improves it by
+2.72\times
+.
+In summary, PyGraph effectively leverages CGs when there is an opportunity without hurting performance elsewhere.
+
+5.2
+Ablation of individual optimizations
+
+Figure 10
+quantifies individual contribution of each optimization in PyGraph. Each application has three bars corresponding to three optimizations.
+The height of a bar is normalized to the performance of PyTorch2-No-CG.
+The total height of the first bar shows the speedup obtained by applying CUDA Graph-aware Code Transformation (CGCT) alone.
+The bottom stack (dark blue) of the first bar shows the speedup of PyTorch2-CG over PyTorch2-No-CG.
+The top stack captures the improvement due to CGCT over PyTorch2-CG.
+The second bar shows performance of PI in tandem with CGCT (+Parameter Indirection).
+The third bar shows the cumulative effect of three optimizations (+Selective CUDA Graphs).
+
+CUDA Graph-aware Code Transformation.
+
+CGCT enables more kernels to be captured within CGs, amortizing the overhead associated with individual kernel launches.
+As a result, applications such as XLNET-I, MMC, and ST achieve speedups of
+3.14\times
+,
+2.31\times
+,
+2\times
+over PyTorch2-CG, while DALLE2, XLNET-T, and VM improve performance by
+43\%
+,
+16\%
+, and
+11\%
+over PyTorch2-CG, respectively.
+
+Table 2
+lists six applications that witness a significant increase in the percentage of their kernels launched as part of CG(s).
+For example, PyTorch2-CG fails to deploy any CUDA Graph for MMC and XLNET-I. In case of XLNET-I, its FxGraph with
+413
+kernels was not deployed via CG due to the presence of a
+single
+CPU tensor in the FxGraph.
+Similarly, one of the FxGraphs of DALLE2 with
+314
+kernels was not deployed as a CG due to a
+single
+memcopy operation from a CPU tensor to a GPU tensor.
+CGCT removes these constraints, deploying more than
+99\%
+of the kernels via CG(s).
+Even for ST and VM, CGCT increased CG coverage from 5.14% and 58.84% to 74.22% and 71.01%.
+
+Parameter Indirection.
+
+PI reduces overhead of copying kernel parameters while replaying CGs.
+This speeds up TKE by 23% and DR-I by 18%.
+Twelve others speed up by more than 4% (EOS, XLNET-I, MTCG-T, TEFD, DCGAN, DLRM, BERT, DR-T, ALNET, DNET, BSCG, VM).
+
+Table 3
+reports the reduction in bytes copied by PI. Most workloads see a drastic drop, with the maximum remaining copy size under PyGraph at just 336 B. For example, it reduces the bytes copied in MTCGT-T, DGPT2, STCLM, and DMLM from 1 GB, 953 MB, 850 MB, and 548 MB, respectively, to just 312 B, 136 B, 136 B, and 136 B, a reduction of over 99%.
+
+Table 3
+also shows the number of CGs that PyGraph optimizes via PI in parenthesis.
+
+Note that even after eliminating all data copy, PI may not always benefit the application.
+For example, for a small tensor, the PCIe transfer cost due to pointer copy may outweigh the benefit of avoiding a larger copy within GPU HBM. These are the cases where a CG does not benefit from PI.
+For instance, DALLE2 sees no benefit from PI.
+In contrast, the lone CG in TKE and DR-I gains significantly from reduced copy sizes, yielding speedups of
+23\%
+and
+18\%
+.
+
+Selective CUDA Graphs.
+
+SCG judiciously deploys CGs driven by a cost-benefit analysis.
+It disables CGs where they could hurt performance, avoiding regression.
+This is particularly important for applications such as EOS, where blind deployment of CGs degrades performance by
+29\%
+.
+
+App.
+
+% of Kernels in CUDA Graphs
+
+PyTorch2-CG
+
+w/ CUDA Graph-aware Code Transformation
+
+ST
+
+5.14
+
+74.22
+
+DALLE2
+
+79.56
+
+99.32
+
+MMC
+
+0
+
+99.32
+
+XLNET-T
+
+1.53
+
+98.06
+
+XLNET-I
+
+0
+
+99.28
+
+VM
+
+58.84
+
+71.01
+
+Table 2
+:
+Enhanced coverage by CUDA Graphs due to CUDA Graph-aware Code Transformation.
+
+App.
+
+Bytes Copy Reduced
+
+(
+# CUDA Graphs
+)
+
+App.
+
+Bytes Copy Reduced
+
+(
+# CUDA Graphs
+)
+
+XLNET-I
+
+8.0 KB
+\rightarrow
+16.0 B (1)
+
+MMC
+
+314.0 KB
+\rightarrow
+16.0 B (1)
+
+ST
+
+1.3 MB
+\rightarrow
+336.0 B (3)
+
+DALLE2
+
+4.0 KB
+\rightarrow
+16.0 B (5)
+
+EOS
+
+4.1 MB
+\rightarrow
+24.0 B (0)
+
+TKE
+
+174.0 MB
+\rightarrow
+168.0 B (1)
+
+VM
+
+1.6 MB
+\rightarrow
+184.0 B (3)
+
+DR-I
+
+3.0 GB
+\rightarrow
+8.0 B (1)
+
+XLNET-T
+
+362.0 MB
+\rightarrow
+232.0 B (3)
+
+MTCG-T
+
+1.0 GB
+\rightarrow
+312.0 B (3)
+
+DLRM
+
+14.6 MB
+\rightarrow
+136.0 B (1)
+
+MBERT
+
+130.0 KB
+\rightarrow
+24.0 B (1)
+
+TEFD
+
+6.2 MB
+\rightarrow
+120.0 B (2)
+
+ALNET
+
+588.0 KB
+\rightarrow
+8.0 B (1)
+
+DCGAN
+
+1.5 MB
+\rightarrow
+16.0 B (1)
+
+BERT
+
+156.3 MB
+\rightarrow
+32.0 B (2)
+
+LCNET
+
+73.5 MB
+\rightarrow
+8.0 B (1)
+
+DR-T
+
+290.0 MB
+\rightarrow
+16.0 B (2)
+
+DNET
+
+18.4 MB
+\rightarrow
+8.0 B (1)
+
+MTCG-I
+
+32.0 KB
+\rightarrow
+16.0 B (1)
+
+DBV2
+
+4.0 KB
+\rightarrow
+24.0 B (1)
+
+BSCG
+
+1.6 GB
+\rightarrow
+56.0 B (30)
+
+DGPT2
+
+953.4 MB
+\rightarrow
+136.0 B (3)
+
+STCLM
+
+849.5 MB
+\rightarrow
+136.0 B (14)
+
+DMLM
+
+548.8 MB
+\rightarrow
+136.0 B (3)
+
+Table 3
+:
+Reduction in data copy and number of CUDA Graphs optimized by PyGraph’s parameter indirection.
+
+In five applications, PyGraph selectively disables CGs to achieve better overall performance.
+For instance, VM exposes 21 candidate CGs, but PyGraph enables only four and disables the other 17 to improve end-to-end performance by 6%.
+Similarly, SCG disables the single CG in EOS to avoid performance loss. Overall, PyGraph exercises selective deployment by enabling 97 of 123 possible CGs across the applications.
+
+Overall, these results demonstrate that each of PyGraph’s optimizations makes a meaningful contribution across multiple applications, collectively enhancing overall performance.
+
+5.3
+Evaluating distributed ML models
+
+We evaluated the efficacy of PyGraph under tensor parallelism (TP)
+[
+63
+]
+, a widely deployed strategy for distributing ML processing in a multi-GPU setting.
+We evaluated four workloads under TP on server with 4
+\times
+H100 GPUs connected over NVLink.
+
+Figure 11
+summarizes the results: for each application, we report three groups of measurements corresponding to TP-1, TP-2, and TP-4.
+In each group, we compare the performance of PyTorch2-CG and PyGraph against the PyTorch2-No-CG under the given TP setting. This allows us to observe the effectiveness of PyTorch2-CG and PyGraph under TP.
+
+Figure 11
+:
+Speedup of PyTorch2-CG and PyGraph over PyTorch2-No-CG across tensor parallel settings (TP=1,2,4).
+
+Figure 11
+demonstrates that PyGraph significantly amplifies the benefits of CGs over PyTorch2-CG under TP.
+All results use inference batch size 1, except for XLNET, which uses batch size 128.
+As the degree of TP increases, GPU kernels finish faster, and CPU launch latency becomes a larger fraction of overall runtime.
+This, in turn, increases the importance of fully harnessing CUDA Graphs, which PyTorch2-CG fails to do.
+In contrast, PyGraph yields substantially higher speedups for XLNET, DALLE2, and ST with progressively larger gains as parallelism increases, as it is able to deploy many kernels in CUDA Graphs.
+Its speedup reaches up to
+3.48\times
+over PyTorch2-No-CG at TP-4 for XLNET with
+2.41\times
+on average across different TP settings.
+This demonstrates that PyGraph assumes further importance with increasingly wider deployment of distributed ML processing across multiple GPUs.
+
+Evaluation on A6000 GPU.
+We also evaluated PyGraph on a workstation class A6000 GPU having less compute power than H100s.
+As the GPU becomes slower, the headroom for improvement with CGs reduces.
+Even then, PyGraph more prudently utilizes CUDA Graph compared to PyTorch2-CG.
+For example, PyTorch2-CG degrades performance compared to PyTorch2-No-CG by up to
+32\%
+for EOS. In contrast, PyGraph never degrades performance and achieves a maximum improvement of
+3.25\times
+over PyTorch2-No-CG with an average speedup of
+1.18\times
+compared to PyTorch2-CG’s average speedup of
+1.06
+over PyTorch2-No-CG. This shows that PyGraph’s efficacy is not tied to a specific GPU architecture.
+
+Compilation Time.
+Across all the workloads we evaluated, PyGraph increases compilation time relative to PyTorch2 by
+1.6\times
+on average (e.g., compilation time for ST and DALLE2 increased from 15 seconds and 96 seconds to 37 seconds and 185 seconds, respectively). This extra latency reflects the additional work PyGraph performs, such as code transformations, kernel rewriting, and profiling. However, note that compilation is a one-time cost incurred in the slow path that is easily covered by the steady-state performance improvement in the fast path.
+
+6
+Related Work
+
+ML compilers:
+
+Early ML compilers such as TensorFlow
+[
+1
+]
+, Caffe
+[
+25
+]
+, Theano
+[
+70
+]
+, and CNTK
+[
+59
+]
+improve performance via graph-level optimizations, while later systems develop richer tensor-program IRs
+[
+5
+,
+7
+,
+10
+,
+14
+,
+18
+,
+32
+,
+60
+,
+47
+,
+71
+,
+77
+,
+82
+,
+84
+,
+85
+,
+86
+,
+87
+]
+and target efficient code generation across diverse hardware and irregular workloads
+[
+61
+,
+13
+,
+68
+,
+79
+]
+.
+Recent advances introduce whole-graph and memory-centric optimizations
+[
+62
+,
+76
+]
+, accelerate dynamic control flow
+[
+81
+]
+, and perform multi-level super-optimization using unified IRs
+[
+75
+]
+.
+These efforts reduce kernel count and/or improve efficiency of kernels.
+PyGraph complements them by mitigating CPU launch overhead and enhancing CUDA Graph’s deployability.
+
+PyTorch2
+[
+4
+]
+showed that dynamic Python execution can coexist with graph compilation by using Torch Dynamo
+[
+52
+]
+to rewrite Python bytecode into FxGraphs
+[
+58
+]
+and Torch Inductor
+[
+22
+]
+to lower them into optimized GPU kernels.
+Earlier capture mechanisms–JIT tracing, TorchScript
+[
+55
+]
+, lazy tensors
+[
+54
+,
+67
+]
+, and symbolic tracing
+[
+58
+]
+–were limited by unsoundness, incomplete Python coverage, or high recompilation overheads.
+PyGraph is not tied to PyTorch2’s pipeline; it only assumes a compiler that produces a stable kernel-launch DAG and augments the backend that prepares and executes kernels.
+PyGraph’s approach can integrated with JAX
+[
+6
+]
+, XLA
+[
+48
+]
+, too. Source-level graph-repair techniques
+[
+30
+]
+are complementary to PyGraph.
+They lengthen computation graphs, while PyGraph ensures the resulting kernel DAGs are effectively captured as CUDA Graphs.
+
+CUDA Graphs:
+
+Grape
+[
+83
+]
+is a close prior work, optimizing CUDA Graphs for DNNs through predication rewriting, metadata compression, and alias prediction, but these techniques require extensive manual kernel and CUDA-driver changes – e.g., over 400 lines of kernel edits for GPT beam search – and its alias predictor is incompatible with PyTorch2.
+In contrast, PyGraph requires
+no
+manual modifications and works transparently for all PyTorch applications.
+Extensive manual changes required by Grape and its tight integration with PyTorch 1.12 makes a quantitative comparison infeasible.
+Other systems use CUDA Graphs in specialized deployments, such as serverless LLM inference, by materializing and restoring pre-captured graphs
+[
+80
+]
+.
+These efforts focus on a graph’s persistence, whereas PyGraph enables broader and more efficient deployment of CUDA Graph and thus, is complementary.
+
+7
+Conclusion
+
+We present PyGraph — a compiler framework designed to enhance the deployment and performance of CUDA Graphs.
+PyGraph addresses several key limitations of the PyTorch2 compiler, leading to substantial performance improvement across various ML benchmarks without requiring manual modifications to applications.
+
