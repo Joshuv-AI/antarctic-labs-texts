@@ -1,0 +1,1111 @@
+ETS: Efficient Tree Search for Inference-Time Scaling
+Coleman Hooper, Sehoon Kim, Suhong Moon, Kerem Dilmen, Monishwaran Maheswaran, Nicholas Lee, Michael W. Mahoney, Sophia Shao, Kurt Keutzer, Amir Gholami
+
+Abstract
+Test-time compute scaling has emerged as a new axis along which to improve model accuracy, where additional computation is used at inference time to allow the model to think longer for more challenging problems. One promising approach for test-time compute scaling is search against a process reward model, where a model generates multiple potential candidates at each step of the search, and these partial trajectories are then scored by a separate reward model in order to guide the search process. The diversity of trajectories in the tree search process affects the accuracy of the search, since increasing diversity promotes more exploration. However, this diversity comes at a cost, as divergent trajectories have less KV sharing, which means they consume more memory and slow down the search process. Previous search methods either do not perform sufficient exploration, or else explore diverse trajectories but have high latency. We address this challenge by proposing Efficient Tree Search (ETS), which promotes KV sharing by pruning redundant trajectories while maintaining necessary diverse trajectories. ETS incorporates a linear programming cost model to promote KV cache sharing by penalizing the number of nodes retained, while incorporating a semantic coverage term into the cost model to ensure that we retain trajectories which are semantically different. We demonstrate how ETS can achieve 1.8 × \times reduction in average KV cache size during the search process, leading to 1.4 × \times increased throughput relative to prior state-of-the-art methods, with minimal accuracy degradation and without requiring any custom kernel implementation. Code is available at: https://github.com/SqueezeAILab/ETS .
+
+
+
+†
+†
+affiliationnotice:
+Equal contribution
+
+Figure 1
+:
+
+Visualization of our methodology for accelerating search while maintaining accuracy.
+(Left): Prior work (REBASE) achieve high accuracy with search by sampling more or less continuations from the candidate leaf nodes depending on their reward scores, thereby trading off exploration and exploitation.
+However, this approach leads to larger KV cache size since it retains divergent trajectories which do not share nodes earlier in the tree.
+(Middle) One approach to reduce the cost is to penalize the number of nodes in the tree, thereby encouraging sharing prior KV cache state.
+However, this has the downside of pruning necessary semantically diverse trajectories, which degrades accuracy.
+(Right) ETS (our method) attains high efficiency by pruning out redundant nodes and promoting KV cache sharing, while ensuring that semantically diverse trajectories are retained, thereby allowing our approach to perform sufficient exploration.
+
+1
+Introduction
+
+With the increasing challenges with scaling up language model pretraining due to compute and data availability, scaling test-time computation is emerging as a new axis along which to improve model performance
+(
+Snell et al. 2024
+)
+.
+By increasing the amount of computation used at test time, we can allow Large Language Models (LLMs) to think longer for more challenging problems by generating long chain-of-thought reasoning, where the model lays out step-by-step reasoning to help guide itself to the final answer
+(
+Wei et al. 2022
+)
+.
+This is particularly useful for improving accuracy in domains which require problem-solving capabilities, such as challenging math and coding problems
+(
+Snell et al. 2024
+;
+Brown et al. 2024
+)
+.
+Test-time scaling can also allow us to trade off increased compute demands at inference time with compute used during training time, since a smaller model with increased compute allocation at test time can outperform a larger pretrained model
+(
+Beeching et al. 2024
+)
+.
+
+One prominent method to scale up test time compute is through search, where we generate multiple possible candidate solutions and then filter them down to produce the final response.
+An emerging method for performing search is to use a
+Process Reward Model
+(PRM) to score partial trajectories in order to inform the search process
+(
+Snell et al. 2024
+;
+Beeching et al. 2024
+)
+.
+These strategies generate multiple potential candidates at each step, score each of them using a PRM, and then choose which trajectories to retain based on these scores.
+While these approaches yield promising results in terms of improving accuracy through test-time scaling, the increased inference costs are substantial, as many trajectories must be generated and scored before a final answer is selected.
+
+Prior work has highlighted that generative LLM inference is typically
+memory bandwidth-bound
+
+(
+Kim et al. 2023a
+;
+Kim et al. 2023b
+;
+Hooper et al. 2024a
+)
+, meaning that inference efficiency is limited by how quickly we can transfer data rather than the peak compute of the GPU (also referred to as memory wall
+(
+Gholami et al. 2024
+)
+).
+There are typically two dominant contributors to memory consumption: the model weights, and the KV cache, which stores the embedded representation of the sequence.
+Both the model weights and KV cache have to be loaded into memory for each generation step.
+For short sequence lengths, the model weights are typically the dominant contributor to memory consumption and bandwidth, whereas for longer context lengths and batched inference the KV cache becomes the main memory bottleneck
+(
+Hooper et al. 2024b
+)
+.
+For test-time compute strategies such as tree search, many trajectories are generated in parallel.
+Since each unique trajectory requires separate KV cache state, for wider beam search, the KV cache becomes a critical memory bottleneck.
+
+Previous works on efficient search have either used number of model calls or FLOPs as the target efficiency metric when performing search
+(
+Qiu et al. 2024
+;
+Wu et al. 2024
+;
+Snell et al. 2024
+)
+.
+However, the actual inference costs of search are not necessarily proportional to the number of model calls or FLOPs, due to the memory-bound nature of generative inference.
+The number of memory operations performed during the search process is critical for determining its runtime.
+Crucially, the number of memory operations required for search is not necessarily correlated with FLOPs or model calls; for example, when we sample several parallel generations, we can amortize the memory operations for the model across these generations, whereas if we perform several successive generations where we iteratively refine the same response, then we need to load the model separately for each refinement.
+A key challenge with these proxy efficiency metrics is that they neglect the influence of KV cache sharing between trajectories, which has a substantial impact on the memory consumption and bandwidth requirements for performing search.
+For example, with two trajectories which share the KV cache for most of their previous steps, this will require substantially fewer memory operations when performing further generations than if each trajectory has an entirely separate KV cache state.
+
+In this work, we analyze the efficiency and performance of existing search methods.
+We focus in particular on parallel tree search algorithms like beam search and REBASE
+(
+Wu et al. 2024
+)
+since they are able to search multiple paths in parallel and are therefore more efficient for LLM test-time scaling than sequential search algorithms like MCTS
+(
+Snell et al. 2024
+;
+Beeching et al. 2024
+;
+Wu et al. 2024
+)
+.
+We identify how standard beam search ends up collapsing to a small number of trajectories (meaning that it exhibits high KV cache sharing in the search tree), but this has the consequence of low diversity and reduced accuracy even for wide beam widths.
+Conversely, methods such as REBASE generate more diverse trajectories and are therefore able to attain higher accuracy and better scaling to wider beam widths.
+However, while these methods may seem to be as efficient for the same width when using number of model calls or FLOPs as the efficiency metric, these approaches lead to substantially reduced KV cache sharing, which in turn translates to substantial inference overheads.
+The reduction in KV sharing leads to substantial increases in latency when using an optimized serving system such as SGLang
+(
+Zheng et al. 2023
+)
+which can exploit KV sharing.
+
+These differences between beam search and diverse tree search methods highlight the trade-off between promoting diverse trajectories to attain high accuracy and increasing the amount of KV sharing that we can exploit.
+There is therefore a need to develop search methods which can produce diverse trajectories and attain high accuracy, but which also have high KV sharing in order to not compromise on inference efficiency.
+Our work aims to tackle this challenge by proposing a search algorithm that promotes KV cache sharing to improve efficiency, while retaining the diverse trajectories that are necessary for facilitating exploration in order to attain high accuracy.
+
+The contributions of our work are as follows:
+
+1.
+
+We present profiling data which demonstrates how existing proxy metrics for search efficiency are not necessarily correlated with search runtime due to the memory-bound nature of LLM inference as well as the impacts of KV cache sharing on attainable throughput.
+
+2.
+
+To allow for accurate and diverse search while still maintaining inference efficiency, we present Efficient Tree Search (ETS), which is highlighted in detail in Figure
+1
+.
+ETS incorporates a linear programming cost model to promote KV cache sharing by penalizing divergent branches, thereby improving inference efficiency.
+
+3.
+
+In order to retain diversity while promoting KV sharing, we augment our cost model with a coverage term that compels the model to retain semantically diverse trajectories,
+while still allowing our KV cache cost model to enhance KV sharing.
+This approach allows our method to retain diverse trajectories while promoting KV cache sharing by pruning out semantically similar trajectories.
+We demonstrate how ETS can achieve
+1.8
+\times
+reduction in average KV cache size during the search process, leading to
+1.4
+\times
+speedups relative to REBASE with minimal accuracy degradation. Notably, our approach doesn’t require dedicated kernel implementations on top of SGLang, and is compatible with the benefits attainable from more efficient kernels for computing attention with tree structured KV sharing
+(
+Yao et al. 2024a
+)
+.
+
+2
+Related Work
+
+2.1
+Rejection Sampling
+
+Previous works have explored methods where multiple independent trajectories are sampled for a particular problem, and then we select between them to determine the final answer
+(
+Wang et al. 2022
+;
+Chen et al. 2024
+;
+Beeching et al. 2024
+;
+Brown et al. 2024
+)
+.
+These approaches are typically referred to as Best-of-N or rejection sampling.
+Once several responses have been generated by the model, we need to verify which of the final answers are correct.
+Prior work has proposed the use of a trained verifier to select between responses
+(
+Cobbe et al. 2021
+)
+.
+This verifier, or Outcome Reward Model (ORM), generates a reward score for each trajectory, and we can then select the best response based on this score.
+Alternatively, we can leverage more complex aggregation strategies like majority voting or weighted majority voting (using the reward scores) to select the final response
+(
+Wang et al. 2022
+;
+Chen et al. 2024
+;
+Beeching et al. 2024
+)
+.
+Prior work has also proposed training a verifier to decide whether each step in the solution process is correct, since this can provide finer granularity feedback in order to provide a better reward signal
+(
+Uesato et al. 2022
+)
+.
+This type of verifier is called a Process Reward Model (PRM) and they have been shown to be more reliable than ORMs for domains such as math problem solving
+(
+Lightman et al. 2023
+)
+.
+One key challenge when designing a PRM is coming up with training data; prior work has aimed to automate the data generation process to facilitate training PRMs without large amounts of human labeled data
+(
+Wang et al. 2024
+)
+.
+Other alternative approaches instead use LLMs as reward models
+(
+Bai et al. 2022
+;
+Abdulhai et al. 2023
+;
+Lee et al. 2024
+;
+Pan et al. 2024
+)
+. In these methods, the LLMs serve as learned reward functions that guide the LLM post-training by providing feedback on the quality of generated outputs.
+
+2.2
+Tree Search
+
+Tree-based search approaches have been extremely successful in applications such as games, where systems designed using search have proven equally capable compared to top human players
+(
+Brown et al. 2017
+;
+Silver et al. 2016
+;
+Silver et al. 2017
+)
+.
+Search strategies can also be extended to LLM reasoning as a way to better navigate the space of possible trajectories.
+One approach for performing tree search with math problems is through the use of a PRM to provide reward scores for partial trajectories, and to then use these scores to guide the search process
+(
+Yao et al. 2024b
+;
+Zhou et al. 2023
+;
+Besta et al. 2024
+;
+Snell et al. 2024
+)
+.
+
+There have been several methods to improve the diversity and efficiency with search strategies.
+One straightforward search strategy is beam search, which explores the solution space by sampling
+N
+partial trajectories, pruning out all but
+k
+of these trajectories based on the PRM scores, and then expanding each retained trajectory by sampling multiple continuations for each of them
+(
+Snell et al. 2024
+;
+Beeching et al. 2024
+;
+Qiu et al. 2024
+)
+.
+This can attain higher accuracy for the same compute budget relative to best-of-N sampling
+(
+Snell et al. 2024
+)
+.
+One challenge with naive beam search is that it doesn’t generate diverse enough trajectories
+(
+Beeching et al. 2024
+)
+.
+One proposed solution for this is Diverse Verifier Tree Search (DVTS), which first segments the beam search tree into multiple parallel subtrees, and then runs beam search independently within each subtree
+(
+Beeching et al. 2024
+)
+.
+This is analogous to prior works on Diverse Beam Search for language model decoding
+(
+Li & Jurafsky 2016
+;
+Vijayakumar et al. 2016
+)
+.
+DVTS attains higher accuracy for wider beam widths than standard beam search; however, this has the potential additional cost of reduced KV sharing due to segmenting the tree into separate subtrees.
+
+2.3
+Accelerating Tree Search
+
+There have been several prior approaches for accelerating tree search for LLM inference.
+One previous approach, REBASE, allocates different numbers of continuations to different partial trajectories based on the reward scores for each of the trajectories
+(
+Wu et al. 2024
+)
+.
+This method produces more diverse trajectories than standard beam search and attains higher accuracy for the same efficiency budget (when measuring efficiency using FLOPs or number of model calls).
+Additionally, one prior work aiming to accelerate Best-of-N sampling terminated generations early using partial reward signals
+(
+Sun et al. 2024
+)
+.
+One alternative approach for accelerating search is to allocate different amounts of computation for different problems depending on their difficulty
+(
+Zhang et al. 2024
+;
+Snell et al. 2024
+;
+Beeching et al. 2024
+)
+.
+
+There have also been several prior works that have designed support in serving systems for shared prefix or tree attention workloads.
+Hydragen
+(
+Juravsky et al. 2024
+)
+proposed only storing the shared prefix for the KV cache once, and then batching together loads.
+vLLM
+(
+Kwon et al. 2023
+)
+also supports shared prefix workloads and avoids duplicating the KV cache.
+SGLang
+(
+Zheng et al. 2023
+)
+supports Radix Attention, which compactly stores reused KV cache segments and dynamically referencing them, even for more complex tree sharing patterns.
+Other works have also proposed efficient kernel implementations for computing attention with tree-structured KV sharing
+(
+Yao et al. 2024a
+)
+.
+
+Figure 2
+:
+
+Correlation between approximate efficiency metrics and profiled runtime.
+We report profiled Runtime as well FLOPs), number of model calls, and total KV Cache Size (“KV Size”) as well as profiled runtime.
+We measure each metric for Beam Search, DVTS, and REBASE for the Llemma-34B model with a width of 256, and we report each metric normalized to the value for Beam Search.
+For Beam Search and DVTS, we retain
+\sqrt{N}
+trajectories at each step, where
+N
+is the width of the search.
+As can be seen, REBASE has similar FLOPs and number of model calls compared to beam search and DVTS, but it exhibits significantly higher runtime.
+The increased runtime is due to its increased KV cache size.
+This clearly shows that FLOPs and number of model calls are not necessarily the right proxy metrics to use when assessing search efficiency.
+
+3
+Profiling
+
+When designing more efficient search algorithms, it is desirable to leverage a proxy metric to assess the efficiency of the algorithm in order to speed up iteration time, as running benchmarking in isolation for fair comparison between different search methods is more challenging and leads to slower iteration time.
+Example proxy metrics for search runtime which were used in previous works include the number of model calls / tree width, as well as FLOPs
+(
+Qiu et al. 2024
+;
+Wu et al. 2024
+;
+Snell et al. 2024
+)
+.
+The simplicity of these metrics makes them desirable for fast prototyping and ease of comparison.
+However, as mentioned previously, FLOP count is not a good metric for memory-bound problems and may even be misleading.
+
+To assess the utility of these proxy metrics, we profiled the throughput when running different search strategies, each using the same width.
+We profiled throughput on 100 samples from the MATH500 test set on NVIDIA H100 NVL GPUs, with the Llemma-34B model and Llemma-Reward-34B PRM each on a separate GPU (model details are provided in Section
+5.1
+).
+Results were collected by running evaluation using 8 parallel threads (which is analogous to the attainable throughput with a batch size of 8 for serving use-cases).
+We also include FLOPs, model calls, and KV cache size as proxy metrics (where KV cache size is the sum of the size of the KV cache state across all steps in the search process).
+To estimate FLOPs, we leverage the approximation that the number of FLOPs is proportional to the number of tokens generated (which holds for short context lengths)
+(
+Pope et al. 2023
+)
+.
+According to existing proxy metrics, these search methods should all yield similar latency as they all have similar numbers of FLOPs and model calls.
+However, as highlighted in Figure
+2
+, we observe that these algorithms exhibit substantial differences in terms of profiled latency.
+These gaps are due to the differences in terms of number of
+memory operations
+which need to be performed when running the workload, since generative LLM inference is typically memory bandwidth-bound
+(
+Kim et al. 2023b
+;
+Kim et al. 2023a
+;
+Hooper et al. 2024a
+)
+.
+The number of memory operations that need to be performed for different tree search methods are dependent on multiple factors:
+
+1.
+
+The amount of KV cache sharing between trajectories determines the size of the state that needs to be loaded for each inference step, which substantially influences the runtime if the KV cache is the dominant contributor to memory consumption relative to model weights.
+Note that leveraging this benefit requires efficient tree attention kernels to reduce KV cache loads
+(
+Yao et al. 2024a
+)
+.
+
+2.
+
+Even with existing open-source frameworks, such as SGLang
+(
+Zheng et al. 2023
+)
+, that don’t incorporate efficient tree attention kernels, we can still reduce memory operations.
+If the KV cache for the sequences is too large to fit in memory (either with wide beam search or in batched use-cases), then the number of sequences that can be run in parallel will be constrained and the search process gets fragmented into multiple successive iterations.
+This leads to performing more memory operations for the model weights, since the model weights need to be loaded for each fragment.
+
+3.
+
+Additionally, while the KV cache state can be reused for earlier steps in the search when generating later steps, if the memory requirements are too great then the KV cache for the earlier steps would be de-allocated and would need to be recomputed, which would increase latency.
+
+These factors mean that reducing the KV cache size by promoting KV cache sharing between trajectories is crucial for reducing latency, even though the KV cache size is
+not
+considered by existing proxy metrics.
+
+4
+Algorithm
+
+4.1
+Encouraging KV Sharing
+
+As shown in Section
+3
+, the efficiency of search strategies is strongly influenced by the amount of available KV cache sharing among the retained trajectories.
+However, the most accurate search strategy, REBASE
+(
+Wu et al. 2024
+)
+, has substantial inference overheads due to the reduction in KV cache sharing from sampling in a more balanced manner when deciding which trajectories to expand.
+
+In order to enhance the available KV cache sharing, we design a cost model-based method which we integrate at each step in the search process when determining which trajectories to sample continuations from.
+This cost model is designed to mitigate the efficiency overheads from balanced sampling (which is necessary for obtaining diverse trajectories) by adding a cost term which accounts for the overhead of divergent KV branches in the search tree.
+The objective of our algorithm is outlined in Figure
+1
+(Middle), where we aim to promote KV cache sharing by minimizing the number of retained nodes in order to minimize the cost of the search process.
+
+A key challenge when trying to incorporate efficiency considerations when selecting which trajectories to retain is that we cannot consider each trajectory in isolation.
+For example, if trajectories
+A
+and
+B
+share node
+C
+in the search tree (and therefore share the KV cache state for this part of their trajectories), we need to retain node
+C
+if we retain
+either
+trajectory
+A
+or trajectory
+B
+.
+Due to the importance of KV sharing in determining runtime, this means that when deciding whether to keep trajectory
+A
+, the efficiency implications of pruning trajectory
+A
+are only apparent if we determine which other trajectories are retained or pruned.
+The efficiency cost of retaining each trajectory therefore depends
+on the other trajectories that are retained or pruned
+.
+As such, it is challenging to assign a cost for retaining each trajectory, and we can only account for efficiency
+at the scope of the tree
+.
+
+To account for efficiency in the search process, our algorithm therefore decides which trajectories to retain or prune while considering the efficiency costs and benefits of retaining a set of trajectories, rather than assigning an efficiency cost and reward for each separate trajectory.
+In order to facilitate this, we formulate our objective as an integer linear programming (ILP) problem, where we have a binary variable corresponding to whether each trajectory is retained.
+We include additional constraint binary variables for each earlier node in the search tree, which is set to 1 if any of the trajectories that share this node are retained.
+This allows us to optimize the ILP to consider interdependency between trajectories when determining the amount of exploitable KV sharing.
+
+Our cost model needs to contain both a term which factors in the reward for keeping each trajectory, as well as the cost of the set of trajectories that we select.
+For the reward term in our cost model, we use the weights obtained with REBASE sampling as the value for retaining each trajectory
+(
+Wu et al. 2024
+)
+.
+The weights
+W_{i}
+are determined using the following expression, where
+N
+is the total number of continuations that need to be sampled,
+R_{i}
+is the reward for trajectory
+i
+computed using a Process Reward Model (PRM),
+T_{R}
+is a temperature parameter that controls how balanced the sampling is, and
+A
+is the set of all trajectories:
+
+W_{i}=\mathrm{ceil}(N\frac{\mathrm{exp}(R_{i}/T_{R})}{\sum_{k\in A}\mathrm{exp}(R_{k}/T_{R})})
+
+(1)
+
+This sampling procedure produces more continuations for more promising trajectories (as determined by their reward scores), while still producing some continuations from less promising trajectories (as opposed to beam search, which retains a subset of promising trajectories and then prunes the rest).
+By still producing some continuations for less promising trajectories, REBASE performs additional exploration, which yields higher accuracy for the same search width.
+
+We then introduce the following objective which we want to maximize at each step, which contains one term which retains the highest priority trajectories, as well as a second term that promotes KV sharing by penalizing the size of the retained tree:
+
+\max_{S}(\frac{\sum_{i\in S}W_{i}}{\sum_{i\in A}W_{i}}\;-\;\lambda_{b}\,\frac{|V_{S}|}{|V_{A}|})
+
+(2)
+
+where
+S
+is the set of selected trajectories (which can be variable in size);
+
+V_{A}
+and
+V_{S}
+are, respectively, the set of all nodes in the tree before applying the cost model and the set of nodes that are retained after pruning the tree; and
+\lambda_{b}
+is a hyperparameter which controls the relative strength of the budget term.
+Note that we add the additional constraint that
+|S|\geq 1
+to ensure that we always retain at least one leaf node.
+
+This objective aims to maximize the reward of the retained nodes, while still maintaining efficiency.
+Note that if
+\lambda_{b}
+is set to 0, this objective bears similarity to the optimization target for existing strategies like beam search, which aim to maximize the reward for the retained set of trajectories (under some constraint for the number of trajectories that can be kept).
+For
+\lambda_{b}>0
+, this term penalizes the number of retained nodes in the tree, which encourages retaining trajectories which share part of their prior KV cache state rather than completely distinct trajectories.
+To solve this ILP, we leverage the Pulp optimization library
+(
+Mitchell et al. 2011
+)
+using the CBC solver
+(
+Forrest et al. 2024
+)
+.
+
+After we apply our KV cache-promoting cost model to prune out trajectories, we then re-apply REBASE sampling to determine how many continuations to sample from each of the remaining trajectories.
+The updated weights
+W^{\prime}_{i}
+are then determined using the following expression, which considers only the retained trajectories:
+
+W^{\prime}_{i}=\mathrm{ceil}(N\frac{\mathrm{exp}(R_{i}/T_{R})}{\sum_{k\in S}\mathrm{exp}(R_{k}/T_{R})})
+
+(3)
+
+For the subsequent iteration in the search process, the weights
+W^{\prime}_{i}
+are used to decide how many continuations to sample for each of the retained trajectories.
+
+Figure 3
+:
+
+Accuracy versus efficiency trade-off curves for different search strategies with the Llemma-34B model.
+We report results for search widths of 16, 64, and 256 across all methods.
+We provide baseline results for Beam Search and DVTS (both with retaining a fixed number of trajectories as well as
+\sqrt{N}
+trajectories at each step)
+(
+Snell et al. 2024
+;
+Beeching et al. 2024
+)
+, as well as for REBASE
+(
+Wu et al. 2024
+)
+.
+Our results demonstrate how our method allows for improved efficiency relative to REBASE, while maintaining the accuracy benefits due to retaining necessary diverse trajectories.
+
+4.2
+Retaining Diversity
+
+The crucial challenge as we encourage KV cache sharing is the importance of diversity for attaining high accuracy.
+If we naively enforce KV sharing, this will also consequently prune out diverse trajectories which were crucial for attaining high accuracy.
+This creates a difficult trade-off, where we want to retain diverse trajectories to maintain accuracy, but not at the expense of large runtime penalties.
+
+However, existing approaches for sampling continuations lead to many redundant or similar continuations.
+Even if some of these continuations are not exact duplicates, they can still have a similar semantic meaning.
+For example, consider the first steps of two different solution trajectories for the question: “The results of a cross-country team’s training run are graphed below. Which student has the greatest average speed?”
+
+1.
+
+Step 1: The average speed is the total distance divided by the total time.
+
+2.
+
+Step 1: To find the average speed, we need to divide the distance traveled by the time taken.
+
+Although these two steps are phrased differently, they convey the exact same meaning. This redundancy suggests that retaining both is unnecessary.
+Several of these continuations could be pruned out without losing out on diversity.
+Our goal is therefore to retain trajectories that are semantically diverse,
+while improving KV cache sharing by removing redundant or similar trajectories which are unnecessary for attaining high accuracy.
+
+To ensure that we retain diverse trajectories, we augment our cost model approach from Section
+4.1
+with an additional term that promotes retaining diverse trajectories.
+The goal is for the set of selected trajectories to cover the original semantic space of the sampled trajectories.
+However, similar to the challenges with estimating the impact of retaining a given trajectory on exploitable KV sharing, we can only estimate whether retaining a given trajectory improves coverage when considering the other trajectories that are retained.
+One possible approach for considering the diversity of trajectories that are retained when pruning to reduce KV cache size would be to estimate the pairwise similarity between trajectories and to then add a term to the cost model that penalizes pairwise similarity among the set of retained trajectories.
+However, this approach would additionally introduce quadratic terms in the cost model, making the optimization objective quadratic rather than nonlinear.
+This would further make it infeasible for large beam widths.
+
+To more efficiently estimate the coverage of our selected trajectories without incorporating pairwise similarity computation directly into the cost model, we first cluster the trajectories and then estimate diversity of retained trajectories based on whether we retain trajectories across different clusters.
+Our approach is visualized in Figure
+1
+(Right), where we ensure that semantically diverse trajectories are retained when we apply our pruning method to reduce the size of the tree.
+This approach ensures that we retain
+coverage
+over the original semantic space of potential trajectories.
+To accomplish this, we first embed the last step for each sequence using a BERT model finetuned for embedding math sentences
+(
+Steinfeldt & Mihaljević 2024
+)
+.
+We then cluster these embeddings using hierarchical agglomerative clustering from Scipy
+(
+Virtanen et al. 2020
+)
+based on cosine similarity.
+We use a fixed distance threshold in order to determine the number of clusters.
+Note that our choice of similarity metric is arbitrary, and our algorithm is also compatible with alternate methods for measuring semantic similarity between the trajectories.
+
+After clustering trajectories, we then incorporate this into our objective as a coverage term, which accounts for how well our selected set of trajectories covers the possible solution space.
+Formally, we incorporate the diversity term into the objective function which we want to maximize at each step as follows:
+
+\max_{S}(\frac{\sum_{i\in S}W_{i}}{\sum_{i\in A}W_{i}}\;-\;\lambda_{b}\,\frac{|V_{S}|}{|V_{A}|}+\lambda_{d}\frac{|C_{S}|}{|C_{A}|})
+
+(4)
+
+where
+C_{S}
+and
+C_{A}
+refer to the clusters covered by the selected trajectories and the total number of clusters, respectively; and
+\lambda_{d}
+is a hyperparameter which controls the relative strength of the coverage term.
+The inclusion of this term ensures that we retain sufficient semantic diversity in order to facilitate exploration during the search process, which is critical for achieving high accuracy.
+As in Section
+4.1
+, after we apply our cost model to prune out trajectories, we re-apply REBASE
+(
+Wu et al. 2024
+)
+to sample continuations from each of the remaining trajectories.
+
+Table 1
+:
+
+Accuracy versus KV cache size for REBASE as well as ETS.
+Results are provided for MATH500 and GSM8K for the Llemma-34B and Mistral-7B-SFT models.
+We report the KV cache size reduction (“KV Red.”) for each width (relative to REBASE), where higher is better since it implies a reduction in memory consumption.
+
+Method
+
+Width=16
+
+Width=64
+
+Width=256
+
+Acc.
+
+KV Red.
+
+Acc.
+
+KV Red.
+
+Acc.
+
+KV Red.
+
+Llemma-34B
+
+REBASE
+
+47.2
+
+1
+\times
+
+50.8
+
+1
+\times
+
+52.0
+
+1
+\times
+
+ETS
+
+47.0
+
+1.2
+\times
+
+51.2
+
+1.5
+\times
+
+52.8
+
+1.8
+\times
+
+Mistral-7B-SFT
+
+REBASE
+
+38.8
+
+1
+\times
+
+43.4
+
+1
+\times
+
+42.4
+
+1
+\times
+
+ETS
+
+39.4
+
+1.3
+\times
+
+43.2
+
+1.3
+\times
+
+42.2
+
+1.7
+\times
+
+MATH500
+
+Method
+
+Width=16
+
+Width=64
+
+Width=256
+
+Acc.
+
+KV Red.
+
+Acc.
+
+KV Red.
+
+Acc.
+
+KV Red.
+
+Llemma-34B
+
+REBASE
+
+87.7
+
+1
+\times
+
+89.0
+
+1
+\times
+
+89.3
+
+1
+\times
+
+ETS
+
+87.5
+
+1.5
+\times
+
+89.3
+
+1.7
+\times
+
+89.3
+
+1.8
+\times
+
+Mistral-7B-SFT
+
+REBASE
+
+88.6
+
+1
+\times
+
+89.1
+
+1
+\times
+
+90.1
+
+1
+\times
+
+ETS
+
+88.3
+
+1.2
+\times
+
+89.2
+
+1.6
+\times
+
+89.6
+
+1.3
+\times
+
+GSM8K
+
+5
+Evaluation
+
+5.1
+Experimental Details
+
+We leverage the open-source REBASE code for the balanced sampling implementation
+(
+Wu et al. 2024
+)
+, and we use SGLang for serving models
+(
+Zheng et al. 2023
+)
+.
+For all experiments in our evaluation, we leverage temperature sampling with a temperature of 1.0 and we fix the REBASE temperature at 0.2, which are the default settings in the open-source code for
+(
+Wu et al. 2024
+)
+.
+We use the final PRM score at each step as the reward for that step, and we select the final answer with weighted majority voting using the final PRM score for each trajectory as the weight.
+We use these aggregation strategies since they have been shown to outperform other methods of aggregating trajectories to determine the final response
+(
+Beeching et al. 2024
+)
+.
+As in
+(
+Wu et al. 2024
+)
+, we reduce the search width each time a retained trajectory completes.
+We set
+\lambda_{d}=1
+throughout our evaluation, and we sweep over
+\lambda_{b}\in[1,2]
+(with increasing
+\lambda_{b}
+corresponding to more aggressive KV compression) and select the largest value of
+\lambda_{b}
+which doesn’t degrade accuracy by greater than
+0.2\%
+.
+
+We provide results for two groups of models. We leverage the Llemma-34B model (finetuned on Metamath) along with the Llemma-34B PRM from
+(
+Wu et al. 2024
+)
+.
+We also use the Mistral-7B model finetuned on Metamath as well as the corresponding Mistral-7B PRM from the Math-Shepherd paper
+(
+Wang et al. 2024
+)
+.
+We evaluate these models for search widths of 16, 64, and 256, and we report results on the MATH500 and GSM8K
+(
+Cobbe et al. 2021
+)
+datasets.
+
+We compare against several baseline search strategies.
+We include results for beam search both with 4 trajectories retained at each step and with
+\sqrt{N}
+trajectories retained at each step, where
+N
+is the initial width of the search, as in
+(
+Snell et al. 2024
+)
+.
+We also include comparisons with DVTS both with 4 trajectories retained at each step and with
+\sqrt{N}
+trajectories retained at each step (where the number of trajectories retained at each step is also the same as the number of separate subtrees), as in
+(
+Beeching et al. 2024
+)
+.
+Finally, we provide comparisons against REBASE, which serves as our strongest baseline due to its high accuracy relative to search width
+(
+Wu et al. 2024
+)
+.
+
+5.2
+Results
+
+Figure
+3
+provides evaluation of our methodology as well as comparisons against several baseline methods.
+We report accuracy results relative to efficiency (in terms of total KV cache size), and we provide results for the Llemma-34B model for both MATH500 and GSM8K datasets.
+We also report results for the beam search, DVTS, and REBASE baseline methods.
+Our results demonstrate that our approach, which considers both diversity and efficiency, is able to attain a better accuracy versus efficiency trade-off than existing search strategies.
+
+Table
+1
+shows results for the Llemma-34B and Mistral-7B models.
+We report results on both MATH500 as well as GSM8K.
+We provide accuracy results as well as profiled KV cache compression estimates.
+These results highlight how the benefits of our search strategy are consistent across different model families and datasets, as we are able to maintain accuracy while obtaining consistent efficiency benefits relative to the REBASE baseline
+(
+Wu et al. 2024
+)
+.
+
+5.3
+Throughput Benchmarking
+
+Table 2
+:
+
+Throughput for our approach relative to REBASE
+(
+Wu et al. 2024
+)
+.
+Results were measured on NVIDIA H100 GPUs using the Llemma-34B model, evaluated on 100 samples from the MATH500 test set (with the accuracy reported for the full test set).
+We report throughput improvements using a beam width of 256.
+We also include the reduction in KV cache size (normalized to REBASE), as well as the accuracy for each approach.
+
+Method
+
+Accuracy
+
+KV Reduction
+
+Throughput
+
+REBASE
+
+52.0
+
+1
+\times
+
+1
+\times
+
+ETS
+
+52.8
+
+1.8
+\times
+
+1.4
+\times
+
+Table
+2
+provides measured throughput for REBASE as well as ETS on H100 NVL GPUs.
+We benchmark both REBASE and ETS using [4,8,16,32] parallel threads (which is representative for the serving scenario with a batch size equal to the number of threads) and select the best configuration for each.
+We run benchmarking with the main LLM and the PRM each on a separate H100 NVL GPU, and for ETS we co-locate the embedding model on the same GPU as the reward model.
+We observe 1.4
+\times
+increased throughput relative to the baseline REBASE method, demonstrating how the increased KV cache sharing from our algorithm translates to higher throughput, without requiring any custom kernels.
+
+5.4
+Ablation
+
+Table 3
+:
+
+Ablation for our methodology. We include results on MATH500 for different beam widths with the Llemma-34B model, and we report KV budget estimates.
+We compare ETS with only applying the KV budget term in the cost model (“ETS-KV”).
+
+Method
+
+Width=16
+
+Width=64
+
+Width=256
+
+Acc.
+
+KV Red.
+
+Acc.
+
+KV Red.
+
+Acc.
+
+KV Red.
+
+REBASE
+
+47.2
+
+1
+\times
+
+50.8
+
+1
+\times
+
+52.0
+
+1
+\times
+
+ETS-KV
+
+47.2
+
+1.3
+\times
+
+51.4
+
+1.3
+\times
+
+52.8
+
+1.7
+\times
+
+ETS
+
+47.0
+
+1.2
+\times
+
+51.2
+
+1.5
+\times
+
+52.8
+
+1.8
+\times
+
+Table
+3
+also provides an ablation for our method.
+We report results for the Llemma-34B model on the MATH500 dataset when using our cost model method with only the term that promotes KV cache sharing and with both terms together.
+For the results with only our KV cache sharing term in the cost model, we fix
+\lambda_{d}=0
+and sweep over
+\lambda_{b}\in[0.75,1.25]
+, selecting the largest value of
+\lambda_{b}
+which doesn’t degrade accuracy by greater than
+0.2\%
+.
+These results highlight that the diversity term allows us to push to more aggressive compression without degrading accuracy.
+This occurs since without the diversity term, our method cannot distinguish redundant trajectories from necessary diverse trajectories when determining which subset to retain.
+
+6
+Conclusion
+
+Computational efficiency is a key bottleneck for exploiting test-time scaling in order to enhance model accuracy by allowing models to think longer before responding.
+An emerging approach for exploiting test-time scaling is through tree search against a verifier.
+A key challenge with existing tree search methods is the trade-off between efficiency and accuracy; high accuracy with tree search necessitates diverse trajectories, but retaining diverse trajectories leads to high inference costs due to reduced KV cache sharing in the tree.
+We perform profiling which demonstrates the importance of KV cache sharing, and show that existing efficiency metrics like FLOPs and model calls are insufficient for assessing the efficiency trade-offs between tree search methods due to the impacts of KV sharing.
+We then propose ETS, a search strategy which promotes KV cache sharing while retaining diverse trajectories in order to attain high accuracy.
+ETS encourages KV cache sharing in the tree search by penalizing divergent branches in the tree.
+Our method also incorporates a coverage term which ensures that semantically diverse trajectories are maintained, even while we prune unnecessary redundant trajectories.
+By retaining diverse trajectories, we are able to perform sufficient exploration to retain the accuracy benefits of diverse tree search.
+The combination of these components of our method allows us to retain necessary diversity while pruning out redundancy in order to enable accurate and efficient tree search.
+ETS achieves
+1.8
+\times
+reduction in average KV cache size during the search process, which translates to
+1.4
+\times
+increased throughput, with minimal accuracy loss and without requiring custom kernel implementations.
+Our method demonstrates the potential of leveraging efficiency considerations in the search process to enable accurate and efficient search for test-time scaling.
+
+7

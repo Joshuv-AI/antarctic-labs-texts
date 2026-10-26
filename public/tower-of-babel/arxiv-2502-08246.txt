@@ -1,0 +1,2431 @@
+Inference-time sparse attention with asymmetric indexing
+Pierre-Emmanuel Mazaré, Gergely Szilvasy, Maria Lomeli, Francisco Massa, Naila Murray, Hervé Jégou, Matthijs Douze
+
+Abstract
+Self-attention in transformer models is an incremental associative memory that maps key vectors to value vectors. One way to speed up self-attention is to employ GPU-compatible vector search algorithms based on standard partitioning methods such as k-means. However, such partitioning methods yield poor results in this context because (1) the keys and queries follow different distributions, and (2) the RoPE positional encoding hinders the bucket assignment. This paper introduces Saap (Self-Attention with Asymmetric Partitions), which overcomes these problems. It is an asymmetrical indexing technique that employs distinct partitions for keys and queries, thereby approximating self-attention with a data-adaptive sparsity pattern. It works on pretrained language models and only requires to train (offline) a small query classifier. On a long context Llama 3.1-8b model, with sequences ranging from 100k to 500k tokens, Saap typically reduces by a factor of 20 the fraction of memory that needs to be looked-up, which translates to a time saving of 60% when compared to FlashAttention-v2.
+
+
+
+†
+†
+date:
+August 24, 2026
+†
+†
+correspondence:
+First Author at
+pem@meta.com
+
+1
+Introduction
+
+Current transformer-based large language models (LLMs)
+(
+Vaswani et al., 2017
+;
+Brown et al., 2020
+)
+implement contextual memory in the form of self-attention: The model attends to previously processed tokens in order to predict the next one.
+To avoid recomputing the previous keys and values, a key-value (KV) cache is stored and reused, allowing for faster next-token prediction.
+This KV cache is memory intensive: on a Llama 3-8B model
+(
+Dubey et al., 2024
+)
+, a single token involves a cache of size 128 kiB – about 10000 times larger than storing the token itself.
+Therefore, this cache becomes increasingly memory-demanding as the context length increases.
+This problem is partially addressed by quantization to compress key and value vectors
+(
+Shi et al., 2024
+)
+but comes at a cost,
+as the generation quality eventually degrades below 4 bits per weight.
+Additionally, long-context self-attention requires matching queries one by one to the entire KV cache, which becomes computationally prohibitive as the context grows.
+
+In this work, we address this challenge by adopting a vector search perspective: we regard self-attention as a setting where a query vector is matched with a database of vectors (the key vectors in our case). The goal is to retrieve a subset of relevant vectors.
+The self-attention softmax can then be computed on this restricted set of
+k
+vectors, yielding an approximation that improves in accuracy as
+k
+increases.
+An efficient implementation of this retrieval with exhaustive search can improve the speed only to some extent,
+since all keys still need to be accessed even if only
+k
+values are used.
+
+Instead, we advocate approximating nearest-neighbor search by partitioning the keys into buckets.
+Practically, this enables sparse, data-dependent, self-attention:
+at search time, we leverage only a small subset of buckets for each query, reducing memory access, and therefore time complexity.
+Multiple choices exist for the partition: random projections, as in the original locality-sensitive
+hashing methods
+(
+Datar et al., 2004
+)
+, or data-dependent partitions, such as k-means. The latter offers better trade-offs in practice in typical approximate neighbor search tasks
+(
+Paulevé et al., 2010
+)
+.
+In this approach for retrieving keys, the slow k-means training is performed offline on a held-out training set of keys.
+After this offline phase, and during the pre-fill phase with a new context (and therefore new keys), performing the assignment to a given bucket of the partition is fast, since it amounts to finding the nearest centroid for each new key.
+
+However, in this context, approximate k-nearest neighbor (ANN) methods to
+improve KV cache efficiency face several limitations and challenges:
+
+1.
+
+keys and queries have very different distributions, hence vector search is out-of-distribution in this setting. This hinders the effectiveness of indexing algorithms.
+
+2.
+
+retrieving the top-
+k
+keys only is restrictive for queries where useful information is associated to keys beyond the top-
+k
+.
+
+3.
+
+current brute-force attention implementations, such as FlashAttention-v2
+(
+Dao, 2024
+)
+are highly tuned for the training and inference hardware. In contrast, many ANN algorithms are not GPU-compatible.
+
+To address these limitations, we propose a novel approach called
+S
+parse
+A
+ttention with
+A
+symmetric
+P
+artitions (
+Saap
+), that casts the partitioning of key and query vectors as a classification task: the bucket membership is predicted separately for keys and query vectors. In addition to this approach, we make the following contributions:
+
+1.
+
+We quantitatively analyze the out-of-distribution nature of query-key matching (Section
+3
+) and introduce an asymmetrical assignment strategy for keys and queries (Section
+4
+);
+
+2.
+
+We mitigate the loss of information that occurs when the attention is limited to top-
+k
+keys.
+Instead we leverage the partition structure (Section
+4
+), which leads to a variable size sparsity pattern, and show that this choice improves the self-attention approximation;
+
+3.
+
+We propose a method for efficiently running the partition-based search on GPUs, based on an optimized batched implementation (Section
+5
+).
+
+Saap
+reduces the resources needed to compute the self-attention of a model without finetuning it, in a hardware-compatible manner. Compared to the state-of-the-art FlashAttention-v2 baseline, it decreases the time taken by self-attention kernels by more than 60%, without compromising the generation quality, see Section
+6
+.
+
+2
+Related work
+
+Table 1:
+Saap
+
+v.s.
+comparable KV-indexing methods: fast implementations like flashattention-v2 correspond to the full attention baseline. The other columns correspond to indexing methods that induce sparse attention.
+
+Full
+
+attention
+
+LSH
+
+Retrieval
+
+Attention
+
+Saap
+
+Frozen LLM
+
+✓
+
+✓
+
+✓
+
+✓
+
+Sparse attention
+
+✓
+
+✓
+
+✓
+
+Fast index build
+
+✓
+
+✓
+
+✓
+
+GPU compliant
+
+✓
+
+✓
+
+✓
+
+Data adaptive
+
+✓
+
+✓
+
+✓
+
+Approximation
+
+exact
+
+medium
+
+good
+
+good
+
+This section reviews related work on accelerating attention for autoregressive transformers. Table
+1
+compares our method with a selection of the most relevant approaches along with their characteristics.
+
+KV cache compression.
+
+Multiple techniques address the large size of the KV cache for long sequences.
+Some approaches rely on vector compression and pruning, similar to neural network pruning
+(
+LeCun et al., 1989
+)
+and compression
+(
+Han et al., 2015
+)
+.
+The most straightforward way is to adopt low-precision computation variants of scalar quantization for the KV cache.
+This is effective until the number of bits per weight becomes detrimental (around 4 bits) and the compression severely degrades the accuracy
+(
+Li et al., 2024a
+)
+, even when the compression is accounted for during training
+(
+Adepu et al., 2024
+)
+with quantization-aware training
+(
+Hubara et al., 2018
+)
+.
+The keys and values can also be compressed by dimensionality reduction,
+e.g
+.
+with Principal Component Analysis
+(
+Kang et al., 2024
+)
+.
+
+Another approach to compress the KV cache is to prune the least-used keys and vectors by measuring their utilization on-the-fly
+(
+Ge et al., 2023
+)
+, maintaining a cache of the most used vectors
+(
+Liu et al., 2024b
+)
+, ignoring the oldest keys
+(
+Xiao et al., 2024b
+)
+, or using a heuristic such as H2O
+(
+Zhang et al., 2023
+)
+.
+The GEAR method
+(
+Kang et al., 2024
+)
+combines pruning, dimensionality reduction and vector compression.
+For more context on KV cache compression and compute optimization, we refer the reader to the recent overview by
+Shi et al. (2024)
+.
+Our
+Saap
+approach is complementary to compression and static pruning.
+Indeed, partition-based vector search techniques are often combined with compression, for instance, the canonical IVFADC method
+(
+Jegou et al., 2010
+)
+.
+
+Vector search data structures.
+
+Several families of vector indexing structures have been applied to KV cache indexing.
+In the vector search literature, the “keys” are called “database” or “reference” vectors.
+Tree-based indexes are inspired by one- and low-dimensional search such as the seminal KD-tree
+(
+Bentley, 1975
+)
+,
+but are not effective in high dimensions.
+Locality Sensitive Hashing (LSH) is based on hash tables where buckets store the database vectors
+(
+Datar et al., 2004
+)
+.
+The advantage of LSH is its fast indexing time, as it amounts to computing a limited number of dot products for each key.
+This advantage has led to its use in several recent works on KV cache indexing
+(
+Zandieh et al., 2023
+;
+Chen et al., 2024b
+)
+.
+In Appendix
+B
+, we discuss LSH-based methods and show that it performs poorly for KV cache acceleration: vanilla LSH is not data-adaptive, so the number of independent hash tables has to be increased significantly to achieve a decent retrieval accuracy. This consumes a lot of memory and overall does not provide a significant gain with pretrained models.
+
+Graph-based indices store database vectors as nodes and searching hops from node to node
+(
+Dong et al., 2011
+;
+Malkov and Yashunin, 2018
+;
+Fu et al., 2017
+;
+Jayaram Subramanya et al., 2019
+)
+.
+Graph-based search is efficient because routing decisions are built into the graph during its construction.
+Therefore, RetrievalAttention
+(
+Liu et al., 2024a
+)
+applies graph-based index RoarGraph
+(
+Chen et al., 2024a
+)
+to the KV cache.
+The downsides are that the index building is slow and the graph is bulky to store, as each node is linked to dozens of neighbors.
+As a result, graph indexing of a KV cache is attractive only if the same KV cache is reused,
+e.g
+.
+because multiple prompts use the same context.
+
+Vector search based on partitions.
+
+With this approach the reference dataset is partitioned into
+C
+buckets.
+Partitions are defined by a function that assigns each vector to one bucket.
+The classical variant employs an inverted file (IVF)
+(
+Witten et al., 1999
+)
+.
+When the partitioning is based on k-means, as advocated by
+Paulevé et al. (2010)
+. The usage is as follows:
+(1)
+At training time
+, k-means clustering of the
+N
+database vectors provides a set of
+C
+centroids.
+(2)
+At indexing time
+, the assignment of a new vector amounts to finding its nearest centroid.
+Ideally, the IVF structure stores the vectors associated to one bucket in contiguous memory. (3)
+At search time
+, the query vector is likewise assigned to the nearest centroid and all the database vectors found in the bucket are compared with the query vector to find the top-
+k
+nearest neighbors.
+A straightforward extension is to visit
+several
+
+nearest buckets instead of the single nearest one
+(
+Lv et al., 2007
+)
+.
+The NeuralLSH method
+(
+Dong et al., 2019
+)
+predicts the bucket corresponding to the queries and database vectors alike using a neural network.
+Unlike our approach, it does not handle out-of-distribution data.
+
+Vector search tooling such as Faiss has been used for KV cache lookups in the Unlimiformer method
+(
+Bertsch et al., 2023
+)
+, in the setting of an encoder-decoder LLM where the entire decoder shares a single cache, independently of the layer.
+This factorization is not possible in decoder-only LLM architectures, where each layer and each head need to store the (key, value) pairs independently.
+
+Out-of-distribution (OOD) search.
+
+By default, vector search assumes query and database vectors follow the same distribution.
+OOD search is needed when it is not the case, for example, if the query and database vectors come from different modalities as with text-to-image search
+(
+Simhadri et al., 2024
+)
+or user-to-item search in recommendation systems
+(
+Paterek, 2007
+)
+.
+The effects of OOD search on partition-based indexes, as identified by
+Jaiswal et al. (2022)
+and
+Chen et al. (2024a)
+, are:
+(1) the nearest database vectors to the query are spread over many buckets, and
+(2) the query assignment does not visit the correct buckets.
+The authors adapt graph-based search to OOD search by taking into account how the graph navigation must be re-routed, based on a training set of query vectors.
+
+KV cache indexing has challenging OOD characteristics that we discuss in Section
+3
+, and that our method
+Saap
+addresses in a principled way in Section
+4
+.
+Dedrift
+(
+Baranchuk et al., 2023
+)
+addresses temporal drift in vector databases for partition-based indexes by re-training mid-way during key ingestion.
+Our
+Saap
+approach mitigates the temporal biases in a simpler way, see Section
+3
+.
+
+Figure 1:
+
+Illustration of the OOD statistics between keys and queries in the self-attention.
+
+Left:
+first two PCA dimensions of keys and queries (the big dots are the attention sinks for keys and queries).
+
+Middle:
+distribution of dot products between random subsets of keys and queries.
+
+Right:
+after clustering keys, probability of assignment to each cluster for keys (x-axis) and queries (y-axis).
+
+3
+Preliminary discussion
+
+In this section, we review a few key properties of the attention operator in LLMs from a vector search perspective.
+We manipulate query vectors (token query embeddings) and key vectors (token key embeddings), ignoring the value vectors for now.
+In a transformer model, queries are matched to keys from a given attention head.
+Therefore, we train and build indexes separately for each head.
+
+Attention as a vector search application
+
+Considering the self-attention computation,
+the main differences with respect to classical approximate nearest-neighbor (ANN) settings are:
+(i) there is not a hard cut-off for relevant results, but a soft weighting of results using softmax;
+(ii) it is a maximum inner product search problem instead of the more common Euclidean or cosine-similarity search; and
+(iii) the keys and queries are produced by different computations, thus, they reside in different embedding spaces.
+To accelerate the computation, we approximate exhaustive attention using a hard cut-off on the maximum number of retrieved keys.
+
+Out-of-distribution setting and partitioning of keys
+
+Classical vector search methods are designed to find vectors that are sampled i.i.d.
+from the same distribution.
+We examine two types of OOD behavior: (i) between keys and queries, and (ii) between training and testing.
+Prior work has quantified the difference between key and query distributions by comparing histograms of query-to-key distances v.s. key-to-key distances
+(
+Jaiswal et al., 2022
+;
+Chen et al., 2024a
+)
+.
+
+Saap
+is based on a partition of the keys.
+For a query vector, the
+\ell
+most promising buckets are visited and the dot product between the query and all keys from the visited buckets is computed.
+One important aspect that plays into OOD behavior for
+Saap
+, is the degree to which the buckets of the
+N
+key vectors are balanced in terms of membership.
+If the buckets are all of the same size and equally likely to be visited, the number of dot products to perform is
+\ell N/C
+.
+The search time is proportional to this.
+
+Key-query OOD
+
+Keys and queries are computed using distinct linear layers on top of shared vectors.
+The distribution mismatch between keys and queries is observed with basic statistics of a random sample of vectors (here head 28 of layer 17 of a Llama 3 model).
+Figure 1
+(
+left
+) shows the first principal components of keys and queries: their embedding spaces are clearly distinct.
+As the two point clouds are on opposite sides of the origin, the
+\langle k,q\rangle
+dot products are almost always negative (
+Figure 1
+,
+middle
+).
+The dot products with the first key (
+i.e
+.
+the “attention sink”
+(
+Xiao et al., 2024b
+)
+) and the most recent keys, are statistically higher than the other keys.
+
+From now on, we apply a spherical k-means clustering with
+C\,=\,1024
+centroids to the keys
+(
+Douze et al., 2024
+)
+.
+Figure
+1
+(
+right
+) shows that the probability of assignment to a given centroid is very different for keys and queries.
+More specifically, some clusters “capture” a significant fraction of the queries (up to 10%).
+Motivated by this, we re-design an alternative assignment operator in Section
+4
+.
+
+Figure 2:
+
+Deviation of key bucket sizes when 100k keys are assigned to a trained k-means.
+The 100k keys are sampled 10 times, in 4 different ways indicated on the y-axis, and with or without the rope transformation applied.
+
+Prompt and temporal OOD
+
+OOD problems occur for all ML models that assume i.i.d.
+training and test data.
+Here we examine the divergence of the distribution at training time compared to at test time when a prompt is used, focusing entirely on the key vector distribution.
+We measure the variance of the assignment of 100k vectors sampled in different ways, and repeat the experiment 10 times: higher variance indicates stronger OOD behavior.
+Figure
+2
+shows that the minimal variance occurs when vectors are sampled uniformly from the training set.
+When we measure it on 100k random uniform vectors from data that is disjoint from the training set, the variance increases.
+We sampled 100k vectors from each of 10 different prompts and found that the variance changes significantly depending on the prompt: this is prompt OOD. We then sample 100k vectors across prompts, but from 10 narrow timestamp ranges: here the deviation with respect to the training distribution is the highest, showing strong temporal bias.
+
+Removing temporal bias.
+
+The rope temporal transformation
+(
+Su et al., 2023
+)
+is likely a major contributor to their temporal bias when applied to all keys and queries.
+Therefore, we repeated our analysis on keys without the rope transformation and found that indeed the time bias is reduced (blue dots in Figure
+2
+).
+We then applied the same de-rope operation to queries where the rope component has been removed, yielding the last plot in Figure
+2
+.
+Given the positive effect of de-roping, we use it for all models trained for
+Saap
+.
+
+Per-head attention span
+
+Figure
+1
+(
+middle
+) shows that the first key of any sequence, the so-called
+attention sink
+
+(
+Xiao et al., 2024b
+)
+, is an outlier in the data distribution and always has a large dot product with the query vectors.
+Similarly, the most recent keys have higher dot products with the queries.
+Therefore, it is typical in attention approximations to retrieve these keys exactly.
+Approximate and exact retrieval results are then combined to form a final attention result.
+In our case, we use the “1+2047” setting, which means that the first token and the most recent 2047 tokens are attended exhaustively.
+This context is long enough to have good performance on many short-context tasks.
+
+Figure
+3
+shows the fraction of attention that comes from the top 256 keys (out of
+10^{5}
+) for each query (excluding the attention sink and recent tokens).
+For most heads, the top-256 cover most of the attention weight.
+Layer 0 is an exception, all its heads are more uniformly spread over keys.
+Therefore, in the following, we perform full attention for the layer 0, similarly to the work by
+Tang et al. (2024)
+;
+Xiao et al. (2024b)
+.
+
+Figure 3:
+Fraction of attention contributed by the top 256 tokens (out of
+10^{5}
+), per head, averaged over 10 prompts.
+
+4
+Training and searching partitions
+
+In this section, we present more details on how our
+Saap
+method assigns keys and queries to buckets. Note that a key will be assigned to a single partition bucket (unlike LSH).
+On the other hand, queries are assigned to the
+\ell
+most promising buckets, in a multi-probe fashion.
+The assignment function aims at assigning key vectors to a relevant bucket and finding the top-
+\ell
+best buckets for the queries.
+A common solution is to partition the data with LSH or clustering.
+Clustering is more effective than LSH variants (see Appendix
+B
+), which are not data-adaptive.
+Thus, we use standard k-means
+(
+Jegou et al., 2010
+)
+for clustering
+K\in\mathbb{R}^{n_{\mathrm{k}}\times d}
+keys into
+C
+centroids.
+K-means has the advantage that it produces relatively balanced clusters.
+
+Asymmetric assignment.
+
+The first adaptation we perform is to address the key-query OOD setting (see Section
+3
+).
+For this, we separate the assignment function for keys and queries: for queries we train a classifier
+f_{\mathrm{q}}
+that outputs a probability distribution over
+[0,1]^{C}
+.
+At search time, for query
+q
+, we compute the attention only for the keys in the clusters given by
+\mathrm{argmax}_{\ell}f_{\mathrm{q}}(q)
+.
+
+Assigning with(out) RoPE.
+
+The second issue with KV cache indexing is the temporal OOD behavior, meaning that long-range lookups that are relatively independent of position are hard to match.
+A large part of this is due to the RoPE transformation of vectors.
+Therefore, we apply the k-means clustering on vectors
+before
+transforming them with RoPE. The keys and queries from which the attention is computed are still transformed with RoPE.
+
+Query assignment function
+
+Here we assume that k-means is already trained.
+We use a training set of queries
+Q\in\mathbb{R}^{n_{\mathrm{k}}\times d}
+and keys
+K\in\mathbb{R}^{n_{\mathrm{k}}\times d}
+.
+The hard assignment is represented as a binary matrix
+H_{\mathrm{k}}=\{0,1\}^{n_{\mathrm{k}}\times C}
+, where entry
+(i,j)
+is set to 1 if key
+i
+was assigned to bucket
+j
+.
+Then, the entry
+(i,j)
+of the matrix
+A\times H_{\mathrm{k}}
+represents the fraction of attention weight for query
+i
+contained in bucket
+j
+.
+Therefore, the output distribution of
+f_{\mathrm{q}}
+should be as similar as possible to row
+i
+of
+A\times H_{\mathrm{k}}
+.
+This yields the following loss:
+
+\mathcal{L}_{\mathrm{q}}=\mathrm{KLDiv}\left(f_{\mathrm{q}}(Q),AH_{\mathrm{k}}\right),
+
+(1)
+
+where
+\mathrm{KLDiv}
+is the Kullback-Leibler divergence between distributions, and
+\mathrm{KLDiv}
+and
+f_{\mathrm{q}}
+are applied row-wise on their matrix arguments.
+Each training batch comes from a separate prompt.
+We sample
+n_{\mathrm{q}}
+queries
+Q
+and
+n_{\mathrm{k}}
+keys
+K
+uniformly from the prompt.
+Since short-term queries are taken into account by the “1+2047” dense part, we force the training to focus on long range queries by sampling only (key, query) pairs that are more than 2047 steps apart.
+See Appendix
+A
+for details about the training parameters.
+
+Beyond top-k.
+
+The IVF approach retrieves only the top-
+k
+keys that have the largest dot product with the query.
+However, collecting the top-
+k
+results in vector search is slow
+(
+Johnson et al., 2019
+)
+on GPUs.
+Besides, retrieving the top
+k
+does require computing the dot products w.r.t.
+
+all
+keys within a matching bucket anyways.
+Therefore, we aggregate
+all
+the corresponding values into the attention result on-the-fly.
+
+5
+Implementation
+
+Batched queries.
+
+Llama 3 8B models use group query attention
+(
+Ainslie et al., 2023
+)
+, where four heads from one layer share the same KV cache.
+At search time, for each token, we need to perform 4 searches for queries
+\{q_{1},q_{2},q_{3},q_{4}\}
+.
+For efficiency, we perform the 4 searches jointly by combining the outputs of the query assignment model as
+\sum_{i=1}^{4}f_{\mathrm{q}}(q_{i})\in\mathbb{R}^{C}
+, and pick the top-
+\ell
+values from this vector.
+This approximation converts a matrix-vector product into a matrix-matrix multiplication (albeit with a small batch size of 4).
+In Section
+6.5
+we measure the impact of this approximation.
+
+On GPU.
+
+The
+Saap
+kernel follows an implementation similar to the Triton-based Flash-Decoding
+(
+Dao et al., 2023
+)
+included in xFormers
+(
+Lefaudeux et al., 2022
+)
+. In contrast to Flash-Decoding, which splits the keys and values uniformly across different CUDA blocks, in our implementation, each CUDA block computes the partial attention for a single cluster assignment, with the dense local attention (Section
+3
+) occurring in its own CUDA block.
+The custom kernel is necessary in order to limit expensive synchronizations between CPU and GPUs due to the variable sizes of the visited clusters.
+It could be further optimized in a way to similar to
+Shah et al. (2024)
+.
+
+The issue with this approach is that the runtime for one layer depends on the largest cluster that is accessed by any of the heads in the layer (
+i.e
+.
+the maximum over
+
+8\times\ell
+clusters).
+Therefore, we rely on the key partitioning to produce balanced clusters.
+Note that the KDEFormer and Reformer enforce the clusters to be artificially balanced, this has a significant impact on accuracy (see Appendix
+B
+).
+
+6
+Experiments
+
+In this section, we evaluate
+Saap
+on two natural language processing (NLP) benchmarks and report end-to-end LLM performance metrics. We provide a comparison with the most important baselines. Appendix
+B
+provides an additional comparison with LSH partitioning, while Appendices
+C
+and
+D
+report additional results on the Ruler
+(
+Hsieh et al., 2024
+)
+and InfiniteBench
+(
+Zhang et al., 2024b
+)
+benchmarks, respectively.
+
+Figure 4:
+
+Scores of Needle-in-haystack (left) and the En.QA task from InfiniteBench (right) as a function of the selectivity (fraction of KV-cache visited), on a Llama 3 8B with scaled rope to 500k.
+We compare several ways of assigning keys and queries to buckets.
+We also show the score with no sparse attention (StreamingLLM) and the full attention score.
+
+6.1
+Models, measures, benchmarks and baselines
+
+We perform experiments using a Llama 3.1 8B, a LLM with 32 layers, 32 query heads and 8 key heads.
+This model is trained for context sizes up to 128k tokens.
+We extend this size to 500k tokens using rope scaling
+(
+Peng et al., 2023
+)
+.
+Our method does not require to fine-tune the model weights.
+
+Saap
+first partitions the keys with a pre-trained k-means and trains a Multilayer Perceptron (MLP) in order to assign queries to buckets (offline), denoted by
+K-means+Q-model
+. The MLP has two layers with an intermediate dimension of 1024, batch normalization and a ReLU nonlinearity.
+We use the
+Saap
+assignment models on the PG19 books dataset
+(
+Rae et al., 2019
+)
+for training the MLP.
+This data contains natural-language text, but may be out-of-distribution for math or coding tasks.
+We sample key and query vectors across the prompt for training, and keep only long-range queries: we discard all queries whose distance to the top-1 matching key is less than 1024 tokens.
+We use frozen key and query embeddings for training. See Appendix
+A
+for more training details.
+
+Performance metrics: selectivity and generation timings.
+
+The main goal of
+Saap
+is to speed up the attention computation and, consequently, decoding.
+Therefore, we measure and report resource consumption as a trade-off between accuracy and computing speed.
+We measure the computing speed in two ways: the first is
+selectivity
+
+(
+Chen et al., 2024b
+;
+Paulevé et al., 2010
+)
+, or the rate of keys that are involved in the computation, averaged over all heads; the second is a direct
+timing
+of the end-to-end generation.
+
+Benchmarks.
+
+We evaluate the end-to-end accuracy on long-context tasks that require different types of lookups
+(
+Li et al., 2024a
+)
+, more precisely:
+
+•
+
+Needle-in-a-Haystack
+
+(
+Kamradt, 2023
+)
+consists of a “hard” text matching task where a secret, short text (the needle) is inserted at an arbitrary position in an arbitrarily long context made of book texts (in-domain for the training data).
+The prompt attempts to retrieve the text.
+We average the scores over prompt lengths between 10k and 128k, reporting separately for lengths between 128k and 500k, and for various insertion points for the needle.
+
+•
+
+InfiniteBench benchmark
+
+(
+Zhang et al., 2024b
+)
+is a series of tasks designed to probe LLM reasoning capabilities beyond a context size of 100k.
+The tasks relate to question answering, coding and math questions, as well as retrieval tasks for numbers, passkeys and KV.
+
+Baselines.
+
+We compare
+Saap
+to the following methods:
+
+•
+
+Full attention
+is the default brute-force attention computation.
+We use FlashAttention-v2
+(
+Dao, 2024
+)
+, a strong open-source reference implementation for long-context attention.
+
+•
+
+K-means
+refers to a partition-based approximate attention using k-means partitioning.
+We report results with k-means directly applied to the full keys and queries, as well as applying it to keys and queries without the rope transformation.
+This is similar to Faiss’ IVFFlat index
+(
+Douze et al., 2024
+)
+, which has been used as a baseline by
+Liu et al. (2024a)
+, but in our case it is not restricted to the top-k nearest keys (see Section
+4
+: beyond top-k).
+
+•
+
+StreamingLLM
+
+(
+Xiao et al., 2024b
+)
+corresponds to setting
+\ell=0
+in IVFFlat, using only the dense part of the attention computation.
+
+6.2
+Comparison with baselines
+
+Table 2:
+
+Scores with a Llama 3.1-8B model using rope extrapolation to increase the context length of 500k and different partitioning schemes. We report in
+bold
+the best results among approximate attention schemes. All methods involving k-means assignment use
+\ell
+=
+32
+for multi-probing.
+
+Method
+
+NIH
+
+InfiniteBench
+(
+Zhang et al., 2024b
+)
+
+128k
+
+500k
+
+Retr.N
+
+Retr.P
+
+Retr.KV
+
+Math.F
+
+Code.D
+
+En.QA
+
+En.MC
+
+Full attention
+
+100.00
+
+100.00
+
+100.00
+
+100.00
+
+21.40
+
+30.29
+
+31.98
+
+29.08
+
+48.03
+
+K-means (roped inputs)
+
+95.48
+
+69.33
+
+98.98
+
+100.00
+
+4.40
+
+26.00
+
+31.47
+
+25.42
+
+48.03
+
+K-means (no rope)
+
+100.00
+
+98.67
+
+99.66
+
+100.00
+
+4.40
+
+34.29
+
+31.47
+
+29.58
+
+50.66
+
+StreamingLLM (1+2047)
+
+9.05
+
+6.67
+
+1.69
+
+1.69
+
+0.8
+
+20.29
+
+31.97
+
+11.60
+
+46.72
+
+Saap
+, K-means + Q
+
+100.00
+
+100.00
+
+100.00
+
+100.00
+
+7.40
+
+32.57
+
+30.20
+
+29.68
+
+50.21
+
+selectivity
+\rightarrow
+
+4.0
+
+5.3
+
+15.0
+
+13.8
+
+21.9
+
+47.8
+
+4.8
+
+3.7
+
+3.7
+
+Table 3:
+
+Comparison of
+Saap
+(
+\ell
+=
+32
+) with state of the art methods.
+The base model is a Llama 3 8B finetuned by Gradient AI for context length of 262k.
+*:
+rows reported from
+Liu et al. (2024a)
+.
+
+InfiniteBench
+(
+Zhang et al., 2024b
+)
+
+Method
+
+Retr.N
+
+Retr.P
+
+Retr.KV
+
+Math.F
+
+Code.D
+
+En.QA
+
+En.MC
+
+Full attention*
+
+100.0
+
+100.0
+
+17.5
+
+19.0
+
+39.5
+
+9.1
+
+68.0
+
+StreamingLLM
+(
+Xiao et al., 2024b
+)
+*
+
+5.0
+
+5.0
+
+1.0
+
+18.5
+
+39.5
+
+5.9
+
+66.5
+
+SnapKV
+(
+Li et al., 2024b
+)
+*
+
+100.0
+
+100.0
+
+0.5
+
+18.0
+
+40.0
+
+11.8
+
+67.0
+
+InfLLM
+(
+Xiao et al., 2024a
+)
+*
+
+100.0
+
+100.0
+
+0.5
+
+20.5
+
+48.0
+
+7.0
+
+37.0
+
+RetrievalAttention
+(
+Liu et al., 2024a
+)
+*
+
+100.0
+
+100.0
+
+9.0/14.0
+
+19.0
+
+40.0
+
+7.5
+
+67.0
+
+Full attention (reproduced)
+
+100.0
+
+100.0
+
+16.0
+
+41.5
+
+24.5
+
+10.3
+
+54.5
+
+Saap
+, K-means + Q
+
+100.0
+
+100.0
+
+5.5
+
+38.5
+
+25.5
+
+11.6
+
+56.0
+
+selectivity
+\rightarrow
+
+25.8
+
+25.9
+
+19.1
+
+51.0
+
+4.8
+
+4.3
+
+4.3
+
+Figure 4
+shows the trade-off between budget and score (we report detailed numbers in
+Table 2
+).
+The operating point is controlled by setting the query-time
+\ell\in\{0,4,8,16,32,64,128\}
+. We also show 1) the
+\ell=0
+setting (
+StreamingLLM
+
+(
+Xiao et al., 2024b
+)
+), that corresponds to the bottom line; and 2)
+the full attention, where the keys are compared exhaustively, as the topline.
+
+Needle-in-a-Haystack scores reach 100% accuracy from
+\ell
+
+=
+
+8
+for context sizes up to 128k, but requires
+\ell
+
+=
+
+32
+beyond that.
+On InfiniteBench, the behavior depends on the tasks.
+In
+Figure 4
+, En.QA exhibits a clear positive trend, and the topline accuracy is reached with around 5% selectivity.
+
+For Code.D and En.MC the results for
+\ell=0
+and full attention are close, so the scores are noisy.
+For Math.F, the selectivity increases quickly with
+\ell
+, which is indicative of an OOD behavior between training and testing prompts. See also
+Figure 6
+in
+Appendix D
+.
+This is because for this task, the context consists of long lists of numbers, which is very different from the books on which the assignment models are trained.
+This causes a large imbalance factor.
+Interestingly, the
+Saap
+score is higher than the full attention score.
+This may be because the sparse attention focuses only on a relevant subset of the prompt instead of averaging information from the entire sequence.
+
+6.3
+Timings
+
+Generation.
+We use 8 H100 GPUs 80 GB (1 KV-cache per GPU) and measure the attention computation speed for one head on a 171k-length context (
+\ell
+=
+32
+, yielding 100% needle-in-a-haystack accuracy).
+We compare against the FlashAttention-v2 implementation
+(
+Dao et al., 2023
+)
+.
+
+FlashAttention-v2
+
+Saap
+
+\ell
+=32
+
+selectivity
+
+100 %
+
+4.4 %
+
+runtime
+
+50
+\mu
+s
+
+18
+\mu
+s
+
+The FLOPs necessary to compute the sparse attention are about 20
+\times
+lower than for the full attention.
+The reduction of runtime is 65%, because the computation is not as well optimized as FlashAttention and includes overheads. Note that end-to-end timings do not only depend on the budget, but also on how balanced the clusters are and whether the heads all perform the same number of FLOPs.
+This is due to the parallelization over GPUs and over computation cores that we use (see Section
+4
+).
+
+The training
+takes around 25 minutes per head on one GPU.
+This is not a limitation since the training is meant to be re-used across contexts and prompts.
+
+6.4
+Comparison with the state of the art
+
+We compare
+Saap
+with RetrievalAttention
+(
+Liu et al., 2024a
+)
+. For this comparison, we employ a Llama 3 model fine-tuned by Gradient AI to support 262k contexts.
+We set
+\ell
+=
+32
+, yielding a selectivity of around 5% for textual content.
+
+Table 3
+shows that the baseline numbers are often different, probably because of slightly different experimental settings (
+e.g
+.
+prompts).
+However, the gap between
+Saap
+and the full attention baseline is very similar to the RetrievalAttention results.
+Note that in our experimental setting, the dense part of the attention is 1+2047 tokens, while it is 128+512 for RetrievalAttention.
+However, for long-range tasks, this does not matter much as it is still a tiny fraction of the attention size (see the ablations in Section
+6.5
+).
+The critical advantage of
+Saap
+is that the slowest stage (training) is performed offline, while RetrievalAttention’s RoarGraph index
+(
+Chen et al., 2024a
+)
+has to be built once the context is available, which takes several minutes for a 100k context.
+As mentioned in Section
+2
+, this makes graph-based indexing of a KV cache attractive only in settings where the same KV cache is reused multiple times.
+In contrast, for
+Saap
+, pre-filling the index takes a few seconds on modern GPUs.
+
+6.5
+Ablation experiments
+
+We have evaluated numerous more complex variants that did not yield consistent improvements:
+increasing the model capacity,
+training a key classification model,
+fine-tuning the query classification model to the current prompt,
+using causal masking in the training batches,
+training on book summarization data rather than books to force long-range queries.
+In general, we observed that good results from experiments at the level of one head do not guarantee an improved end-to-end performance.
+
+Q-model architecture and training.
+
+In Appendix
+E.1
+, we analyze some variants of the Q-model training.
+This analysis shows that using long-range queries-key pairs for training is useful.
+Using a residual architecture rather than a simple MLP does not help.
+
+Dense context size.
+
+Saap
+’s default dense context is 2048 tokens (the attention sink of size 1 plus the 2047 most recent keys).
+We experiment with some other settings for attention sink+dense context: 1+511, 1+63 and 128+512.
+The results in Appendix
+E.2
+show that the performance remains similar.
+
+Batched queries.
+
+Saap
+combines all four queries belonging to the same group into a single search, see Section
+5
+.
+These queries could also be performed independently. In Appendix
+E.3
+, we show that batching the queries corresponding to the same KV head outperforms ranking the buckets independently for each query.
+
+Number of clusters
+C
+and probes
+\ell
+.
+We discuss the trade-off in Appendix
+E.4
+. The selectivity is roughly proportional to
+\ell/C
+. Large
+C
+provides better quality but is limited for efficiency reasons.
+
+6.6
+Limitations
+
+Our method involves an additional training stage. While its computational cost is negligible compared to the LLM training, it involves some expertise (1) to ensure that the model quality is not significantly impacted for the target use-case(s), (2) to reset the hyper-parameters if the ones we report are not adapted for the target model.
+Another limitation is that our method is a solution for inference, not to training and not for prefill (although we do not see any major obstacle to adopt it for prefill).
+
+7
+Conclusion
+
+We introduced
+Saap
+, a new method for non-exhaustive attention computations in LLMs.
+
+Saap
+is data adaptive, while incurring negligible run-time or memory overhead compared to exhaustive attention.
+Our paper has focused on the generation stage, where memory I/O has the strongest impact on performance.
+We have shown the efficiency of
+Saap
+for typical long-context tasks, with significant computation speedups and a small impact on accuracy.
+
+Appendices
+
+In the following appendices, we present a few additional results that complement the main paper.
+Appendix
+A
+provides details regarding the training procedure.
+Appendix
+B
+examines a few LSH-based partitioning methods.
+Appendices
+C
+and
+D
+report experimental results for RULER and additional ones for Infinitybench.
+Appendix
+E
+reports the results of ablation experiments.
+Appendix
+F
+details how the
+Saap
+algorithm is implemented on GPU.
+
+Appendix A
+Training details
+
+The training was performed on 40 prompts of 500k tokens each.
+For these we have access to all key and query vectors from all layers and heads.
+
+Key assignment.
+we train the k-means for 10 iterations with a random initialization.
+This is standard setting for partition-based indexing methods, we use the IVF implementation of the Faiss library
+(
+Douze et al., 2024
+)
+.
+
+Q-model.
+We train the Q-model for 40k iterations.
+At each iteration, we sample 1000 queries vectors from one random prompt.
+The query vectors are sampled among queries for which the nearest key in the prompt is more than 1024 tokens away in the sequence, to favor long-range queries (around 21% the queries have this property).
+All the key vectors from the same prompt are used for training, except the attention sink.
+
+The loss of Equation
+1
+is optimized with the Adam optimizer and a learning rate of
+10^{-5}
+.
+Note that we set a high number of iterations to get the best possible setting and because the model’s training time is not critical for the pre-fill or inference speed.
+
+Appendix B
+Partitioning the KV-cache with LSH
+
+Figure 5:
+
+MSE vs. selectivity for three LSH variants, compared to a random selection and a partition based on k-means (the baseline for
+Saap
+), on 4 representative heads.
+
+Locality Sensitive Hashing refers to multiple algorithms inspired by the Johnson-Lindenstrauss lemma. In the context of approximate nearest neighbor research, the term is overloaded, as it covers several algorithms and variants.
+One common component is that the vector to hash
+x\in\mathbb{R}^{d}
+is projected onto
+r
+directions drawn randomly, which yields the
+r
+-bit bucket number:
+
+B(x)=\sum_{i=0}^{r}2^{i}\mathbf{1}[x^{\top}\pi_{i}>0]\in\{0,\dots,2^{r}-1\}.
+
+(2)
+
+Multiple hash tables.
+
+MagicPig
+(
+Chen et al., 2024b
+)
+employs
+several
+(up to
+L=200
+) hash tables. The vector search relies on collisions between the buckets: a key is considered only if it is hashed together with the query in at least two hash tables.
+Using such a large number of hash tables is classical for LSH, since a single hash table is very unbalanced.
+The theoretical guarantees of LSH apply only when the number of hash tables is large.
+
+Therefore, it is not strictly speaking a partitioning method of the keys.
+Besides, the large number of hash tables means that the memory used for that indexing structure is larger than the KV-cache itself (
+4L=800
+bytes per vector to store, compared with the
+2\times 2\times 128=512
+bytes to store the key-value pairs).
+This is why MagicPig stores the hash tables in CPU RAM.
+
+A single hash table?
+
+In the KDEformer method of
+Zandieh et al. (2023)
+, a single hash table is considered, with a large
+r
+, so that the buckets are sparse.
+The bucket numbers corresponding to they keys
+B(k)
+are ordered by their Gray codes
+1
+1
+
+1
+
+https://en.wikipedia.org/wiki/Gray_code
+(which the authors re-invent).
+Then the sequence of keys ordered in this way is partitioned in equal sized bins.
+At query time, only the bin the query vector “falls” in is visited.
+
+Since successive binary strings ordered by Gray codes differ by only 1 bit, the hope is that nearby buckets end up being nearby in this ordering.
+However, it is not guaranteed that if
+B(k)
+and
+B(k^{\prime})
+differ by only 1 bit, then they will be nearby in this enumeration.
+Indeed, the bit that they differ by is not necessarily the one that changes in successive Gray codes.
+Besides, it is
+also
+unlikely that many keys differ by only one bit because if
+r
+is large then most vectors will differ by more than one.
+
+Alternative hash functions.
+
+In the Reformer of
+Kitaev et al. (2020)
+, the hashing function is replaced with the maximum dot product of random directions:
+
+B(x)=\underset{i=1..2^{r}}{\mathrm{argmax}}~~x^{\top}\pi_{i}.
+
+(3)
+
+Compared to Equation (
+2
+), each random projection only generates a single bucket instead of a bit for the bucket number.
+This is close to our k-means approach, if the centroids were drawn randomly.
+
+Similar to KDEFormer, the sequence of keys is sorted and split arbitrarily, but the bucket numbering does not have a significance here.
+The authors observe that it is beneficial to use multiple hash tables.
+
+Discussion.
+
+The theoretical grounding of these LSH based methods is fragile.
+They rely on a supposed property explicited in the HyperAttention work
+(
+Han et al., 2023
+)
+:
+
+A useful property of this LSH variant is that its buckets are ordered in such a way that geometrically
+adjacent buckets have consecutive buckets.
+
+There is an error in this reasoning: it is not possible to map a high-dimensional space to a sequence while maintaining neighborhood relations; otherwise, nearest neighbor search in high dimensions would be as easy as in 1D.
+
+Besides, the subsequent arbitrary splitting of linear sequences into regular buckets defined to minimize computations defeats the purpose of the original data buckets.
+
+Experiments.
+
+We compare different LSH approaches in the tradeoff between selectivity and mean squared error (MSE) for a few attention heads.
+The MSE is computed between the approximate attention output and the exact one.
+We use random sampling as the baseline.
+Since the attention mechanism can be seen as Gaussian kernel smoothing
+Zhang et al. (2024a)
+, random sampling is actually a reasonable estimator, that reaches MSE=0 when all vectors are sampled (we use sampling without replacement).
+
+All the variants have a parameter that adjusts the tradeoff:
+for KDEFormer and Reformer, fewer larger buckets improve the accuracy and increase the computational cost (1 bucket covering all keys and queries is equivalent to full attention);
+for MagicPig’s LSH with multiple hash tables, increasing the number
+L
+of hash tables improves the coverage of the key vectors.
+
+Figure
+5
+shows that for this metric, the KDEFormer and Reformer are on-par or slightly worse than random sampling.
+Note, however, that these two paritioning methods were developed to be used at pre-fill time, so their performance could be better in a self-attention setting where the contexts embeddings are matched among themselves.
+In fact, Reformer uses the query corresponding to a key to assign that key to a bucket instead of attempting to assign the key itself.
+MagicPig implements the classical multi-hashtable LSH, so it performs better, but note that since MagicPig uses multiple hash tables, it does not yield a (single) partition of the dataset.
+The k-means approach obtains much better results, mainly because it is data-adaptive.
+
+These LSH based methods are confronted with the same bucketing balancing issues that we encounter in
+Saap
+.
+MagicPig resolves this balancing issue by running the search on CPU, that is more tolerant to irregular computation patterns than GPUs.
+The two other variants arbitrarily split the keys and queries into fixed-size buckets that a handled easily by block computations.
+
+Saap
+attempts to balance the buckets at training time with a specific loss term.
+
+Appendix C
+RULER results
+
+In
+Table 4
+, we report the results of the RULER
+(
+Hsieh et al., 2024
+)
+subtasks: multi-key, multi-query and VT for two context lengths 65k and 128k.
+Surprisingly, the SAAP scores are often above the full attention scores. This can be explained by the fact that the sparse attention focuses on only a relevant subset of the prompts, thus it has a denoising effect.
+SAAP scores are also higher than k-means in three out of five tasks.
+
+Table 4:
+
+Scores with a Llama 3.1-8B model using rope extrapolation to increase the context length of 500k and different partitioning schemes. We report in
+bold
+the best results among approximate attention schemes. Each subtask has the corresponding context size in parentheses.
+
+RULER
+(
+Hsieh et al., 2024
+)
+
+Methods
+
+multi-key
+
+multi-query
+
+VT
+
+context length
+
+65k
+
+128k
+
+65k
+
+128k
+
+65k
+
+Full attention
+
+39.0
+
+25.8
+
+54.5
+
+62.7
+
+50.5
+
+StreamingLLM (1+2047)
+
+3.6
+
+2.0
+
+1.9
+
+1.7
+
+5.0
+
+K-means (roped inputs,
+
+\ell=32
+)
+
+27.6
+
+14.2
+
+78.4
+
+60.7
+
+78.4
+
+K-means (no rope,
+
+\ell=32
+)
+
+34.4
+
+24.2
+
+65.0
+
+67.7
+
+54.2
+
+Saap
+, K-means+Q (
+\ell=32
+)
+
+46.6
+
+31.8
+
+70.0
+
+65.7
+
+85.0
+
+Appendix D
+InfiniteBench results
+
+Additional results.
+
+Figure 6
+complements
+Figure 4
+and illustrates the task-dependent behaviors described in Section
+6.2
+.
+.
+The results are more noisy, yet
+Saap
+does perform well for most tasks.
+
+Figure 6:
+
+Performance on selected InfiniteBench tasks
+
+Appendix E
+Ablation experiments
+
+In these experiments we evaluate our method with variations of a few key parameters.
+
+E.1
+Variations on architecture and training setting
+
+Figure
+7
+shows the performance on the NIH and En.QA tasks using different architectures.
+It is comparable to Figure
+4
+with a few more variants for the Q model:
+
+•
+
+“Q-model short-range” is the standard 2-layer MLP, but trained without filtering out short-range queries ;
+
+•
+
+“Q-model residual” relies on a residual architecture with the same capacity as the MLP, also trained without filtering out short-range queries.
+
+The NIH plot shows that training on long-range queries only improves the accuracy significantly.
+Besides, the residual architecture is not an improvement over the MLP.
+The En.QA results are more contrasted but the task is more noisy, so we chose to standardize on the MLP architecture with short-range filtering.
+
+Figure 7:
+
+Comparison of architectural variants on the needle-in-haystack (left) and InfiniteBench En.QA (right) tasks.
+
+E.2
+Dense context size
+
+Figure
+8
+shows the performance of various dense context sizes.
+Depending on the task, some dense context settings are more efficient.
+We chose 1+2047 that works well on the needle-in-haystack task.
+
+Figure 8:
+
+Comparison of dense context sizes on the needle-in-haystack (left) and InfiniteBench En.QA (right) tasks.
+The dense context is reported as “128+512” means that the first 128 tokens of the sequence and the most recent 512 ones are accessed exactly (dense).
+
+E.3
+Batched queries
+
+Figure
+9
+shows the effect of batching the 4 queries belonging to the same KV head.
+
+•
+
+”Batched”: Jointly rank partitions across multiple queries to identify the top-k partitions that we want to access.
+
+•
+
+”Independent”: Access the top-k ranked partitions for each query separately.
+
+Interestingly, we observe that the batched setting often outperforms the independent setting, which ought to be more data-adaptive.
+
+Figure 9:
+
+Comparison of batched and independent queries on the needle-in-haystack (left) and InfiniteBench En.QA (right) tasks.
+
+E.4
+Guidance for the number of clusters and the number of visited clusters
+
+We carried out additional experiments with a varying number
+C
+of partitions in a setting similar to Figure
+5
+: we measure the MSE (approximation error) with k-means partitioning (for a few arbitrary layers and heads).
+We vary the number of visited clusters
+
+\ell
+for several settings of
+C
+.
+The selectivity roughly is proportional to
+\ell/C
+.
+
+Figure
+10
+shows that with a fixed
+\ell/C
+and selectivity, a lower (better) MSE can be obtained with a larger number of clusters
+C
+.
+This is also a classical observation in partition-based indexing
+(
+Douze et al., 2024
+)
+.
+However, a larger
+C
+poses several problems:
+(1) the assignment operation is more expensive,
+(2) it is harder to train – especially for a Q-model,
+(3) the GPU implementation becomes less efficient because the memory regions to access are more fragmented.
+Therefore, we set
+C
+=1024 by default.
+
+Selectivity is a monotonously increasing function of the hyperparameter
+\ell
+, the number of clusters visited per query.
+
+Table 5
+and
+Figure 11
+show that depending on the task, the selectivity increases faster with
+\ell
+, eg. for NIH the selectivity at
+\ell=32
+is around 4% while it is 48.5% for Math.F. This high selectivity can be explained by the fact that the Math.F benchmark is built on long sequences of numbers, which is a different domain compared to natural language. For this task
+Saap
+is ineffective, because at this selectivity level, the speedup with respect to full attention is not significant.
+
+By contrast, for Code.D the selectivity is close to that of natural language task en.QA. This is interesting because, while the LLM training data includes code, the key and query partitioning models did not: in this case
+Saap
+is relatively robust.
+
+The relationship between
+\ell
+and selectivity can also be observed in the curves of
+Figure 4
+, where the score vs. selectivity operating points are obtained by varying
+\ell=4,8,...,256
+.
+
+Figure 10:
+Error (MSE) as a function of the number of clusters
+C
+and the number of probes
+\ell
+.
+
+Table 5:
+
+Selectivity when varying the number
+\ell
+of visited clusters.
+
+\ell
+
+balanced
+
+NIH 128k
+
+NIH 500k
+
+Retr.N
+
+Retr.P
+
+Retr.KV
+
+Math.F
+
+Code.D
+
+En.QA
+
+En.MC
+
+4
+
+0.4
+
+0.5
+
+0.8
+
+1.8
+
+1.5
+
+3.7
+
+3.2
+
+0.7
+
+0.4
+
+0.4
+
+8
+
+0.8
+
+1.0
+
+1.5
+
+3.7
+
+3.3
+
+7.0
+
+7.4
+
+1.5
+
+0.9
+
+0.9
+
+16
+
+1.6
+
+2.0
+
+3.0
+
+8.1
+
+7.2
+
+14.1
+
+21.4
+
+3.0
+
+2.0
+
+2.0
+
+32
+
+3.1
+
+4.0
+
+5.3
+
+17.4
+
+15.9
+
+28.7
+
+48.5
+
+5.4
+
+4.1
+
+4.1
+
+64
+
+6.2
+
+7.8
+
+9.2
+
+36.7
+
+35.3
+
+60.3
+
+73.5
+
+9.5
+
+8.2
+
+8.2
+
+128
+
+12.5
+
+15.1
+
+16.2
+
+82.6
+
+83.0
+
+87.7
+
+88.4
+
+16.5
+
+16.2
+
+16.2
+
+Figure 11:
+Selectivity at various choices for
+\ell
+, the number of clusters visited.
+
+Appendix F
+Algorithm details
+
+In this section, we will describe the algorithm details of the
+Saap
+Triton kernel.
+Given a query
+Q\in\mathbb{R}^{1\times d}
+,
+the 1+2047 keys and values that are accessed exactly are
+K_{l},V_{l}\in\mathbb{R}^{N_{l}\times d}
+;
+the remaining keys and values are
+K_{s},V_{s}\in\mathbb{R}^{N_{s}\times d}
+, Every
+K_{s},V_{s}
+has a corresponding partition assignment
+A_{i}\in\{1,...C\}
+for
+i\in\{1,...,N_{s}\}
+, where
+C
+is the number of buckets.
+
+From this partition assignment, we build an index comprised of two tensors
+\texttt{Off},\texttt{Idx}
+that groups all assignments to the same bucket together, and allows for efficiently iterating over all elements in a bucket.
+This representation is similar in principle to a compressed sparse-row representation, where
+Off
+(of size
+C
+) would map to the compressed rows and
+Idx
+(of size
+N
+) to the column indices.
+Thus, the list of key/value ids within bucket
+c
+is
+\texttt{Idx}[\texttt{Off}[c]:\texttt{Off}[c+1]]
+, where
+i:j
+denotes indices
+\{i,\dots,j-1\}
+.
+
+The key and value vectors are stored in HBM (high-bandwidth memory) that is
+slower
+than the on-chip SRAM.
+
+For a given query
+Q
+, we assign the
+\ell
+most promising buckets in
+B\in\{1,...,C\}^{\ell}
+.
+
+We parallelize the program by launching
+\ell+1
+CUDA blocks, where the first block will handle the 1+2047
+K_{l},V_{l}
+, and each of the remaining blocks will handle a given bucket and will perform the sparse attention. Our kernel assumes the grouped-query attention setting where keys and values share the same head, with only the queries having
+n_{h}
+independent heads. Given this setting, we avoid duplicating the
+K,V
+heads and we compute the
+n_{h}
+heads from
+Q
+together, by leveraging the fact that the sequence length for
+Q
+is 1, so that the computation is equivalent to transposing the head and the sequence dimension for
+Q
+.
+
+Algorithm 1
+
+Partial attention kernel
+PAttn
+
+0:
+
+Inputs
+Q,O^{*}\in\mathbb{R}^{n_{h}\times d}
+,
+K,V\in\mathbb{R}^{B_{c}\times d}
+,
+m^{*}\in\mathbb{R}^{n_{h}\times 1}
+and
+s^{*}\in\mathbb{R}^{n_{h}\times 1}
+all in on-chip SRAM
+
+Compute
+s:=QK/\sqrt{d}
+
+Compute
+m_{i}:=\text{rowmax}(m^{*},A)
+
+Update
+O^{*}:=O^{*}\cdot\exp(m^{*}-m_{i})+V\exp(s-m_{i})
+
+Update
+s^{*}:=s^{*}\cdot\exp(m^{*}-m_{i})+\exp(s-m_{i})
+
+Update
+m^{*}:=m_{i}
+
+Algorithm 2
+
+Inverted list computation kernel
+
+0:
+
+Inputs
+Q\in\mathbb{R}^{n_{h}\times d}
+,
+K_{s},V_{s}\in\mathbb{R}^{N_{s}\times d}
+,
+K_{l},V_{l}\in\mathbb{R}^{N_{l}\times d}
+, buckets to visit:
+B\in\{1,...,C\}^{\ell}
+,
+Off
+and
+Idx
+, key block size
+B_{c}
+, and CUDA block id
+b_{i}
+.
+
+Load
+Q
+from HBM to on-chip SRAM
+
+Initialize accumulator
+O_{b_{i}}:=0_{d}
+
+Initialize sumexp accumulator
+s_{b_{i}}:=0
+
+Initialize max accumulator
+m_{b_{i}}:=-\infty
+
+if
+
+\ell>=b_{i}>0
+
+then
+
+Read
+c=B[b_{i}-1]
+, the bucket id to visit
+
+Let
+I^{c}
+be the indices of
+Idx
+that correspond to bucket
+c_{i}
+by indexing
+I^{c}=\texttt{Idx}[\texttt{Off}[c]:\texttt{Off}[c+1]]
+
+Divide the indices
+I^{c}
+in
+T=\lceil\frac{|I^{c}|}{B_{c}}\rceil
+blocks
+\{I^{c}_{1},...I^{c}_{T}\}
+of size
+B_{c}
+
+for
+
+0\leq j<T
+
+do
+
+Load indices
+I_{j}^{c}
+to SRAM.
+
+Strided load
+K_{s}^{j},V_{s}^{j}:=K_{s}[I_{j}^{c}],V_{s}[I_{j}^{c}]
+to SRAM
+
+\texttt{PAttn}(Q,K_{s}^{j},V_{s}^{j},m^{b_{i}},s_{b_{i}},O_{b_{i}})
+
+end
+
+for
+
+else
+
+if
+
+b_{i}==0
+
+then
+
+compute block size
+T=\lceil\frac{N_{l}}{B_{c}}\rceil
+
+for
+
+0\leq j<T
+
+do
+
+compute indices
+i_{0}=B_{c}j
+and
+i_{1}=B_{c}(j+1)
+
+\texttt{PAttn}(Q,K_{l}[i_{0}:i_{1}],V_{l}[i_{0}:i_{1}],m^{b_{i}},s_{b_{i}},O_{b_{i}})
+
+end
+
+for
+
+end
+
+if
+
+Write
+O_{b_{i}},s_{b_{i}},m_{b_{i}}
+to HBM
+
+In a separate kernel, for every
+n_{h}
+compute merge-attention
+:
+
+Load
+O_{0},s_{0},m_{0}
+
+Set
+m^{*}:=m_{0}
+,
+O=O_{0}
+and
+s=s_{0}
+
+for
+
+1\leq i\leq\ell
+
+do
+
+Load
+O_{i},s_{i},m_{i}
+
+Compute
+\hat{m}:=\max(m^{*},m_{i})
+
+if
+
+m_{b_{i}}<m^{*}
+
+then
+
+Compute
+\alpha:=\exp(m_{i}-\hat{m})
+
+Update
+O_{i}:=\alpha O_{i}
+
+Update
+s_{i}:=\alpha s_{i}
+
+else
+
+Compute
+\alpha:=\exp(m^{*}-\hat{m})
+
+Update
+O:=\alpha O
+
+Update
+s:=\alpha s
+
+end
+
+if
+
+Set
+m^{*}:=\hat{m}
+,
+s:=s+s_{i}
+and
+O:=O+O_{i}
+
+end
+
+for
+
+return
+
+O/s
+
+Once the partial results are computed, we apply the merge-attention function from xFormers
+(
+Lefaudeux et al., 2022
+)
+to aggregate the partial results into the final output.
+
+13
+,
+9
+7
+,
+39
+
