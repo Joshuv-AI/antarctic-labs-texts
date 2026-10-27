@@ -1,0 +1,1842 @@
+Distributed Speculative Execution for Resilient Cloud Applications
+Tianyu Li, Badrish Chandramouli, Philip A. Bernstein, Samuel Madden
+
+Abstract
+Fault-tolerance is critically important in highly-distributed modern cloud applications. Solutions such as Temporal, Azure Durable Functions, and Beldi hide fault-tolerance complexity from developers by persisting execution state and resuming seamlessly from persisted state after failure. This pattern, often called durable execution , usually forces frequent and synchronous persistence and results in hefty latency overheads. In this paper, we propose distributed speculative execution (DSE), a technique for implementing the durable execution abstraction without incurring this penalty. With DSE, developers write code assuming synchronous persistence, and a DSE runtime is responsible for transparently bypassing persistence and reactively repairing application state on failure. We present libDSE, the first DSE application framework that achieves this vision. The key tension in designing libDSE is between imposing restrictions on user programs so the framework can safely and transparently change execution behavior, and avoiding assumptions so libDSE can support more use cases. We address this with a novel programming model centered around message-passing, atomic code blocks, and lightweight threads, and show that it allows developers to build a variety of speculative services, including write-ahead logs, key-value stores, event brokers, and fault-tolerant workflows. Our evaluation shows that libDSE reduces end-to-end latency by up to an order of magnitude compared to current generations of durable execution systems with minimal runtime overhead and manageable complexity.
+
+
+
+1
+Introduction
+
+Modern cloud applications are more distributed than ever. Companies have long adopted microservices architectures, splitting their applications into hundreds of loosely-coupled, independently-deployed distributed components
+[
+40
+,
+2
+]
+.
+Recent proposals, such as serverless and granular computing
+[
+44
+,
+49
+]
+, have pushed for even more distribution at a finer granularity.
+Benefits aside, this makes every modern cloud application a distributed one, and fault-tolerance is a key challenge.
+A common solution is to build fault-tolerant abstractions and hide failures from the average application developer; such abstractions are responsible for persisting application state where necessary and transparently recover from failures to resume execution. A variety of systems can be thought to fit under this paradigm, including transactional database systems, batch processing systems like Spark
+[
+70
+]
+, exactly-once stream processing systems such as Kafka Streams
+[
+68
+]
+. Most relevant to the cloud, however, are
+Durable Execution
+
+[
+10
+]
+systems such as Azure Durable Functions
+[
+8
+]
+and Temporal
+[
+30
+]
+. Compared to previous systems, durable execution engines are designed for the modern cloud and are widely used to orchestrate microservices or serverless workers
+[
+14
+]
+. Despite growing popularity
+[
+71
+,
+43
+,
+73
+,
+32
+,
+13
+,
+17
+,
+27
+,
+20
+,
+22
+,
+16
+,
+12
+]
+, current generation durable execution engines perform frequent and synchronous state persistence, which results in high latency overhead (
+Section
+
+2
+). Worse, this overhead scales with the degree of distribution — as the application is split into more distributed components, synchronous persistence becomes more frequent and expensive.
+
+In this paper, we propose an alternative:
+distributed speculative execution
+(DSE), which decouples the abstraction of durable execution from the physical execution pattern. Analogous to similar schemes in hardware
+[
+66
+]
+and file systems
+[
+58
+,
+57
+]
+, DSE systems bypass synchronous persistence, but ensure equivalence to non-speculative user programs through automatic rollback and recovery after failures. Externally visible results are delayed until persistence to avoid exposing temporary inconsistencies. On the common, failure-free path, DSE dramatically reduces application latency; in exchange, failure recovery becomes slower and more complex. This is a good trade-off when failures are rare, as often the case in the cloud.
+
+We present libDSE, a
+general-purpose
+DSE runtime applicable to diverse applications including fault-tolerant workflows, stream processing, and distributed transactions. Compared to earlier work, libDSE is specifically designed for the modern cloud environment where applications are written as workflows over message-passing, fail-restart stateful components. There are two main challenges in designing libDSE. First, to achieve generality, libDSE must perform DSE without relying on application-specific assumptions such as determinism, known read/write sets, or immutability. Second, libDSE must hide the complexities of speculation, but enforce key properties needed for correct DSE in user applications.
+
+For the first challenge, libDSE modifies the
+
+Distributed Prefix Recovery
+(DPR) protocol
+[
+51
+]
+, a distributed cache recovery scheme, for our setting. DPR instruments messages between services to build and maintain a recovery dependency graph. The graph is used to determine when results are safe to expose externally, and to compute a consistent snapshot for every affected component to rollback to after failure.
+Each component allows libDSE to force persistence/rollback when necessary, which requires application changes.
+
+For the second challenge, libDSE provides a programming model centered around
+two intuitive programming primitives,
+actions
+and
+sthreads
+.
+Actions are user-defined atomic blocks that are guaranteed by libDSE not to overlap with persist/recovery/rollback invocations.
+Sthreads are stateless and lightweight threads of execution that allow libDSE to guarantee correctness for long-running or asynchronous operations which cannot execute atomically.
+Advanced developers exercise fine-grained control over speculation behavior through
+speculation barriers
+, analogous to memory barriers
+[
+26
+]
+.
+Barriers allow libDSE services to co-exist with non-speculative components by only exposing non-speculative results.
+
+Using libDSE, developers can build speculative services without worrying about the distributed protocol design and concurrency control challenges of speculation.
+These speculative services can be composed into performant yet resilient applications. To showcase this, we build a speculative write-ahead log service, a key-value store, an event broker, and a workflow orchestration service using libDSE. We demonstrate the benefits of DSE by assembling three representative applications from these building blocks: a travel reservation system, an event processing application, and an optimized two-phase commit protocol. Our experiments show that DSE can effectively reduce latency by up to an order of magnitude, with minimal reduction of throughput and scalability. In summary, our contributions are:
+
+•
+
+We propose a new distributed speculative execution (DSE) scheme that dramatically and transparently reduces fault-tolerance overhead in durably executed applications.
+
+•
+
+We describe our design and implementation of libDSE, the first general-purpose DSE framework for the modern cloud.
+
+•
+
+We evaluate libDSE on a diverse set of cloud applications,
+and present a detailed evaluation, showing 20% to up to an order of magnitude latency savings compared to current, non-speculative implementations.
+
+2
+Motivation
+
+2.1
+Background: Durable Execution
+
+Durable execution creates an illusion of uninterrupted, failure-free execution by persisting application state at every step and automatically retrying execution after failure. This strong abstraction hides many distributed system complexities from the average developer, but often at the cost of performance.
+
+Running Example.
+
+Consider a toy example of an application that consists of a frontend layer, a counter service, and a logging service. Users issue requests to the frontend to increment the counter. Each request and its result is then sent to the logging service for bookkeeping purposes. Failures can result in a number of anomalies in even this simple scenario. Each service can crash and lose data. The frontend server can crash after a successful increment but fail to log the incremented value. Naive attempts to solve this may retry and increment or log too many times. While these anomalies appear innocuous in the toy example, they are highly undesirable in real-world scenarios. If an e-commerce company uses a similar architecture to connect their payment and fulfillment services, such anomalies can lead to double charging or unfulfilled orders. A principled solution is necessary to prevent such anomalies.
+
+Figure 1:
+A Simple Running Example
+
+Current Solutions.
+
+The goal of durable execution is to ensure that users cannot distinguish between execution of the application with failures, and ones without (except perhaps through performance degradation).
+Today’s cloud architect might achieve durable execution in this example by first making each service durable (e.g., by persisting to a database before returning), and then using a resilient workflow engine (e.g., Temporal) to orchestrate the frontend calls. Importantly, each stateful service must be programmed for
+idempotency
+– retried requests must not have additional visible effects beyond their first execution. Often this is achieved by attaching a unique ID to each request and de-duplicating on the service side. To protect against frontend failure, the workflow engine automatically persists operation intents
+[
+65
+]
+and intermediate results, and retries on failure. In our running example, the workflow engine would execute an increment call by first persisting the intent to increment and generate a request ID, make the remote call, and record the result.
+
+Under the hood, the workflow system maintains (sometimes implicitly) a directed acyclic graph (DAG) of stateful tasks, and ensures exactly-once semantics of execution (assuming idempotent tasks). Most such systems today must synchronously persist each task’s output before starting the next task to ensure correctness. Otherwise, because tasks might not be deterministic, replay may yield different outputs and spawn different downstream tasks; tasks spawned based on previous outputs can then conflict with later ones and cause anomalies.
+Consequently, almost all current generation durable execution systems have cumulative latency overheads that scale with the depth of the task graph. State-of-the-art implementations such as Boki
+[
+43
+]
+and Halfmoon
+[
+61
+]
+focus on optimizations that increase throughput and reduce overhead per-persistence, but do not fundamentally bypass synchronous persistence. ExoFlow
+[
+73
+]
+relies on annotations to mark tasks that can be deterministically replayed or with effects that can be rolled back to avoid synchronous persistence. However, this solution relies on users to carefully annotate each task and supply the logic to rollback outputs, which increases the burden on the developer. This approach also does not help with non-deterministic applications.
+
+Our Solution.
+
+In contrast, DSE forges ahead before operation intents, effects, or intermediate results are durable. This inevitably leads to anomalies upon failures. DSE applications must detect such inconsistencies, repair them, and prevent external users from observing them during the process. In other words, the requirements of correct DSE are:
+
+•
+
+Recoverability.
+Inconsistencies are eventually repaired.
+
+•
+
+Failure Transparency.
+External entities (e.g., clients) never observe failure-induced inconsistencies.
+
+Fundamentally, this means that DSE systems are rollback-based recovery systems
+[
+39
+]
+. Any solution must design protocols that correctly track recovery dependencies between participants, determine when state becomes recoverable, and rollback unrecoverable state on failure. On failure, the system determines the extent of failure based on collected dependencies and orchestrates rollback across participants to restore the application to a consistent state. Such schemes support non-determinism, as non-deterministic operations are either restored from persisted state and never replayed, or all their effects are rolled back. The key trade-off is that on failure, DSE throws away work and requires rollback coordination, which adds overhead. In exchange, DSE optimizes for latency by removing synchronous persistence from the critical path. Overall persistence overhead of a DAG is no longer the sum of all steps, but instead is the maximum of all steps, as asynchronous persistence occurs in parallel.
+
+2.2
+Example Applications
+
+Next, we sketch how DSE applies to three classes of applications to improve end-to-end latency. In all of these cases, correctness requirements force existing implementations to frequently and synchronously persist state, causing increased latency that DSE can help address. We later describe how we build an application from each class with libDSE and demonstrate the benefits in
+Section
+
+6
+.
+
+Figure 2:
+Example Applications that benefit from DSE
+
+Resilient Workflows.
+As mentioned, resilient workflow systems typically must persist their state synchronously between steps of the workflow. In the example of
+Figure
+
+2
+a, a travel-reservation application uses a system like Temporal to orchestrate reservations between three independent services. The workflow system must persist the intent to make a reservation, wait for the reservation to become persistent, and persistently record the outcome before proceeding, leading to significant synchronous persistence.
+
+Event-driven Processing.
+
+Many modern cloud systems consist of decoupled services that react to events, and rely on event broker (pub-sub) systems
+[
+47
+,
+7
+]
+for inter-service communications. Event brokers must be stateful and fault-tolerant to ensure availability, support asynchronous/unreliable consumers, etc. Most brokers therefore disallow event consumption before persistence. In
+Figure
+
+2
+b, a stream processing application (e.g., Kafka Streams
+[
+68
+]
+) relies on an event broker to pass data between operators, and therefore must pay one synchronous persistence per operator.
+
+Distributed System Primitives.
+
+Critical distributed protocols often involve synchronous persistence for fault-tolerance. For example, as shown in
+Figure
+
+2
+c, the vanilla two-phase commit
+[
+55
+]
+protocol requires the transaction coordinator to log start of commit before starting the protocol, workers to log their responses before responding to PREPARE, and the transaction coordinator to log its decisions of commit/abort before completing the protocol and notifying participants. DSE provides a new way to transparently optimize such protocols, bypassing synchronous persistence to the log without the need to redesign the protocol.
+
+3
+libDSE API
+
+StateObject abstract API
+
+Semantics
+
+Persist(v, metadata, callback)
+
+Persist the current state and
+metadata
+as version
+v
+and then invoke
+callback
+.
+
+Restore(v)
+\rightarrow
+metadata
+
+Recover (or rollback) to the given version and return associated metadata.
+
+Prune(v)
+
+Signal that a version (and all that precede it) can be pruned.
+
+ListVersions()
+\rightarrow
+metadata[]
+
+List all unpruned versions and associated metadata.
+
+Table 1:
+StateObject
+Abstraction
+
+StateObject API
+
+Semantics
+
+StartAction(header)
+\rightarrow
+bool
+
+Start an atomic action, (optionally) receive
+the given libDSE message header. If returned false, the message originates from rolled back state and should be discarded.
+
+EndAction()
+\rightarrow
+header
+
+End an atomic action and (optionally) produce a header that encodes dependencies for any outgoing messages resulting from this action.
+
+Connect(config)
+
+Connect this
+StateObject
+to a libDSE Coordinator using the given configuration. Must be invoked exactly once before performing any other operation.
+
+Refresh()
+
+Refresh should be periodically called to perform libDSE background tasks and guarantee progress for the cluster.
+
+Detach()
+\rightarrow
+sthread
+
+Temporarily suspend an action and produce an sthread that can be used for speculative operations independent of this
+StateObject
+.
+
+Merge(sthread)
+\rightarrow
+bool
+
+Resume an action by merging the detached sthread backed into this
+StateObject
+and update its dependencies. If false, the state leading to the creation of the sthread was rolled back and the sthread should be discarded.
+
+sthread API
+
+Semantics
+
+Receive(header)
+\rightarrow
+bool
+
+Attempt to receive the given libDSE message header. If returned false, the message should be discarded. Throws exception if the sthread is rolled back.
+
+Send()
+\rightarrow
+header
+
+Produce a header that encodes current dependencies of this sthread.
+
+Barrier()
+
+Blocks until all state observed by this sthread becomes non-speculative. Throws exception if the sthread is rolled back.
+
+Table 2:
+Summary of libDSE API
+
+DSE application developers build speculative services by encapsulating application state into
+StateObject
+s.
+StateObject
+s are stateful, message-passing entities loosely based on I/O automata
+[
+54
+]
+that follow a
+fail-restart
+model
+[
+50
+]
+. Each
+StateObject
+can persist its state and recover to it after failure, thereby appearing to restart instead of failing.
+Application developers define
+StateObject
+s by implementing a set of methods to persist or restore application state, using libDSE’s primitives to safely access and update that state. Application developers do not reason about speculation or failure recovery, as it is the responsibility of the libDSE runtime to 1) persist, recover, or rollback
+StateObject
+s when necessary by invoking developer-supplied methods, 2) instrument application messages to establish dependencies, drop rolled back messages, or delay speculative messages from external observers, and 3) implement the necessary protection when developers access
+StateObject
+s through libDSE provided primitives. The rest of this section focuses on these primitives (
+Table
+
+2
+). We discuss the details of how libDSE orchestrates speculative execution in
+Section
+
+4
+.
+
+3.1
+StateObjects and Actions
+
+Users create
+StateObject
+s by implementing the abstract API shown in
+Table
+
+2
+. We show an implementation of the counter service from our running example using cloud storage files in
+Figure
+
+3
+. The framework ensures that
+Persist
+and
+Restore
+are not concurrently invoked. For performance, the
+Persist
+API is asynchronous; users may return from the call once the persistence operation is issued (e.g., flush the log at a specific offset), but before it is completed. While conceptually simple,
+Restore
+encapsulates two different use cases, one where the
+StateObject
+has failed and must reload state from persistent storage, and another where the
+StateObject
+responds to a rollback.
+For the latter case, the example loads persistent state. This is correct, but unnecessarily slow and inefficient.
+Developers are therefore encouraged to distinguish between these two cases (e.g., by checking if
+value == default
+in the example) and apply application-specific optimizations if possible (e.g., by leveraging built-in multi-versioning
+[
+62
+,
+33
+,
+60
+]
+).
+If the
+StateObject
+crashes, the runtime uses
+ListVersions
+to determine (unpruned) successful
+Persist
+calls. This API easily allows for alternative implementations of persistence and recovery. For example, one can implement the counter service via either logging and replay or a replicated state machine.
+
+⬇
+
+1
+
+class
+
+CounterStateObject
+
+:
+
+StateObject
+
+{
+
+2
+
+int
+
+value
+;
+
+4
+
+void
+
+Persist
+(
+long
+
+ver
+,
+
+byte
+[]
+
+m
+,
+
+Action
+
+c
+)
+
+{
+
+5
+
+var
+
+content
+
+=
+
+Encode
+(
+ver
+,
+
+m
+);
+
+6
+
+//
+
+async
+
+write
+
+to
+
+a
+
+cloud
+
+storage
+
+7
+
+Task
+.
+Run
+(()
+
+=>
+
+{
+
+8
+
+WriteFile
+(
+GetName
+(
+v
+),
+
+content
+);
+
+9
+
+callback
+();
+
+10
+
+});
+
+11
+
+}
+
+13
+
+byte
+[]
+
+Restore
+(
+long
+
+ver
+)
+
+{
+
+14
+
+content
+
+=
+
+ReadFile
+(
+GetName
+(
+ver
+));
+
+15
+
+var
+
+restored
+,
+
+metadata
+
+=
+
+Decode
+(
+content
+);
+
+16
+
+value
+
+=
+
+restored
+;
+
+17
+
+return
+
+metadata
+;
+
+18
+
+}
+
+19
+
+...
+
+20
+
+}
+
+Figure 3:
+
+Example
+StateObject
+Implementation
+
+⬇
+
+1
+
+message
+
+IncrementRequest
+
+{
+
+2
+
+bytes
+
+header
+
+=
+
+1;
+
+3
+
+int
+
+incrementBy
+
+=
+
+2;
+
+4
+
+}
+
+5
+
+message
+
+IncrementResponse
+
+{
+
+6
+
+bytes
+
+header
+
+=
+
+1;
+
+7
+
+int
+
+result
+
+=
+
+2;
+
+8
+
+}
+
+9
+
+service
+
+CounterService
+
+{
+
+10
+
+...
+
+11
+
+}
+
+13
+
+//
+
+gRPC
+
+generated
+
+interface
+
+14
+
+class
+
+CounterImpl
+
+:
+
+CounterServiceBase
+
+{
+
+15
+
+CounterStateObject
+
+so
+;
+
+17
+
+override
+
+IncrementResponse
+
+Increment
+(
+
+18
+
+IncrementRequest
+
+r
+)
+
+{
+
+19
+
+if
+
+(!
+so
+.
+StartAction
+(
+r
+.
+header
+))
+
+throw
+;
+
+20
+
+response
+
+=
+
+new
+
+IncrementResponse
+();
+
+21
+
+response
+.
+result
+
+=
+
+22
+
+AtomicInc
+(
+so
+.
+value
+,
+
+r
+.
+incrementBy
+);
+
+23
+
+response
+.
+header
+
+=
+
+so
+.
+EndAction
+();
+
+24
+
+return
+
+response
+;
+
+25
+
+}
+
+26
+
+...
+
+27
+
+}
+
+Figure 4:
+
+Example CounterService Implementation
+
+libDSE organizes operations on
+StateObject
+s as a series of atomic execution units called actions. Each action’s effects are either entirely persisted or entirely lost due to recovery or rollback. libDSE achieves this by ensuring actions never interleave with
+Persist
+or
+Restore
+operations. However, actions may execute concurrently with each other to allow for parallelism. Messages are consumed as a part of actions or produced as a result of actions. libDSE provides users with flexibility on how best to deliver messages between
+StateObject
+s, relying on users to pass opaque headers instead of implementing messaging in libDSE. We present an example of this in
+Figure
+
+4
+. Here, we implement our counter service using gRPC
+[
+21
+]
+, and declare a metadata field on each message for libDSE headers. To process an increment request, the developer begins an action by consuming the input header. If
+StartAction
+returns false, the message’s sender has been rolled back, and the message must be discarded. Otherwise, libDSE protects execution after line 21 from libDSE-triggered persists and restores. Users still need to guard against multiple concurrent requests, and hence use the thread-safe version of increment in line 23. Finally, developers end the action, obtaining a header to pass back to the caller.
+
+3.2
+Handling Asynchrony
+
+Long running actions can block persistence until finished and halt persistence progress across the cluster. For example, the frontend server in our running example issues RPCs that may complete asynchronously and automatically retry in the background. libDSE introduces
+sthreads
+to support such use cases. An sthread is essentially a lightweight thread of execution within a
+StateObject
+that encodes the speculative state of its parent
+StateObject
+at time of sthread creation. We show an example in
+Figure
+
+5
+. Here, the frontend workflow orchestrator calls
+Detach
+after logging the intent to call counter service (line 6), but before calling (line 10).
+After line 7, application code no longer runs in an atomic block, and may go to sleep, retry, or otherwise perform long-running operations without blocking the
+StateObject
+.
+Consequently, in the event of a rollback, the sthread may still temporarily continue to execute. It is therefore essential that sthreads are treated as
+independent, standalone
+participants of the system and interact with other participants, including its parent
+StateObject
+, exclusively through libDSE-instrumented message passing. For example, in line 9, we generate libDSE headers from the sthread, and consume headers on line 12. Finally, to update the parent
+StateObject
+, sthreads must be merged to start a new action (line 13). This logically sends a message from sthread to
+StateObject
+, which can be rejected; in this case, the sthread simply terminates, as it represents derived state of its parent, which will recover independently.
+
+⬇
+
+1
+
+...
+
+2
+
+WorkflowEngineStateObject
+
+so
+;
+
+3
+
+...
+
+4
+
+async
+
+Task
+
+ExecWorkflow
+(
+WorkflowRequest
+
+r
+)
+
+{
+
+5
+
+if
+
+(!
+so
+.
+StartAction
+(
+r
+.
+header
+))
+
+throw
+;
+
+6
+
+so
+.
+MarkWorkflowStart
+(
+r
+);
+
+7
+
+var
+
+t
+
+=
+
+so
+.
+Detach
+();
+
+8
+
+//
+
+Request
+
+executes
+
+outside
+
+atomic
+
+block
+
+9
+
+cReq
+
+=
+
+ComposeRequest
+(
+r
+,
+
+t
+.
+Send
+());
+
+10
+
+var
+
+cRes
+
+=
+
+11
+
+await
+
+CallCounterServiceAsync
+(
+cReq
+);
+
+12
+
+if
+
+(!
+t
+.
+Receive
+(
+cRes
+.
+header
+))
+
+throw
+;
+
+13
+
+if
+
+(!
+so
+.
+Merge
+(
+t
+))
+
+throw
+;
+
+14
+
+//
+
+Back
+
+in
+
+an
+
+atomic
+
+block
+
+15
+
+so
+.
+UpdateWorkflow
+(
+cRes
+);
+
+16
+
+...
+
+17
+
+//
+
+Finally,
+
+return
+
+after
+
+barrier
+
+to
+
+18
+
+//
+
+hide
+
+speculation
+
+from
+
+caller
+
+19
+
+t
+
+=
+
+so
+.
+Detach
+();
+
+20
+
+await
+
+t
+.
+Barrier
+();
+
+21
+
+return
+
+response
+;
+
+22
+
+}
+
+Figure 5:
+
+Example Workflow Implementation with libDSE
+
+Finally, sthreads support barriers, which provide fine-grained control over speculative behavior. Similar to a memory fence, a barrier blocks until everything the sthread received becomes non-speculative, thus preventing speculation across the barrier. Only sthreads are allowed to invoke barriers, as they are, by definition, blocking. Barriers are useful when interacting with external entities. For example, in line 19 and 20 of
+Figure
+
+5
+, by detaching and calling barrier, line 21 will be delayed until the response becomes non-speculative, therefore only sending non-speculative results to users. In many cases, barriers can be automatically inserted (e.g., at the end of an RPC handler processing an external user request), but advanced users may also use barriers to prevent speculative dependencies between parts of their applications. For example, a barrier before line 13 prevents the logging service from receiving speculative requests.
+
+4
+Speculative Protocol
+
+In this section, we describe how libDSE achieves DSE based on our application model of message-passing atomic actions.
+
+4.1
+Inspiration: DPR
+
+Distributed Prefix Recovery (DPR)
+[
+51
+]
+is a recently proposed technique for causal consistency across sharded “cache-stores”,
+storage units spanning volatile memory and durable storage as shown
+in
+Figure
+
+6
+. For example, a shard within a partitioned database with an accompanying Redis caching layer can be considered a (logical) cache-store. Often in such an architecture, the caches are
+write-through
+: clients read from the cache, but write directly to the backend storage and ensure consistency with invalidation. In contrast, DPR is
+write-back
+: writes directly update the cache for increased throughput and immediate visibility, and cached entries are asynchronously flushed to storage. This leads to lost writes if caches fail, which may cause application anomalies as readers may have acted on lost updates. DPR presents a lightweight protocol for addressing this problem. First, operation completion and persistence are decoupled using two acknowledgements. Second, DPR clients interact with cache-stores explicitly through
+sessions
+. Each session is a (linearizable) sequence of operations, as shown in the left of
+Figure
+
+6
+, and DPR guarantees, through orchestrated rollbacks of state, that any surviving state corresponds to session
+prefixes
+. This ensures that in the event of a cache failure, no surviving operation depends on a lost operation.
+
+Figure 6:
+Distributed Prefix Recovery
+
+4.1.1
+Our Insights
+
+The original formulation of DPR around cache-stores does not easily apply to our setting. In particular, clients are first-class citizens in DPR, but do not participate in rollbacks; they are responsible for discovering rollbacks and resuming (potentially replaying) operations. This complexity is compounded by possible client failures, as the recovered (amnesiac) client may lack information needed to properly handle a rollback. Unlike DPR’s client-server formulation, libDSE’s speculative protocol is defined between message-passing stateful peers and makes no distinction between requests and responses, leading to a more succinct protocol than DPR. One benefit of this formulation is that application control flow is part of persisted state (e.g., as part of the workflow orchestrator) and will therefore participate in any rollback, allowing applications to resume from exactly where they are supposed to without needing to recover clients separately.
+
+We improve upon DPR by introducing a new coordinator design. The original DPR relies on a stateful coordinator (i.e., the point of truth is the persistent state of the coordinator) built on an external database system for correct operations. Consequently, DPR adds one coordinator persistence to the failure-free code path before writes can be declared recoverable. We present a deterministic and stateless coordinator design (i.e., the point of truth is the collective persistent state of participants), which removes this overhead.
+
+4.2
+Protocol Details
+
+Like DPR, the libDSE protocol centers around explicit recovery dependency tracking with a dependency graph, as shown in
+Figure
+
+7
+. Each vertex of the graph is a recoverable point that can be loaded via
+Restore
+, and is uniquely identified by a combination of a
+StateObject
+id, a global failure counter (more details on this later), and a local persistence counter. For example,
+A^{1}_{2}
+is the recoverable point from
+StateObject
+A with local persistence counter 2 and global failure counter 1. Edges of the dependency graph represent recovery dependencies – an edge from
+u
+to
+v
+iff
+u
+recovering without
+v
+results in an inconsistency. By definition of consistency
+[
+48
+]
+, such a dependency is established either implicitly by precedence (i.e.,
+u
+is later than
+v
+in the same
+StateObject
+), or if
+u
+received a message originating from state captured by
+v
+. Because each recoverable point captures multiple state transitions and messages, the dependency graph may have cycles.
+
+Instrumentation Protocol.
+
+libDSE tags each message with its originating vertex on the dependency graph (the content of aforementioned libDSE headers). If a
+StateObject
+receives a message from
+v
+when its current (not yet persisted) recoverable point is
+u
+, it adds an edge from
+u
+to
+v
+in the dependency graph. Each
+StateObject
+accumulates dependency graph updates and sends them periodically to the libDSE coordinator after persistence. For sthreads, because they are derived state, they do not participate on the dependency graph, but track all of their dependencies in a set and append them all to each message. The dependency set of an sthread can be cleared every time after a barrier to prevent unbounded growth.
+
+Figure 7:
+Example Dependency Graph
+
+Boundary Protocol.
+
+A
+Recoverable Boundary
+is a cut of the graph where no future failure will cause vertices within the boundary to roll back. Messages originating from within the boundary are therefore not speculative and safe to expose externally. Recoverable boundaries manifest on the graph as closures, i.e., sets of vertices that 1) are all recoverable and 2) have no edge leading to non-recoverable vertexes, as seen in
+Figure
+
+7
+. The coordinator finds boundaries by periodically searching the graph. To ensure the existence of closures, we additionally require the following:
+
+Definition 4.1
+.
+
+(Commit Ordering Rule)
+A^{x}_{y}
+is allowed to receive a message from
+
+B^{m}_{n}
+only if
+y\geq n
+.
+
+This ensures that for any vertex
+A^{x}_{y}
+, the set of vertices with persistence number
+\leq y
+is a closure that includes
+A^{x}_{y}
+. This modification prevents degenerate cases where a failure may roll back arbitrarily many vertices (i.e., the domino effect
+[
+39
+]
+). The libDSE runtime blocks an action from starting if the message it receives violates the commit ordering rule until local persistence has caught up. Note that this will not lead to deadlock situations, as local persistence can always advance in our system without depending on other participants.
+
+Recovery Protocol.
+
+Failures lead to vertex loss on the dependency graph, and the system state is inconsistent iff any surviving vertex has an edge into a lost vertex. To recover, the system must roll back vertices until no such violations exist. The primary challenge here is that the system must achieve
+consensus
+on rollbacks; otherwise, overlapping failures or out-of-sync view of the dependency graph may result in different parts of the system recovering to different closures and creating inconsistency in the process. For simplicity, our protocol relies on the coordinator (which embodies consensus as a “leader” of the cluster) to make a unilateral decision. As part of this consensus, the coordinator also assigns a monotonically increasing and unique failure sequence number to the rollback (i.e., the global failure counter from before). Each participant of the rollback then recover to the prescribed state at their own pace. This creates a temporary split of the cluster into pre-recovery and post-recovery halves. libDSE identifies communications between them using the different global failure counter values messages carry, and disallows such communication for safety. Additionally, each
+StateObject
+recovers strictly in order of assigned failure sequence number. To summarize:
+
+Definition 4.2
+.
+
+(Recovery Sequencing Rule)
+A^{x}_{y}
+is allowed to go to
+A^{x+1}_{z}
+if and
+only if
+A
+successfully completes the rollback request for failure sequence number
+x
+.
+
+Definition 4.3
+.
+
+(Recovery Partition Rule)
+A^{x}_{y}
+is allowed to receive a message from
+
+B^{m}_{n}
+only if
+x=m
+. If
+m<x
+, the message is discarded; otherwise, its
+receipt must be delayed.
+
+Correctness Sketch.
+Because our protocol is mostly a restatement of the DPR protocol in a message-passing model, its correctness largely follows from DPR (we discuss our new coordinator design in the next subsection). What is left then is to demonstrate that our model and the DPR cache-store model are equivalent. On a high-level, each libDSE
+StateObject
+can be thought of as the combination of a cache-store and an execution thread that allows the
+StateObject
+to update the cache-store in the absence of external client requests. The execution thread then is logically just a co-located DPR client that always reads the latest cache-store state before issuing a write operation to the cache-store. Message-passing can be modeled as issuing a request to a remote cache-store from this co-located DPR session. Then, one can demonstrate that after simplifications (because the DPR session only reads from the local cache-store), the libDSE protocol is equivalent to the DPR protocol.
+
+4.3
+Coordinator Design
+
+We now describe the design of our coordinator. As shown in
+Figure
+
+8
+, the libDSE coordinator, unlike DPR’s, is backed by a persistent log (either through distributed consensus like Raft
+[
+59
+]
+or reliable cloud storage) that encodes changes to the cluster state, such as membership changes and recoveries.
+
+Figure 8:
+libDSE Coordinator Design
+
+Finding Boundaries.
+Unlike DPR, libDSE automatically persists fragments of the dependency graph as part of
+StateObject
+s using the metadata parameter on
+Persist
+. This forms a distributed point of truth for the dependency graph, and the coordinator maintains a (outdated) view of the actual graph. Newly persistent versions and in-flight operations may be missing from the coordinator’s view. That said, the persistent part of the graph is
+immutable
+– future operations may add vertices, but cannot change dependencies in the past. This makes it safe for the coordinator to declare recoverable boundaries on the coordinator’s view, because any recoverable boundaries the coordinator finds on its present view must also be recoverable on a later view. Consequently, the coordinator does
+not
+persist its decisions on the failure-free path – restarted coordinators instead recompute the boundary on a more up-to-date view to find the same (or larger) recoverable boundary.
+
+Orchestrating Rollback.
+A rollback is triggered when one of the
+StateObject
+s fail, and the coordinator computes the extent of data loss by removing any vertices on the dependency graph not reported as persistent by the restarting
+StateObject
+.
+Then, it iteratively removes vertices from the graph until no surviving vertex has a dangling edge. As discussed in
+Section
+
+4.2
+, on failure, the coordinator must achieve
+consensus
+between
+StateObject
+s on what the final state of the graph is in response to the restart. This is achieved by synchronously persisting the failure (by assigning it a failure sequence number) and the rollback actions proposed, before releasing the decision to the rest of the cluster on the log.
+
+Coordinator Recovery.
+Even though the coordinator is stateless, when a coordinator fails, the system must still perform some necessary steps to ensure correctness. On recovery, the new coordinator needs to reconstruct the cluster state, including previous rollback decisions and the list of active participants by replaying the persistent log. It then re-sends recent rollback decisions and asks for every participant to send locally stored dependency graph segments, which guarantees a view of the dependency graph that is more up-to-date than before the failure. The coordinator cannot answer
+queries about the current recovery boundary or before every participant has responded to ensure a complete view of the graph.
+
+5
+Implementation and Discussion
+
+5.1
+Putting it Together: libDSE Runtime
+
+The libDSE runtime implements the aforementioned programming model, and connects each
+StateObject
+to the coordinator we just presented. In total, the core libDSE and coordinator implementation consists of around 4000 lines of C# code.
+
+Framework Integrations.
+libDSE has built-in integration with gRPC
+[
+21
+]
+and ASP.NET
+[
+6
+]
+. To create a speculative service, users first write the service API using vanilla gRPC, encapsulate the state with a
+StateObject
+, and implement the generated gRPC stub using the libDSE API. libDSE provides an optional gRPC interceptor
+[
+23
+]
+that automatically injects action boundaries and barriers where appropriate before and after RPC handlers execute, and uses the HTTP headers to transparently pass libDSE headers, hiding speculation from the average developer altogether. Advanced users can disable the interceptor and manually call libDSE APIs where necessary. Finally, all background logic of libDSE is packaged as a ASP.NET managed service, and users can start an ASP.NET-based speculative service simply by declaring these dependencies and leaving the rest to the ASP.NET framework.
+
+Synchronization.
+libDSE uses biased locking
+[
+63
+,
+36
+,
+52
+,
+53
+]
+to implement actions and ensure scalability. Essentially, each action executes under shared lock while
+Persist
+and
+Restore
+execute under exclusive lock.
+
+StateObject
+Life Cycle.
+When starting an application,
+StateObject
+s first
+Connect
+to a the coordinator to report its presence with a predetermined unique ID. If a
+StateObject
+that has already reported starting does so again, libDSE treats this as indicative of a failure. This triggers cluster level recovery which sends each affected runtime node a request to recover to a specific point. This assumes that external systems (e.g., Kubernetes) detect down services, replace them, and attempt to reconnect, but this is not a fundamental restriction. When
+Connect
+returns, libDSE has registered the calling
+StateObject
+as the legitimate incarnation which may start sending and receiving messages. libDSE guarantees that any messages received from or sent to the previous incarnation will eventually be rolled back, but it is up to service implementers to ensure that two incarnations do not simultaneously update persistent state. It is not necessary for a service to explicitly disconnect from a libDSE coordinator, as long as it persists all of its outstanding state before becoming inactive.
+
+5.2
+Building Speculative Services
+
+We implement four cloud building blocks using libDSE:
+
+Speculative Log.
+We implement a speculative write-ahead log based on the open-source FasterLog
+[
+19
+]
+project, and it serves as the basis for our implementation of other speculative services. The most significant change required from a standard log implementation is attaching custom metadata with
+Persist
+calls. We achieve this by designing special commit records that hold metadata, and appending them to the end of a log at the beginning of
+Persist
+. Recovering or rolling back simply drops all log entry after the latest surviving commit record. Our speculative wrapper maintains an in-memory mapping of (unpruned) commit records and their offsets within the log to speed up this operation, and rollbacks are directly done using this mapping. The mapping is persisted as metadata to avoid scanning the log on recovery. Overall, the speculative log is about 200 lines of wrapper code around FasterLog and took around 2 person-hours to complete.
+
+Key-Value Store.
+We implement a speculative key-value store based on the open-source FASTER Key Value store
+[
+18
+]
+, which powers production systems such as Orleans
+[
+29
+]
+, Durable Functions
+[
+8
+]
+, and Garnet
+[
+24
+]
+. We use libDSE’s gRPC integration to add request handling to FASTER, originally an embedded key-value store. Our speculative implementation, including stored-procedures for our workload (discussed later), is about 400 lines of C# code.
+
+Speculative Workflows.
+We then build a speculative workflow orchestration engine, similar to Durable Functions and Temporal. Our implementation follows the CReSt model used in DARQ
+[
+50
+]
+, and achieves speculative durable execution by performing atomic transitions of state on a speculative persistent log. Note here that our implementation only includes the core backend logic of workflow engines, and omit the front-end code-as-workflow infrastructure and supporting features such as durable timers. Overall, the speculative workflow engine contains about 200 lines of C# code.
+
+Event Broker.
+Lastly, we implement a speculative event broker system similar to Kafka
+[
+47
+]
+and EventHubs
+[
+7
+]
+, with a collection of producers and consumers interacting through disjoint topics. Each topic is backed by a collection of partitions, implemented with speculative logs. We build the event broker service again using gRPC, but with manual libDSE integration to allow for streaming gRPC calls. Our broker uses the DARQ API
+[
+50
+]
+for exactly-once processing. Building the system took about 10 person-hours and around 800 lines of C# code.
+
+5.3
+Limitations
+
+Both the original DPR and our modified protocol rolls back more state than necessary in the case of a failure – in-flight messages and concurrent operations may introduce new dependencies not yet visible to the coordinator, and without additional protocols, the coordinator must draw the rollback boundary based on the immutable, persistent portion of the graph, which results in all participants rolling back their latest in-memory content. In practice, we mitigate this issue by skipping rollbacks of a local version if a
+StateObject
+does not depend on any uncommitted state. This ensures, for example, that participants not exposed to speculative state are never impacted by rollbacks. For further optimization, participants need to vote on the rollback boundary on failure instead; we leave this for future work. The primary issue with libDSE and the DSE model is that existing applications cannot transparently benefit from these techniques. Developers must switch to speculative building blocks or implement their own to get the most out of DSE. That said, the migration can be incremental, as libDSE is backward-compatible with existing services via barriers. The DSE framework and protocol is not designed for replicated services; while simple state machine replications approaches
+[
+64
+]
+can be thought of as an alternative persistence backend in
+StateObject
+s, quorum-based systems or systems with weaker guarantees (e.g., Dynamo
+[
+34
+]
+) do not have a clear “restart” semantic and therefore are not easily modeled in DSE. Lastly, because of the commit ordering rule, libDSE performs best when communicating services persist at roughly the same pace (e.g., every 10ms), so it is less likely to delay messages or force persistence. In cases where services need to be out of sync, additional mechanisms are required – for example, one might allow recipient of a message with persistence number difference bounded by a fixed number or ratio. We leave more detailed exploration of these topics for future work.
+
+6
+Evaluation
+
+Our evaluation studies the following research questions:
+
+•
+
+Does DSE help applications reduce end-to-end latency?
+
+•
+
+What overhead does libDSE impose on applications?
+
+•
+
+Does libDSE scale to large numbers of participants or high concurrency on a single service?
+
+Experimental Setup.
+
+We run all of our experiments on the Azure public cloud. For end-to-end experiments, we build the applications using the popular gRPC + ASP.NET stack and deploy them onto Kubernetes cluster. We use a managed Azure Kubernetes Service (AKS) cluster
+[
+28
+]
+; all workloads are scheduled onto a pool of 10 Standard_D8s_v3 machines
+[
+15
+]
+with attached premium locally redundant storage SSDs
+[
+9
+]
+. Unless otherwise specified, all libDSE services run with a group commit frequency of 10ms. For microbenchmarks, we use a pair of D32s_v3 machines
+[
+15
+]
+(as client and server), each with 32 vCPUs and 128 GB of RAM.
+
+6.1
+End-to-End Benchmarks
+
+(a)
+Varying #Services
+
+(b)
+Varying Load
+
+Figure 9:
+
+TravelReservations
+
+TravelReservations.
+We first assemble a travel reservation system based on DeathStarBench
+[
+40
+]
+. Similar to previous work
+[
+71
+,
+43
+,
+73
+]
+, we focus on the
+write
+portion of the workload, where the speculative workflow engine reserves a series of items, one from each service (e.g., hotel, flight, car-rental) backed by our speculative KV store using sagas
+[
+31
+]
+.
+Because prior systems such as Beldi and Boki are built on different stacks (golang + AWS + Lambda), our system is not directly comparable with them. Instead, as a baseline, we simulate systems such as Beldi and Boki by turning off speculation in our system; doing so will cause our system to perform the same number of synchronous persistence as Beldi/Boki would, but normalize performance of other parts of the system so they are comparable with our implementation. All benchmarks run for 120 seconds.
+Figure
+
+9
+shows the result of our experiment. On the left we report the average and 95th-percentile latency when varying the number of services involved, while issuing at a low rate of 10 workflows per second for accurate latency measurements. When the number of services increase, the latency of the baseline linearly increases due to synchronous persistence. Our DSE implementation, on the other hand, experiences only minor latency increase stemming only from increased RPC work instead of synchronous persistence.
+We further demonstrate that DSE has no detrimental effects on scalability by fixing the number of services to 3, and varying the arrival rate of workflows. As shown on the right side of
+Figure
+
+9
+, both versions of our implementation scale up to thousands of workflows without performance degradation, similar with numbers reported by Beldi, Boki, and ExoFlow.
+
+(a)
+c=10ms
+
+(b)
+c=500ms
+
+(c)
+bytes written
+
+Figure 10:
+
+EventProcessing
+
+Event Processing.
+We use our speculative event broker to implement the the search trend alert workload as described in the DARQ paper
+[
+50
+]
+(available in open-source), with three processing stages communicating with each other through events in a streaming fashion.
+We compare our implementation with the original, non-speculative version of DARQ.
+Figure
+
+10
+shows the result of our experiment. We issue a pre-generated trace of events at a steady rate of 50k events/s for 120 seconds, varying the group commit frequency (
+c
+). The first two plots demonstrate latency savings, where DSE drastically reduces the end-to-end latency of the workload. Importantly, in the case of stream processing, DSE is more than a latency saving; the bottom graph shows the number of bytes written to storage during execution, and as shown, DSE offers significant reductions in storage bandwidth. This is because, as an optimization, if an intermediate processing result is generated, consumed, and pruned from the system during speculative execution, it never needs to reach storage. Hence, as shown in
+Figure
+
+10
+, this storage saving is more profound with a large group commit period, which increases the probability that intermediate results never reach storage.
+
+(a)
+speculative
+
+(b)
+non-speculative
+
+Figure 11:
+
+TwoPhaseCommit
+
+Two Phase Commit.
+Finally, we build a textbook two-phase commit protocol
+[
+55
+]
+using libDSE. The benchmark cluster consists of one commit coordinator and four commit participants, each writing to their own (speculative, when speculation is enabled) log. Each transactional client first (without waiting for persistence) writes a log record to each participant signaling the start of a transaction, and then issues a request to the coordinator to begin commit. Participants always vote yes unless the commit start record has been lost due to a failure. Note that our implementation only contains the commit logic and does not include any actual data operation. We issue 30000 transactions from 8 concurrent closed-loop clients to the coordinator, and plot the commit latency of each transaction in
+Figure
+
+11
+. As seen, in the non-speculative version, commit latency clusters around multiples of 10, which is the group commit frequency. There are a few “lucky” transactions that complete the first round of messages at the end of the last group commit and therefore finish close to 10ms, but most transactions wait for longer. With speculative execution, the distribution becomes less bimodal, as prepare messages no longer wait for commit, and much more frequently, commits finish under 20ms (i.e. do not wait for two group commits).
+This leads to average latency savings of about 5ms.
+
+6.2
+Recovery
+
+(a)
+speculative
+
+(b)
+non-speculative
+
+Figure 12:
+
+EventProcessing-recovery
+
+Event Processing.
+We first show realistic recovery by running the EventProcessing workload from the previous section and killing one of the event handling nodes in kubernetes at the 30 second mark. Kubernetes then automatically restarts the failed node on a new container, which triggers libDSE to recover when the new node starts. Processing is temporarily halted to the failed node as gRPC requests to it timeout and are retried. Recall that compared to non-speculative applications, speculative applications additionally perform rollback recovery after the failed node restarts. As seen in
+Figure
+
+12
+, both versions of the application takes around 10 seconds to recover, which mostly stems from container restart. The overhead of speculative recovery is negligible compared to restart.
+
+(a)
+speculative
+
+(b)
+non-speculative
+
+Figure 13:
+
+TwoPhaseCommit-recovery
+
+Two Phase Commit.
+To further study the effect of speculation on recovery performance, we construct a recovery scenario based on the two-phase commit workload. We force one of the transaction workers to atomically rollback to a previously committed state, losing all uncommitted state, simulating an instantaneous fail-over to a stand-by. This represents the theoretical best case recovery performance, which leaves only recovery overhead induced by speculative execution. To increase the complexity of recovery, we increase the number of concucrrent clients to 64 in this experiment. We plot the results in
+Figure
+
+13
+, where red dots represent aborted transactions. Firstly, we observe that in both cases, recovery is very fast and does not create a noticeable gap in operations, except through aborted operations. In comparison, however, speculative recovery results in more aborts. This is because aborts can only come from committers losing transaction start records in the non-speculative case, but libDSE will aggressively rollback any potentially inconsistent state, aborting more transactions than necessary.
+
+To summarize, even though DSE makes recovery more expensive and complex, and could aggressively rollback more work than necessary, it does not negatively impact applications because recovery itself is rare and already expensive.
+
+6.3
+Microbenchmarks
+
+Finally, we present a series of microbenchmarks to study the overhead of various libDSE mechanisms.
+
+Figure 14:
+
+Overhead of libDSE instrumentation
+
+Overhead of libDSE Instrumentation.
+We first study the latency and throughput overhead of libDSE’s message instrumentation protocol on a service. We study three versions of the FASTER-based key-value store from the hotel reservation benchmark, two with libDSE (DSE) and another as a thin RPC wrapper around the vanilla FASTER code (no DSE). To study the effects of the interceptor mechanisms vs the instrumentation protocol itself, we also build one version that process libDSE headers in user code (DSE-manual) and another one that does so transparently with gRPC interceptors (DSE-interceptor). We vary request issue rate for each configuratio nto investigate the resulting latency-throughput trade-off. As seen in
+Figure
+
+14
+, libDSE with interceptors results in slightly higher latency when the system is not saturated and around 25% lower maximum throughput. This is mostly due to the additional work entailed by the gRPC interceptor mechanism (e.g., HTTP header manipulation). In contrast, the libDSE protocol itself causes negligible increase in latency and less than 5% reduction in throughput. This shows that the libDSE instrumentation adds only a small overhead to applications.
+
+(a)
+local-action
+
+(b)
+send-receive
+
+(c)
+detach-merge
+
+Figure 15:
+
+Thread scalability of libDSE Primitives
+
+Thread Scalability of libDSE Primitives.
+Recall that libDSE users must protect their operations with libDSE threading primitives for correct speculative execution. It is therefore important the libDSE primitives be scalable so as to not introduce new bottlenecks in an application. To measure this, we design a simple microbenchmark where threads acquire protection under a tight-loop concurrently, reporting throughput as the number of concurrent threads increase. A background thread periodically performs (empty) checkpoints to advance versions. We measure three sets of primitives: local-action, where libDSE users mark blocks of code blocks as atomic with regards to checkpointing and recovery, send-receive, where libDSE users start an action using a (randomly pre-populated) header and writes the resulting dependencies to another header at the end of action, and finally detach-merge, where libDSE users create a new sthread from the current dependencies and then merging it with the state object. As shown in
+Figure
+
+15
+, our implementation of the action primitive (based on
+[
+52
+]
+) is scalable up to 16 threads with no adverse degradation of performance. As expected, send-receive is more expensive then local-action, and detach-merge than send-receive, due to the amount of computation involved. However, all three primitives can sustain millions of operations per second on a single server, making it unlikely to be a bottleneck in typical RPC-oriented workloads that only see 100s of thousands of operations per second per node.
+
+7
+Related Work
+
+Durable Execution and Workflows.
+Durable Execution, as a term, is first coined by Temporal
+[
+10
+]
+, and widely accepted in industry
+[
+14
+,
+32
+,
+13
+,
+17
+,
+27
+,
+20
+,
+22
+,
+16
+]
+, although it is similar to the earlier concept of virtual resiliency
+[
+4
+,
+42
+]
+.
+Workflow systems
+[
+5
+,
+11
+,
+25
+]
+, orchestrate execution of a directed acyclic graph (DAG) of tasks, and is widely used in industry to compose complex applications from individual components. Workflow systems are some of the earliest adopters of durable execution, providing exactly-once guarantees over the DAG.
+Systems such as Azure Durable Functions
+[
+8
+]
+, and Temporal
+[
+30
+]
+achieves this by synchronously persisting workflow state before starting new steps; external effects of execution are wrapped in special abstractions (e.g., activities in Temporal and DF) and required to be idempotent for resilience. ExoFlow
+[
+73
+]
+is a recent workflow system that allows developers to take advantage of determinism and rollbacks within the workflow for better performance. Developers mark parts of their workflow as deterministic or rollback-capable, and ExoFlow will bypass synchronous persistence where possible, using replay and rollback to recover when necessary. In contrast, libDSE works for any message-passing fail-restart application, and does not rely on determinism.
+
+Cross-Service Transactions.
+Other systems, such as Olive
+[
+65
+]
+, co-locate service state and orchestration state onto one unified storage layer, providing exactly-once guarantees without requiring idempotence, but also forces developers to migrate to their storage engine. While Olive used existing database services (e.g., Azure Tables), Boki
+[
+43
+]
+showed that a shared log abstraction can provide more performance and usability benefits, and Halfmoon
+[
+61
+]
+further optimizes Boki to reduce the amount of information logged. One advantage of this architecture is that the unified storage layer can be engineered to support distributed transactions
+[
+71
+,
+67
+]
+. Orleans, of particular note, implemented early lock release
+[
+41
+,
+35
+,
+37
+,
+3
+,
+38
+]
+to reduce latency, which is similar to DSE. In contrast, libDSE is designed to work for heterogeneous storage engines, and do not implement transactional semantics (transactions can optionally be layered on top). While some protocols allow distributed transactions across heteregenous storage engines
+[
+1
+,
+46
+,
+72
+]
+, they are not widely used currently to our knowledge. Finally, DBOS
+[
+12
+,
+45
+]
+proposes to build all services and runtime layers on top of distributed transactional DBMS, but would require an even more radical rewrite of existing technology stacks than libDSE.
+
+Other Related Work.
+Fault-tolerance in microservice-oriented cloud applications can be viewed as a modern instantiation of asynchronous recovery in message-passing systems, which was heavily studied in prior work
+[
+39
+]
+.
+The programming model of libDSE is similar in concept to actor systems
+[
+29
+]
+, where distributed stateful objects communicate through asynchronous method calls, but usually without resilience guarantees.
+Dataflow systems are conceptually similar to workflow systems and compose distributed components, but usually have the benefit of known application semantics (i.e, composed components are operators such as filter and map, rather than blackbox code). Consequently, dataflow systems predominantly use lineage-based techniques to reconstruct application state on failure
+[
+70
+,
+56
+,
+69
+]
+. libDSE is, at its core, a checkpoint-based recovery scheme, which assumes no such domain-specific knowledge. Finally, Speculator
+[
+57
+]
+and xsyncfs
+[
+58
+]
+similarly uses speculative execution to speed up file system operations transparently. However, they are different from DSE in two key aspects. Firstly, speculator and xsyncfs are
+client-centric
+: each client process is responsible for checkpointing their own state, blocking operations that externalize speculative state, and rolling back on failed speculation. File servers never store speculative state. In contrast, in DSE, distributed participants collaborate on speculative state and coordinate to repair state after failure. Secondly, DSE application only speculate on whether operations are lost (i.e., wait for the operation to complete, but not persistence), whereas speculator attempts to speculate on the result (i.e., do not wait for the operation to complete, but guess the result). This is because failed speculation is cheap for speculator, as rollbacks are localized to client processes. DSE rollbacks, in contrast, involve distributed coordination among many affected components, and should only be triggered when necessary (i.e., when an actual failure occurs).
+
+8
+Conclusion
+
+We presented distributed speculative execution (DSE), a novel approach to reduce persistence overhead in durably executed clodu applications. Through our framework, libDSE, we demonstrate that DSE is both practical and beneficial for performance, and that its complexities can be effectively hidden from most developers through the use of abstractions. We built 4 speculative services using libDSE and evaluated 3 end-to-end applications assembled from those building blocks. Our results show that DSE significantly reduces latency. We envision DSE to be a key technique in building future highly distributed cloud applications.
+
