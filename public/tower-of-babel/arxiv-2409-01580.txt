@@ -1,0 +1,1412 @@
+Foreactor: Exploiting Storage I/O Parallelism with Explicit Speculation
+Guanzhou Hu, Andrea C. Arpaci-Dusseau, Remzi H. Arpaci-Dusseau
+
+Abstract
+We introduce explicit speculation , a variant of I/O speculation technique where I/O system calls can be parallelized under the guidance of explicit application code knowledge. We propose a formal abstraction – the foreaction graph – which describes the exact pattern of I/O system calls in an application function as well as any necessary computation associated to produce their argument values. I/O system calls can be issued ahead of time if the graph says it is safe and beneficial to do so. With explicit speculation, serial applications can exploit storage I/O parallelism without involving expensive prediction or checkpointing mechanisms. Based on explicit speculation, we implement Foreactor, a library framework that allows application developers to concretize foreaction graphs and enable concurrent I/O with little or no modification to application source code. Experimental results show that Foreactor is able to improve the performance of both synthetic benchmarks and real applications by significant amounts (29%-50%).
+
+
+
+1
+Introduction
+
+I/O-intensive applications, ranging from command-line file utilities to complex databases and key-value stores, play significant roles in today’s computing infrastructure. They spend the majority of time in I/O system calls, accompanied with a relatively small amount of auxiliary compute to drive the system calls based on their internal data structures. For example, we observe that a
+Get
+operation in LevelDB
+[
+10
+]
+, an LSM-tree-based key-value store, spends roughly 75% of time in
+pread
+system calls on an NVMe NAND solid-state drive (SSD) when memory capacity is limited.
+
+On the hardware side, the evolution from legacy hard disk drives (HDDs) to modern NVMe SSDs on PCIe links has dramatically reduced device latency and improved maximum bandwidth. A hidden trend alongside the advances in storage media is that devices are offering a higher degree of internal parallelism. Modern SSDs are composed of multiple independent units, in layers of channels, packages, dies, and planes. Moreover, a single machine could be equipped with an array of multiple storage devices. Combined with an increasing number of CPU cores and larger memory capacity, it is often desired to maintain a sufficient amount of concurrent I/O requests in parallel to fully utilize storage device bandwidth. We refer to this effect as
+storage I/O parallelism
+and visualize an example of it on an NVMe SSD in Figure
+1
+.
+
+Figure 1
+:
+Throughput vs. I/O Concurrency on single NVMe SSD.
+
+Dashed blue line shows sequential access steady throughput; solid lines show random mixed read-write throughput with different request sizes.
+
+I/O speculation is an ideal technique to exploit I/O parallelism by issuing I/O requests speculatively ahead of time. Current I/O speculation techniques can be categorized into speculative execution and speculative prefetching, each having its limitations. Speculative execution
+[
+8
+,
+21
+,
+23
+,
+16
+,
+35
+]
+moves slow I/O requests to background threads and uses predicted results to continue the application’s foreground execution. It is mostly applied to write-only workloads whose results are easier to predict and requires a rollback mechanism in case of wrong prediction. Speculative prefetching
+[
+4
+,
+5
+,
+26
+,
+20
+]
+guesses what parts of data are likely to be read in the near future and prefetches them in the background. It is restricted to read-only requests in a cache system context.
+
+We propose
+explicit speculation
+, where I/O system calls are speculatively issued under the guidance of explicit knowledge derived from application code analysis. We summarize such explicit knowledge into
+foreaction graphs
+, a formal abstraction that describes the exact order of I/O system calls that could happen within an application function, as well as any necessary computation required to produce their argument values. An I/O system call can be issued ahead of time if the graph says it is safe and beneficial to do so. With the help of foreaction graphs, explicit speculation does not predict system call results, does not require a checkpointing mechanism, can be applied to a wider range of I/O system calls, and does not assume a cache system context.
+
+Based on the explicit speculation technique, we implement Foreactor, a library framework that brings concurrent I/O into applications with little or no modification to their source code. To enable explicit speculation for a chosen application function, the developer draws its foreaction graph, describes it as a plugin code file to be put alongside application source code, compiles it with the application, and pre-loads the libforeactor dynamic library when running the application. Foreactor intercepts POSIX library invocations on system calls and consults the foreaction graph for submitting the next few system calls that are foreseen to happen. Foreactor incorporates both
+io_uring
+, a recent Linux kernel asynchronous I/O interface, and a general user-level thread pool as the backend engine to efficiently delegate I/O system calls to background threads.
+
+We evaluate Foreactor with real application workloads and show that it improves the performance of the
+du
+command-line utility by 50%, the
+cp
+utility by 29%, B+-tree scan and bulk-loading by up to 37%, and the LevelDB Get operation with YCSB by up to 34%. We also demonstrate the benefits of separating the foreaction graph abstraction from specific backend implementations; with a seamless switch to a user-level thread pool backend, Foreactor achieves an 18% speedup for B+-tree bulk workloads.
+
+The rest of this paper is organized as follows. §
+2
+provides background on storage I/O parallelism and existing software techniques to exploit this effect. §
+3
+describes explicit speculation and defines the foreaction graph abstraction. §
+4
+presents a case study of a few suitable application workloads. §
+5
+describes the design and implementation of the Foreactor framework. §
+6
+presents experimental evaluation results of Foreactor. §
+7
+provides additional discussion on some practical aspects. §
+8
+summarizes related work, and §
+9
+concludes the paper.
+
+2
+Background
+
+We provide background on storage I/O parallelism and existing software techniques to exploit such parallelism, and discuss their limitations in this section.
+
+2.1
+Storage Device Parallelism
+
+Persistent storage devices are often built upon multiple smaller units of storage media. In flash-based SSDs – which have become increasingly popular in today’s storage systems – there are multiple levels of smaller units, namely
+channels
+,
+packages
+,
+dies
+, and
+planes
+, contributing to the aggregate bandwidth. The flash controller inside an SSD device can manage up to 10 independent channels. Each channel connects multiple flash memory chips, called packages. Each package is in turn composed of multiple dies (for interleaving) or planes (for true parallelization)
+[
+1
+,
+11
+]
+.
+
+The maximum effective throughput out of a storage device is reached when all of its independent units are operating on data being requested by the user. To make this goal easier to achieve, data is often divided into small chunks, e.g. 512B sectors or 4KB pages, and striped across all units in such granularity. If an I/O request is large enough to span an entire stripe, then all units work together at the same time on fetching or manipulating one chunk of data, delivering full device bandwidth. However, I/O request sizes vary and are often much smaller than the size of a stripe. In general, it is required to maintain a sufficient amount of concurrent I/O requests on the fly, such that their addresses statistically cover all units of storage media. The number of concurrent I/O requests is often referred to as the queue depth (QD). Depending on the average request size of a workload, a QD of 16 or higher may be necessary to fully utilize device bandwidth
+[
+11
+,
+40
+]
+.
+
+Additional CPU power and memory capacity is required to maintain concurrent I/O requests. Luckily, modern machines are equipped with exponentially more CPU cores and larger main memory, allowing them to support higher I/O concurrency to fully exploit the effect of storage I/O parallelism as shown in Figure
+1
+. In fact, storage systems demanding extremely high throughput often manage a RAID array of independent devices
+[
+25
+,
+19
+]
+, introducing yet another factor of parallelism. For simplicity, we restrict the scope of this paper to a single SSD device.
+
+2.2
+I/O Speculation
+
+I/O speculation refers to the set of I/O optimization techniques that involve speculative work, i.e., I/O requests and/or computation that are predicted to happen and are started ahead of time, but may not eventually happen in the actual execution of the application. Current I/O speculation techniques can be categorized into two classes: speculative execution and speculative prefetching.
+
+Speculative Execution
+. Upon submitting a slow I/O request during the foreground execution of an application, instead of completing the I/O request in-place, the system offloads it to a background thread and predicts its result, then continues foreground execution assuming the prediction is correct. Speculation on the foreground thread must be paused when it reaches the point of returning an externally visible result to the user. This technique shares much similarity with speculative execution in CPU branch prediction. The foreground thread is often named the fast-path thread, since it skips slow I/O requests and speculatively executes subsequent computation (as well as submission of later dependent I/O requests). Example realizations of this technique include SpecHint – a framework for run-time I/O hint generation
+[
+4
+,
+8
+]
+, Speculator – a speculative distributed file system
+[
+21
+]
+, Speck – a parallel security check software
+[
+22
+]
+, and XsyncFS – a locally asynchronous file system batching write commits
+[
+23
+]
+.
+
+Speculative execution has two major limitations, preventing it from being useful for exploiting storage I/O parallelism. First, it must be able to generate a predicted result of any offloaded I/O request, which is hard for most read requests. Hence, it is often applied to compute-heavy workloads where I/O requests are rare, or to write-heavy workloads where all writes are predicted to return success. Second, it requires a checkpoint-rollback mechanism, e.g. undo logging, on all data touched by speculation, so that data and internal application states stay correct in cases of wrong predictions. Such mechanisms often introduce significant performance overhead.
+
+Speculative Prefetching
+. Within a cache framework context, the system makes guesses on what parts of data are going to be read in the near future and prefetches them into cache ahead of time. Read requests are either batched together or made parallel to increase overall request scale and improve bandwidth utilization. Cache read-ahead is the simplest form of speculative prefetching, where the system always favors consecutive addresses following recently accessed data. More sophisticated speculative prefetching policies, such as informed prefetching
+[
+26
+]
+, MPI-IO caching
+[
+5
+]
+, signature-based prefetching
+[
+3
+]
+, and speculative RPCs
+[
+43
+]
+have been proposed to optimize for specific applications and workload scenarios.
+
+Speculative prefetching naturally exploits I/O parallelism, yet has three restrictions limiting its generality. First, it can only be applied to stateless read requests, because argument values of speculatively issued requests come from guesses and may end up wrong. Any requests with side effects, e.g. writes, cannot be safely submitted ahead of time. Second, it assumes a cache system context and requires fine-tuned application-specific cache management policies to yield good performance. Deriving such policies is challenging and there is no standard methodology as guidance. Third, it often relies on run-time trace collection to produce reasonable guesses on future I/O requests, introducing considerable overhead.
+
+(a)
+
+Speculative Execution
+
+(b)
+
+Speculative Prefetching
+
+(c)
+
+Explicit Speculation
+
+Figure 2
+:
+Demonstration of I/O Speculation Techniques.
+
+Gray boxes represent computation. Blue boxes represent I/O requests. Dashed border means speculative content. Lightning symbol represents the return point of application function. FG stands for foreground application thread. BG stands for background I/O threads.
+
+2.3
+Asynchronous I/O and
+io_uring
+
+Besides I/O speculation techniques, applications may also be re-programmed to perform asynchronous I/O explicitly. This can be done either though manually implementing a user-level thread pool I/O engine, or by using an asynchronous I/O interface provided by the underlying operating system. A system supporting asynchronous I/O often exposes a separate pair of interfaces for I/O submission and completion, respectively. For example, the legacy Linux
+aio
+interface uses
+io_submit()
+for submissions and
+io_getevents()
+for blocking and waiting on completions. However,
+aio
+does not support decent I/O parallelization in the background.
+
+Linux kernel version 5.1 introduces
+io_uring
+
+[
+12
+]
+, a modern alternative that supports more I/O system calls, has no restrictions on request alignment and page cache configuration, and enables efficient concurrent I/O with the help of an in-kernel thread pool named
+io_
+workqueue.
+io_uring
+exposes a dual ring-queue interface, one as the submission queue (SQ) and one as the completion queue (CQ). Application calls
+io_uring_setup()
+system call once to allocate space for the two ring-queues. To submit a batch of I/O requests, the application fills a corresponding number of entries after the current SQ tail pointer, and makes a single
+io_uring_enter()
+system call to inform the kernel about the new entries. Submitted requests may be carried out either serially by one kernel thread or in parallel by multiple
+io_
+workqueue threads. An extra
+linking
+feature is provided to link requests into a chain to force them to be executed in order. To check for completions, no system calls are required and the application simply checks the position of the CQ tail pointer, which is updated by the kernel whenever a new completion entry gets filled.
+
+A primitive asynchronous I/O interface alone is not sufficient for applications to benefit from I/O asynchrony and I/O parallelism. Developers still have to do significant re-engineering of application source code to decide when and where to submit I/O requests and wait for completions. This process is largely application-specific and platform-specific – such code refactoring has to be repeated for every new application and on every different asynchronous I/O backend.
+
+3
+Explicit Speculation
+
+We propose
+explicit speculation
+, a form of I/O speculation guided by explicit knowledge derived from application code analysis. We formalize the result of code analysis as a new abstraction – the
+foreaction graph
+– which is a directed graph describing the order of all I/O-related system calls that a chosen application function could possibly issue, as well as the sources of their argument values. With the help of the foreaction graph abstraction, explicit speculation enables a general method to decide on candidates of speculative I/O requests, to pre-compute necessary argument values at appropriate times, and to maintain a sufficient amount of I/O concurrency to fully exploit storage I/O parallelism.
+
+3.1
+Motivation and Goals
+
+The idea of explicit speculation is motivated by the following four facts. First, I/O parallelism is currently under-exploited. Most I/O acceleration techniques, e.g. kernel-bypassing, focus on reducing software stack latency. Existing I/O speculation techniques improve I/O parallelism in workload-specific ways and introduce considerable overhead. Primitive asynchronous I/O interfaces require significant development effort re-writing applications to make use of them.
+
+Second, most application code logic is naturally written in a serial way and contains an explicit pattern of I/O system calls. It should be possible to formalize such knowledge accurately for general application functions and use this explicit knowledge to enable I/O speculation with low overhead.
+
+Third, the order of I/O requests, their argument values, and their mutual dependencies are the most critical information needed to enable efficient I/O speculation. However, no systematic methodology has been proposed to guide concurrent I/O based on these information.
+
+Fourth, the appearance of Linux
+io_uring
+now allows us to batch and parallelize I/O system calls in an asynchronous manner flexibly and efficiently.
+
+Accordingly, by proposing explicit speculation, we aim to achieve these goals:
+
+•
+
+Define a formal abstraction, named the foreaction graph, that statically describes all the necessary information needed of an application function to make I/O speculation decisions. (§
+3.2
+and §
+3.3
+)
+
+•
+
+Conduct case studies of code analysis on a set of applications that are suitable for concurrent I/O and derive their foreaction graphs. (§
+4
+)
+
+•
+
+Design and implement a general library framework that brings concurrent I/O into serially-written applications with the knowledge of foreaction graphs to exploit storage I/O parallelism, while introducing minimal modification to their source code. (§
+5
+)
+
+3.2
+Foreaction Graph
+
+We now define the foreaction graph abstraction formally. We make two implicit design decisions. First, we consider system calls as the granularity of I/O requests, because they naturally capture application code logic and sit on the clear boundary between userspace and the kernel. Second, we consider individual application functions, e.g. the
+DBImpl::Get()
+code path of LevelDB, as the scope of speculation. Full application analysis introduces too much complexity and is impractical for modern I/O-intensive applications. Also, their bottlenecks typically occur in just a few critical-path functions that involve bulk operations.
+
+To enable issuing I/O system calls ahead of time, we found that the following information about a chosen function’s code logic are required:
+1
+the collection of possible I/O system calls and their original order,
+2
+the argument values of each system call instance, and
+3
+the dependencies between system calls, if any. We organize these information in the form of a directed graph with annotations. Figure
+3
+shows the foreaction graph of an example application function that reads the first block of each file in a list of input files and may return early when e.g. a search pattern is found.
+
+Foreaction Graph Structure
+. Specifically, a foreaction graph is composed of the following elements:
+
+Syscall nodes
+represent I/O system calls instances and each have a certain type, e.g.
+pread
+or
+pwrite
+. A syscall node typically maps to a unique system call invocation in application source code. A syscall node is
+pure
+if it is a read-only system call that has no side effect other than possibly bringing data into the OS page cache, such as
+pread and fstat
+. We translate any
+read
+with implicit offset into a
+tell
+-
+pread
+-
+seek
+combination and consider it pure as well. Non-pure system calls, e.g.
+pwrite
+, will leave permanent side effects and thus cannot be arbitrarily issued ahead of time.
+
+Branching nodes
+represent split points into multiple possible execution paths containing different syscall node sequences. A branching node typically maps to a branching point in application code control flow, such as an
+if
+condition or a loop boundary. Note that only branching points that lead to different I/O system call sequences appear as branching nodes in the graph. An
+if-else
+block of pure computation, for example, will not appear in the graph structure.
+
+Figure 3
+:
+Foreaction Graph Example.
+
+S
+
+Start node
+is a special node representing the entrance of the function and appears exactly once in each graph.
+
+E
+
+End node
+is a special node representing the exit of the function and appears exactly once in each graph.
+
+Edges
+connect nodes together to form a directed graph. Let us first assume a graph without loops. In this case, the graph must be a directed acyclic graph (DAG) flowing from the start node as source to the end node as drain. The start node has no incoming edge and exactly 1 outgoing edge; each syscall node has 1 or more incoming edges and exactly 1 outgoing edge; each branching node has 1 or more incoming edges and 1 or more outgoing edges; the end node has 1 or more incoming edges and no outgoing edge. Based on this setup, we introduce
+loops
+into the graph by allowing an outgoing edge from a branching node to be a looping-back edge pointing to a prior syscall node or a prior branching node. Every such looping-back edge is associated with an
+epoch number
+, explained later in this section, that records the number of traversals across it.
+
+An edge could be marked as
+weak
+(and drawn as a dashed arrow), meaning the function could possibly exit early at some point during its execution on that edge. This denotation is syntactically equivalent to having an extra branching node on the edge with two outgoing edges, one to its original successor node and one to the end node.
+
+{}
+
+Annotations
+are critical information attached to nodes that specify all the necessary computation required to support I/O speculation on the graph. We explain annotations in more detail below.
+
+Node Annotations
+. Annotations control the computation of syscall node argument values and the execution flow of the graph in case of branching. They are a crucial part of the foreaction graph abstraction because they encode the explicit knowledge we need to compute system call arguments ahead of time. Each node type has its own set of annotations.
+
+A
+start node
+has one section in its annotation,
+Input
+, which is a collection of application variables whose values may be used by other nodes in the graph.
+
+Syscall nodes
+have three sections in their annotations:
+1
+
+Compute
+, which describes any necessary computation needed to produce its argument values from input application variables.
+2
+
+Args
+, which is the list of arguments, according to the type of the system call, to be used when this system call instance is to be issued speculatively.
+3
+
+Harvest
+, which specifies the action to be done after the completion of the system call to reflect its result. For brevity, when presenting a foreaction graph, if all the computation needed by a syscall node is simple logic such as array lookup, the Compute section may be omitted and inlined in the Args section. Compute may also contain a special operation called
+Link
+, which forces the backend to always submit this system call together with the next one down the graph and execute them in sequential order. This is useful when, e.g., a write follows a read in a copy loop.
+
+Branching nodes
+have one section in their annotations,
+Choice
+, which describes the computation of the branching decision, i.e., which outgoing edge to take.
+
+Annotation Variables
+. The following types of variables may appear in annotations:
+
+A
+
+Application state
+variables are ones that exist in original application code and whose values can be used directly. All application state variables used in the graph should appear in the
+Input
+annotation of the start node.
+
+I
+
+Internal extra state
+variables are ones added by the graph to help with the computation of argument values or to represent extra memory buffers needed by read-like system calls.
+
+e
+
+Epoch number
+s keep track of the number of loop iterations and are used to index array-like variables.
+
+Throughout this paper, we assume that foreaction graphs are obtained from manual analysis of application code by developers. We discuss the feasibility of automated generation of foreaction graphs in §
+7
+.
+
+(a)
+
+Metadata Stat Loop
+
+(b)
+
+Data Copy Loop
+
+(c)
+
+LSM-tree Search
+
+(d)
+
+LSM-tree Search Timeline w/ Speculation
+
+Figure 4
+:
+Representative Application Foreaction Graphs.
+
+4(b)
+,
+4(b)
+, and
+4(d)
+shows the foreaction graphs for three common application workloads.
+4(d)
+illustrates a possible execution timeline of
+4(d)
+with explicit speculation.
+
+3.3
+Principles of Speculation
+
+We then describe the principles of doing explicit speculation on a given foreaction graph and discuss the reasons behind these principles. The ultimate goal is to try to maintain a sufficient number of concurrent I/O system calls such that the aggregate request scale is large enough to yield close-to-optimal throughput, while not violating application semantic given by the foreaction graph. To achieve this goal, we obey the following guidelines.
+
+Speculate at run-time
+. Speculation of I/O system calls should happen progressively at run-time to amortize the overhead. This means both the decision making on which systems calls to pre-issue and the submission of these system calls are carried out along the way of original function execution.
+
+Peek in execution order
+. The best candidates for speculatively-issued system calls are those that immediately follow the current progress of execution, because their results are the soonest to be needed. Therefore, when preparing system calls for speculative submission, the best strategy is to peek at the next few successor nodes by following outgoing edges up to a certain depth.
+
+Compute argument values explicitly
+. Having the foreaction graph abstraction gives us the advantage of knowing how to compute system call argument values explicitly, instead of relying on run-time guesses as in speculative prefetching. Therefore, compute these values explicitly whenever possible.
+
+No unrecoverable side effects
+. Any non-pure system calls (as defined in §
+3.2
+) may leave unrecoverable side effects when issued speculatively, such as unintended writes that do not eventually happen. Instead of implementing a checkpoint-rollback mechanism with high overhead as in speculative execution systems, we choose to put a rule that any non-pure system calls could be pre-issued only if they are guaranteed to happen. This means there are no
+weak
+edges along the path from the current node of execution to the prepared candidate. This rule limits our ability to parallelize certain write-heavy functions, but greatly simplifies the correctness model.
+
+Control depth according to scale
+. The depth of peeking controls the approximate number of concurrent I/O system calls. It should be set to a value such that the aggregate request scale, i.e. average request size times depth, is large enough to fully exploit device bandwidth. For example, given an SSD of stripe size 128KB and a function containing a loop of 4KB reads, an ideal depth of peeking should be larger than 32. The optimal depth varies across different hardware platforms and workloads, and may have an obvious upper bound for functions that at most contain a certain number of I/O calls.
+
+4
+Application Case Study
+
+We do a brief case study of several I/O-intensive application scenarios, including regular I/O loops in command-line utilities, B+-tree scan and bulk-loading, and LSM-tree search. We present their foreaction graphs to demonstrate the determinism in their system call patterns and the potential of I/O parallelism exploitation.
+
+4.1
+Regular I/O Loops
+
+Functions that contain a loop of I/O requests are obvious candidates for concurrent I/O. Let us first consider a function that loops through all entries of a directory and calls
+fstatat
+on each entry to collect their metadata information. Figure
+4(b)
+draws its foreaction graph. Since all
+fstatat
+calls are pure and are independent with each other, they can be safely pre-issued in parallel. To do so, a set of internal buffers have to be created to hold the results from concurrent requests.
+
+A slightly more complex case would be a loop that copies blocks of data by reading from a source file and writing into a destination file. Figure
+4(b)
+draws the foreaction graph for this case. In each iteration of the loop, the
+write
+call depends on the
+read
+call to fetch data first, thus we cannot freely pre-issue the
+write
+s even though their argument values can be explicitly computed. The solution is to leverage the
+Link
+feature so that each read-write pair are submitted together and are forced to execute in order. Also, note that the
+read
+node does nothing in its
+Harvest
+section to avoid unnecessary memory copies – each
+write
+directly uses the corresponding internal buffer that the linked
+read
+populates.
+
+4.2
+B+-tree Scan and Bulk-loading
+
+The B+-tree is a well-known data structure for efficiently indexing both relational and key-value data. A B+-tree is an
+m
+-ary balanced search tree, where
+m
+is typically at the magnitude of 100s. Every node is a fixed-sized page containing a sorted array of keys – alongside the keys, internal nodes store page IDs of child nodes, while leaf nodes store values (or pointers to values if they reside in a separate location). Each node also maintains the page ID of its right sibling to support bulk operations. All pages of a B+-tree typically reside in a single database file on backend storage. Although an individual search or insertion is a strict pointer-chasing procedure, a scan or bulk-loading operation involves a long sequence of leaf page I/O, revealing an opportunity for I/O parallelization.
+
+In a range scan, it first traverses the tree twice for the start key and the end key, respectively, to locate their leaf pages. A sequential scan of keys from start to end is then carried out to gather key-value pairs within the range, triggering a leaf page read upon crossing any sibling pointer. This operation can be parallelized by first looking up the last level internal pages and gathering all candidate leaf page IDs, then issuing a certain number of leaf page reads in parallel. Bulk-loading could happen upon initializing a new B+-tree from a sorted stream of incoming data. Instead of traversing the tree for every key-value pair, it simply writes them into the right-most leaf node (possibly triggering splits when a node becomes full). This leads to a loop of leaf page writes.
+
+The leaf page I/O loop in scan and bulk-loading turns out to be straight-forward and can be modeled as a foreaction graph similar to the stat loop in Figure
+4(b)
+, replacing
+fstatat
+with
+pread
+or
+pwrite
+. Also, note that these two bulk operations typically happen upon initialization or on cold data, leading to inevitable cache misses.
+
+4.3
+LSM-tree Search
+
+The Log-Structured Merge Tree (LSM-tree) is a widely-used data structure for storing key-value data and is optimized towards efficient inserts/updates. Searching for a key in an LSM-tree, however, may involve a long chain of
+pread
+s through multiple files. Consider a typical LSM-tree implementation where records are stored in sorted table files. Collections of tables form levels starting with level 0. New records (including updates to existing keys) are inserted into an in-memory table first, and when it reaches certain size limit, it is dumped as a new table file and is pushed into level 0. Tables in level 0 thus may have overlapping key ranges. When a level becomes too crowded, a background compaction procedure is scheduled to merge all records in the level and dump them as table files into the lower level. In all levels starting at 1, tables within a level cover non-overlapping key ranges.
+
+A search operation involves first looking up the key in memory; if not found, it then needs to traverse through a list of table files. The list consists of all level-0 tables, from the newest to the oldest, with range covering the key, followed by at most one file per lower level. If a match is found along the way, the traversal terminates early. In the worst case, a search operation may involve 12
+\sim
+19
+pread
+s in LevelDB. Each table file is roughly 2MB in size and contains a sequence of sorted records, an index block mapping keys to offsets, and a signature footer. Looking up a key in a table involves a simple computation of index block lookup followed by a
+pread
+into the table file for the candidate data block.
+
+Figure
+4(d)
+draws the foreaction graph for the LSM-tree search operation. We would like to point out three things about the graph. First, the open branch is a rare case and is therefore omitted. Second, the
+Compute
+annotation of
+pread_data
+node captures the index block lookup, which in LevelDB’s case is a binary search. Third, the edge from
+pread_data
+to the branching node is a
+weak
+edge, because the function may terminate early if a match is found. If explicit speculation is applied to LSM-tree search, Figure
+4(d)
+illustrates a possible execution timeline when there are 12 candidate tables and the key is found in the 7th table. The needles represent timepoints where the application calls
+pread
+s. Reasoning behind the timeline will be covered in §
+5
+.
+
+5
+Foreactor: Design and Implementation
+
+We implement Foreactor, a userspace framework that enables explicit speculation in C/C++ applications. In this section, we describe the components of the framework, the essential pre-issuing algorithm, its correctness guarantees, and additional implementation details.
+
+5.1
+Framework Components
+
+The architecture of Foreactor is shown in Figure
+5
+. It is mainly composed of two parts:
+1
+
+libforeactor
+, the core dynamic library that intercepts I/O system calls and controls speculation on foreaction graphs, and
+2
+application-specific foreaction graphs written in the form of auxiliary plugin code.
+
+Libforeactor
+. Libforeactor is the core dynamic library that any application using Foreactor links against. The library plays four roles in enabling explicit speculation.
+1
+It provides an interface to plugin code for building foreaction graphs on chosen application functions and registering them for speculation.
+2
+It intercepts registered function calls as well as I/O system calls (POSIX library calls to be precise) to track the progress of code execution.
+3
+When a registered function is active, it consults the corresponding foreaction graph and pre-issues a certain number of I/O system calls ahead of time, using the algorithm explained in §
+5.2
+.
+4
+It manages an asynchronous system call engine, by default Linux
+io_uring
+, to submit concurrent I/O system calls and harvest their completions.
+
+Figure 5
+:
+Overview of Foreactor Architecture.
+
+Foreaction Graph as Plugin Code
+. To materialize a conceptual foreaction graph into code that libforeactor understands, a plugin file should be created and put alongside application source code. Suppose the target function to be optimized is
+f
+, its plugin file should contain the following content.
+
+First, a builder function is required to programmatically compose the foreaction graph structure. Libforeactor provides APIs including
+AddSyscallNode()
+,
+AddBranchingNode()
+,
+SyscallSetNext()
+, as well as
+BranchAppendChild()
+. The builder function is invoked only once upon the first invocation of
+f
+.
+
+Second, a wrapper function is needed to shadow
+f
+and capture the values of all necessary input variables that appear in the
+Input
+annotation.
+
+Third, each syscall node requires two custom helper stubs to realize their attached annotations:
+
+ComputeArgs(epoch, *args...) -> (ready, link);
+SaveResult(epoch, rc) -> void;
+
+Specifically,
+ComputeArgs()
+implements
+Compute
+and
+Args
+sections of the annotation, while
+SaveResult()
+implements
+Harvest
+.
+ComputeArgs()
+either produces the system call’s argument values from current input variables, or returns non-ready to indicate that arguments values cannot be produced yet at this time point. The link flag is returned true to indicate that this system call should be linked with the next one down the graph upon submission, as explained in §
+3.2
+.
+SaveResult()
+is evaluated exactly once per syscall node (and per epoch if there are loops) to retrieve its return code in case it was issued speculatively in the background.
+
+Fourth, each branching node needs a
+ComputeArgs()
+stub that produces the branch decision, which corresponds to the
+Choice
+annotation. It may also return non-ready to indicate that the branch decision cannot be made yet at this time point.
+
+An application could have multiple functions registered with Foreactor, in which case there will be multiple foreaction graphs and hence multiple plugin files. Every foreaction graph instance is per-thread local, meaning that a multi-threaded application could have multiple threads executing the same function, each performing explicit speculation with Foreactor independently.
+
+Build System Modification
+. To activate Foreactor, no modification to application source code is required. However, minor modification to its build system is needed to include the compilation of plugin file and the linking of it with the rest of the application. Alternatively, the application could include its plugins explicitly around wrapped functions.
+
+5.2
+Pre-issuing Algorithm
+
+Algorithm 1
+
+Pre-issuing Algorithm
+
+Data:
+
+peek
+depth
+, intercepted node
+frontier
+
+1
+
+n = frontier.next
+,
+e = frontier.out_edge
+;
+
+2
+
+weak = false
+;
+
+3
+
+while
+
+depth-- > 0
+and
+n
+is not null
+do
+
+4
+
+if
+e
+is weak, set
+weak = true
+;
+
+5
+
+while
+
+n
+is branching node
+do
+
+6
+
+n
+=
+n.ChooseBranch()
+;
+
+7
+
+if
+n
+is null,
+goto
+line
+1
+;
+
+8
+
+end while
+
+9
+
+ready = n.ComputeArgs()
+;
+
+10
+
+if
+
+ready
+and not (
+weak
+and
+n
+non-pure)
+then
+
+11
+
+io_uring.Prepare(n)
+;
+
+12
+
+end if
+
+13
+
+n = n.next
+,
+e = n.out_edge
+;
+
+14
+
+end while
+
+15
+
+io_uring.SubmitAllPrepared()
+;
+
+16
+
+if
+
+frontier
+not in
+io_uring
+
+then
+
+17
+
+invoke
+frontier
+synchronously;
+
+18
+
+else
+
+19
+
+io_uring.WaitCompletion(frontier)
+;
+
+20
+
+frontier.SaveResult()
+;
+
+21
+
+end if
+
+22
+
+frontier = frontier.next
+;
+
+At the heart of Foreactor is a pre-issuing algorithm that controls I/O speculation on foreaction graphs, designed according to the principles listed in §
+3.3
+. This algorithm is invoked upon every I/O system call interception when a registered function is active. Pseudocode of the algorithm is given in algorithm
+1
+.
+
+We would like to point out the critical steps of the algorithm that reflect our design principles. We denote the current intercepted syscall node as the
+frontier
+node. First of all, this algorithm is invoked upon every intercepted syscall node and stops after a certain depth of peeking beyond this node as line
+1
+suggests, which corresponds to the speculate-at-run-time principle. Second, peeking is done in code execution order by always following outgoing edges in line
+1
+. Third, argument values are computed explicitly in line
+1
+. Fourth, line
+1
+keeps track of whether there are any weak edges along the path, and line
+1
+permits a non-pure syscall node being speculatively issued only if there are no weak edges on the path from frontier. Lastly, prepared system calls are submitted to
+io_uring
+as a batch of entries in line
+1
+to reduce the number of actual user-kernel boundary crossings.
+
+5.3
+Correctness Guarantees
+
+Since plugin files are compiled directly with the application, they have the visibility of application states and the ability to change them. If the following two rules are obeyed when composing a plugin file, then it is guaranteed that Foreactor will maintain correctness of data during the process of speculation and will not corrupt the application’s original semantic.
+
+Keep input variables read-only
+. All application state variables that appear in the
+Input
+annotation should remain read-only throughout the plugin file. The only exceptions are destination buffers of
+fstat(at)
+,
+(p)read
+, and
+getdents
+system calls, which for sure would be modified by the original function anyway.
+
+Obey external synchrony
+. Nightingale et al. have defined the correctness model of
+external synchrony
+for local file I/O in
+[
+23
+]
+. Specifically, a system that deploys asynchronous I/O is externally synchronous if an external observer, in this case the user of the application, cannot distinguish the output of the system from its original synchronous counterpart. In our case, if all syscall nodes in a foreaction graph are
+pure
+, i.e. read-only, this is trivially true. If there are non-pure syscall nodes, then the developer must ensure that the foreaction graph structure matches application code and that all
+weak
+edges are marked correctly. If so, a non-pure system call instance can be speculatively issued only if it is guaranteed to be invoked, thus not leaving any unwanted side effects that the original synchronous version would not make.
+
+5.4
+Implementation
+
+We implement Foreactor with 7.5k lines of C++ code, excluding any application-specific plugin files. The length of a plugin file may vary from tens to hundreds of lines, depending on the complexity of its foreaction graph.
+
+Function Call Interception
+.. Foreactor intercepts chosen application functions through a linker
+--wrap
+option trick. Given function
+f
+, this option allows us to supply a wrapper function named
+__wrap_f()
+and invoke the original
+f
+through symbol
+__real_f()
+. Alternatively, developers could directly inject wrapper code in-place around candidate functions.
+
+System Call Interception
+. Libforeactor is required to be
+LD_PRELOAD
+ed when running the application, in order to intercept POSIX library calls corresponding to I/O system calls. Currently supported system calls include
+open(at)
+,
+close
+,
+(p)read
+,
+(p)write
+,
+fstat(at)
+, and
+getdents
+.
+
+Asynchronous Backend Engine
+. By default, Foreactor uses Linux
+io_uring
+as the backend asynchronous system call engine. It also supports a built-in user-level thread pool engine with the same semantic as
+io_uring
+as an alternative to support older kernel versions and to improve debuggability.
+
+6
+Evaluation
+
+We evaluate Foreactor with four application use cases:
+du
+– an
+fstat
+-heavy utility that calculates storage space usage of a directory,
+cp
+– a
+read
+-
+write
+-heavy utility that copies files, BPTree – a standard B+-tree data structure, and LevelDB – an LSM-tree-based key-value store. We show the effectiveness of Foreactor by answering the following questions:
+
+•
+
+How well does Foreactor improve the performance of regular I/O request loops? (§
+6.1
+)
+
+•
+
+How well does Foreactor apply to more complex application functions, such as LSM-tree operations, with different workload configurations? (§
+6.2
+and §
+6.3
+)
+
+•
+
+How much is the performance overhead of explicit speculation and how much does it improve device bandwidth utilization? (§
+6.4
+)
+
+Experimental Setup
+. We run all experiments on an Intel x86 server machine with one Toshiba NVMe NAND-flash SSD. The machine is equipped with an Intel Xeon D-1548 dual-socket 8-core CPU running at 2.00GHz (with 2 hyperthreads per physical core) and 64GB of DDR4 ECC main memory. The NVMe SSD device is attached through PCIe v3.0 and has a capacity of 256GB. It offers a bandwidth of 1200MB/s for sequential accesses, 1115MB/s for mixed random 64KB requests at a queue depth (QD) of 16, and 60MB/s for mixed random 4KB requests at a QD of 1. The backing file system is ext4 mounted in default ordered mode.
+
+6.1
+Command-line Utilities
+
+(a)
+
+du
+Stat Loop
+
+(b)
+
+cp
+Copy Loop
+
+Figure 6
+:
+Throughput of
+du
+and
+cp
+Workloads.
+
+(a)
+
+Scan
+
+(b)
+
+Bulk-loading
+
+Figure 7
+:
+Throughput of BPTree
+Scan
+and
+Load
+.
+
+Throughput
+(m rec.s/s)
+
+io_uring
+
+User threads
+
+Scan (degree = 510)
+
+92.1
+
+83.1
+
+Load (degree = 510)
+
+10.2
+
+9.5
+
+Table 1
+:
+BPTree Performance on Different Backends.
+
+To test the effectiveness of explicit speculation on regular I/O request loops, we consider two command-line utilities,
+du
+and
+cp
+, that are part of the GNU
+coreutils
+suite.
+du
+is used for calculating disk space usage of a directory by calling
+fstat
+s on its entries to gather their file sizes.
+cp
+is used for copying files between different locations in the file system directory tree. On recent Linux kernels,
+cp
+also adopted the new
+copy_file_range
+interface to reduce the number of system calls and to avoid user buffer copies if the backing file system supports it. We compare against this mode as well.
+
+(a)
+
+Avg. Time vs. Memory Ratio
+
+Record Size = 1K
+
+(b)
+
+Avg. Time vs. Record Size
+
+Memory Ratio = 10%
+
+(c)
+
+P99 Tail Latency vs. Record Size
+
+Memory Ratio = 10%
+
+Figure 8
+:
+LevelDB Get Operation Performance.
+
+8(a)
+and
+8(b)
+: avg. time to complete a
+Get
+operation in YCSB-C workload with different page cache memory capacities and record sizes;
+8(c)
+: 99% tail latency versus record sizes.
+
+Figure
+6(a)
+shows the average completion time of a single invocation of
+du
+on directories containing different numbers of files. Within each group, the left bar corresponds to original
+du
+, while the right two bars correspond to
+du
+with Foreactor parallelizing its
+fstat
+loop at different pre-issuing depths, 4 and 16. Each bar is averaged over 20 runs. The kernel VFS inode cache is emptied before each run, since
+du
+is typically run on cold directories. We can see that maintaining multiple metadata reads in parallel reduces completion time by up to 50%, thanks to concurrent requests multiplexing device bandwidth. We also observe better performance with larger pre-issuing depth, though the trend flattens out due to higher overhead running the pre-issuing algorithm.
+
+Figure
+6(b)
+shows the average completion time of a single invocation of
+cp
+on files of different sizes. Each bar is averaged over 20 runs and the kernel page cache is emptied before each run. Foreactor outperforms original
+cp
+and its
+copy_file_range
+mode, though there is only marginal benefit due to two reasons. First, each iteration of the copy loop issues a read request of 128KB size and a write of the same size, which is already a large enough scale to utilize device bandwidth. Second, we ran
+cp
+with file source and destination on the same backend device, introducing read-write interference. In a data backup workload where source and destination are on different storage devices, this effect will be minimized.
+
+6.2
+B+-tree Scan and Bulk-loading
+
+We implement BPTree, a standard B+-tree data structure that supports
+Scan
+and
+Load
+operations. We then apply Foreactor to parallelize the leaf page I/O loops in these two operations as described in §
+4.2
+. We use 8KB as the page size and consider 64-bit integral keys and values. A BPTree instance has a controllable
+degree
+(i.e., the number of keys a node can hold before triggering a split) configured at initialization, with a maximum degree of 510 allowed in our settings. A Higher degree leads to a wider tree and in turn fewer I/O requests.
+
+We run
+Load
+to build a BPTree instance from a pre-generated key-value record stream followed by 10 range
+Scan
+s, and repeat this for different degree configurations. All keys are chosen uniformly random. Figure
+7(a)
+and
+7(b)
+shows the throughput of
+Scan
+and
+Load
+, respectively, in million records per second with different degree configurations. Foreactor is able to speculatively issue leaf page I/O requests, bringing up to 37% of throughput improvement. We can also see that a B+-tree with higher degree offers better bulk operation performance, because there will be a significantly fewer number of nodes. The cost is slower binary search for a key within a node, which is negligible for bulk operations but may be significant for point queries. Note that we choose a pre-issuing depth of up to 256 versus 16 for
+cp
+, because the request sizes are 8KB pages instead of 128KB buffers.
+
+Table
+1
+compares BPTree performance on two different asynchronous I/O backends: the default
+io_uring
+and the user-level thread pool.
+io_uring
+delivers better throughput due to a reduction in the number of actual system calls and the efficiency of the kernel
+io_
+workqueue.
+
+6.3
+LevelDB Get with YCSB
+
+Figure 9
+:
+LevelDB Get Relative Improvement.
+
+Greener is better.
+
+(a)
+
+Multiple Clients
+
+(b)
+
+YCSB Workloads
+
+(c)
+
+Workload Skewness
+
+Figure 9
+:
+LevelDB Performance Sensitivity Analysis.
+
+Throughput under the impact of multiple clients, non-
+Get
+operations, and different key skewness.
+
+To apply Foreactor to a more complex use case, we choose LevelDB, an LSM-tree-based key-value store. In particular, we use Foreactor to parallelize the
+pread
+s in its
+Get
+request code path described in §
+4.3
+.
+
+We run YCSB-C workload with default Zipfian distribution on LevelDB with different page cache memory capacities (set through
+cgroup
+) and record value sizes. In each experiment, we run a workload trace that reads out 200MB of data from a database image of approximately 1GB volume size. We choose a pre-issuing depth of 16 as it is the upper bound of the number of
+pread
+s in our settings. Results are presented in Figure
+8
+. Each bar is averaged over 5 runs. Figure
+8(a)
+shows that Foreactor is able to reduce average
+Get
+latency by speculatively issuing future
+pread
+s. The improvement gets better with smaller page cache memory ratio, because an increasing number of
+pread
+s will miss the page cache and land on the SSD device. Figure
+8(b)
+shows that for small record sizes below 4KB, Foreactor brings steady improvement because all
+pread
+s will actually read out 4KB data blocks. For larger value sizes, the improvement tends to get better due to each
+pread
+getting larger, outweighing the computation overhead. Figure
+8(c)
+shows that explicit speculation is especially helpful for improving tail latency of LevelDB
+Get
+s, because the slowest
+Get
+s are ones with the longest search chains and that trigger the most page cache misses.
+
+Figure
+9
+presents a summary of relative
+Get
+operation performance improvement across all memory ratios and record sizes. There is a clear trend that Foreactor helps the most with a small memory ratio and a moderate record size. The top-right corner shows that it is not wise to apply Foreactor when memory capacity is abundant and request size is small, because then most
+pread
+s will be small memory accesses hitting the page cache.
+
+Sensitivity Analysis
+. We run more complicated workloads to study the effectiveness of Foreactor when there are multiple LevelDB client threads, when the workload is a mix of read and write operations, and with different workload skewness. Figure
+10(a)
+shows that Foreactor scales well when the number of clients are small, because each LevelDB client thread performs explicit speculation independently and uses its own
+io_uring
+queue pair. When too many clients co-locate on the same machine, device bandwidth is already sufficiently utilized and Foreactor starts to behave poorly due to bandwidth contention and excessive computation overhead. Figure
+10(b)
+shows single-client throughput of different YCSB workloads while only
+Get
+operations are being accelerated by Foreactor. Improvement is proportional to the percentage of
+Get
+requests in each workload. Figure
+10(c)
+studies the effect of search key distribution skewness other than default Zipfian constant 0.99. Smaller Zipfian constant corresponds to less skew workload and higher chance of page cache misses, resulting in better relative improvement.
+
+6.4
+Overhead and Utilization
+
+Foreactor introduces three pieces of performance overhead in order to enable explicit speculation:
+1
+executing the pre-issuing algorithm upon intercepted system calls,
+2
+copying read system call results back to user buffers, and
+3
+cancelling on-the-fly system calls upon early exits. Figure
+10
+quantifies the latency factors of a typical LevelDB Get operation at 1KB record size and 10% memory ratio, with and without Foreactor. Gray bars correspond to irrelevant application logic not touched by Foreactor; light-blue bars correspond to synchronous I/O system calls, in this case
+pread
+s; blue and light-green bars represent the time spent in submitting
+pread
+s to
+io_uring
+and waiting on their completions, which is where Foreactor saves time compared to original synchronous system calls. The rest three bars correspond to overhead factors, with pre-issuing algorithm being the largest factor. In general, Foreactor brings improvement as long as the benefit of I/O concurrency outweighs the overhead of peeking.
+
+A small amount of extra CPU power and memory space is required for adding I/O concurrency. Quantitatively, for LevelDB Get with 1KB record size, applying Foreactor to a single client thread increases CPU usage on our 8-core machine from 11.95% to 14.75% and allocates roughly 1.06MB of extra memory for read buffers. As a result, SSD device bandwidth utilization boosts from 130.60MB/s to 197.43MB/s per client thread. Other workloads report similar numbers.
+
+Figure 10
+:
+Latency Breakdown of LevelDB Get Case.
+
+7
+Discussion
+
+We provide additional discussion on some practical aspects of applying explicit speculation with Foreactor, specifically, on the effects of application-level caching, OS page cache configurations, and possible automation in generating foreaction graphs. We also discuss the limitations of explicit speculation.
+
+Effects of Application-level Caching
+. For applications that manage a built-in cache atop I/O system calls, its foreaction graphs might be less straightforward to draw, since
+read
+and
+write
+requests might hit the application-level cache and hence do not trigger corresponding system calls. In this case, one solution is to turn off the application-level cache and instead use the OS-level page cache. A possible extension to the foreaction graph abstraction is to generalize the definition of syscall nodes and allow them to also represent requests to the application-level cache (which may or may not translate into actual system call instances). This extension may require modifications to application source code to let Foreactor take control at cache query boundaries in addition to intercepting system calls, and is currently not implemented in Foreactor.
+
+Effects of OS Page Cache
+. Since
+io_uring
+is mostly oblivious to the Linux kernel page cache, non-
+O_DIRECT
+I/O system calls are naturally supported. Depending on the workload and available memory capacity, it might be desirable to turn off page cache read-ahead by
+fadvise(FADV_RANDOM)
+and/or
+fadvise(FADV_DONTNEED)
+so as to reduce the chance of page cache contention by concurrent I/O requests. Another pitfall is that the Linux page cache locks all accesses to a file exclusively during buffered writes (through the
+rwsem
+semaphore), which discourages concurrent write requests to the same file even when all writes are to non-overlapping address ranges. For such workloads, the
+RWF_UNCACHED
+flag might be useful to avoid page cache thrashing
+[
+6
+]
+.
+
+Obtaining Foreaction Graphs
+. So far, we have assumed that foreaction graphs are derived manually by application developers with sufficient understanding of application code logic. It is possible to automate (part of) this process through static code analysis by compilers. For example, the graph structure could be derived from the control-flow graph (CFG) of the function, which is an intermediate representation during the compilation procedure, by extracting out all occurrences of system calls. Annotations could be generated by semantic analysis on code, through techniques such as symbolic execution. We leave automatic generation of foreaction graphs as future work to explore.
+
+Limitations
+. The explicit speculation approach currently has two major limitations. Firstly, it does not help in cases where I/O requests form a strict dependency chain, i.e., each request depends on the result of its previous request. A typical example would be the pointing-chasing procedure of a B+-tree search. In this case, none of the later
+read
+s can be pre-issued concurrently, unless we could make precise guesses on the addresses of lower-level blocks. We would like to note that explicit speculation can be freely combined with other I/O acceleration techniques. For example, XRP – I/O request aggregation with eBPF embedding
+[
+46
+]
+– can be applied to such cases. The second limitation is that the foreaction graph abstraction is not expressive enough to represent complex recursive functions, since it is based on loops and does not track the function call stack. The scope of I/O speculation is thus limited to non-recursive functions, which we found expressive enough to cover many interesting cases.
+
+8
+Related Work
+
+There has been a rich set of work on measurement of storage device characteristics, software I/O acceleration techniques, and application system call analysis.
+
+Device Parallelism Measurement
+. He et al. presented a performance study of NAND flash-based SSDs
+[
+11
+]
+and showed that maintaining a large aggregate request scale is necessary to fully utilize device bandwidth due to the fact of internal stripping across smaller flash media units. Wu et al. presented a similar study on Intel Optane SSDs
+[
+40
+]
+, a recent type of SSDs based on the 3D-XPoint persistent memory media, and also reported the effect of device internal parallelism, though to a smaller degree compared to NAND flash SSDs. There are also studies applying RAID to SSDs to further improve parallelism and reliability
+[
+19
+,
+2
+]
+. Overall, the effect of storage I/O parallelism is common on modern storage hardware.
+
+I/O Speculation
+. As described in detail in §
+2.2
+, previous I/O speculation techniques have taken either the speculative execution approach
+[
+8
+,
+21
+,
+22
+,
+23
+,
+43
+]
+for compute- or write-heavy workloads, or the speculative prefetching approach
+[
+4
+,
+5
+,
+26
+,
+3
+,
+20
+]
+for read-only cache workloads. This paper proposes explicit speculation, a more deterministic and formal approach, to support controlled I/O speculation with an emphasis on exploiting storage I/O parallelism.
+
+Asynchronous I/O
+. Linux
+io_uring
+is a new asynchronous I/O interface supported in kernel version 5.1 or newer
+[
+12
+]
+, with which users can submit original I/O system calls in batches and poll on their completions using the minimum number of actual user-kernel boundary crossings. It exposes a dual ring-queue programming interface and implements an efficient in-kernel
+io_
+workqueue thread pool. Significant engineering effort is still required to enable asynchronous I/O in mature applications, for example, in scientific computing applications
+[
+36
+,
+37
+]
+and databases
+[
+13
+]
+.
+
+Other I/O Acceleration Techniques
+. A wide range of I/O acceleration techniques have been proposed to reduce storage stack software overhead in the era of ultra-fast storage devices. Examples include caching and memory mapping
+[
+41
+,
+24
+]
+, batching and aggregation
+[
+29
+,
+30
+,
+33
+,
+46
+,
+34
+]
+, kernel-bypassing
+[
+17
+,
+27
+,
+38
+,
+18
+,
+44
+]
+, disaggregation
+[
+15
+,
+31
+,
+45
+,
+32
+]
+, and device-specific systems such as persistent memory file systems
+[
+39
+,
+42
+,
+14
+,
+7
+,
+47
+]
+. Explicit speculation proposed in this paper is an orthogonal aspect to these techniques.
+
+Application System Call Analysis
+. Previous works have used system call analysis to study the correctness of applications and storage system semantics. For example, ALICE
+[
+28
+]
+is a tool that analyzes application crash consistency behavior on different file system persistence models. Frost et al. proposed a file system abstraction, patch, that explicitly encodes write-before dependencies in their consistency mechanisms and allows lower layers of the storage stack to be file-system-agnostic
+[
+9
+]
+. Foreactor expands the scope of system call analysis to build foreaction graphs and improve performance.
+
+9
+Conclusion
+
+In this paper, we introduce explicit speculation, a highly deterministic variant of I/O speculation technique. We propose the foreaction graph abstraction that describes application function I/O patterns and captures any necessary computation required to produce their argument values. We implement Foreactor, a framework that allows application developers to materialize foreaction graphs and exploit storage I/O parallelism transparently. Experimental results show that Foreactor is able to improve device bandwidth utilization and boost performance across a range of I/O-intensive applications.
+
