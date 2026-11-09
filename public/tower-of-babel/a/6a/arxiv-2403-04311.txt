@@ -1,0 +1,932 @@
+ALTO: An Efficient Network Orchestrator for Compound AI Systems
+Keshav Santhanam, Deepti Raghavan, Muhammad Shahir Rahman, Thejas Venkatesh, Neha Kunjal, Pratiksha Thaker, Philip Levis, Matei Zaharia
+
+Abstract
+. We present ALTO, a network orchestrator for efficiently serving compound AI systems such as pipelines of language models. ALTO achieves high throughput and low latency by taking advantage of an optimization opportunity specific to generative language models: streaming intermediate outputs. As language models produce outputs token by token, ALTO exposes opportunities to stream intermediate outputs between stages when possible. We highlight two new challenges of correctness and load balancing which emerge when streaming intermediate data across distributed pipeline stage instances. We also motivate the need for an aggregation-aware routing interface and distributed prompt-aware scheduling to address these challenges. We demonstrate the impact of ALTO’s partial output streaming on a complex chatbot verification pipeline, increasing throughput by up to 3 × \times for a fixed latency target of 4 seconds / request while also reducing tail latency by 1.8 × \times compared to a baseline serving approach.
+
+
+
+1.
+Introduction
+
+Generative language models (LMs) are often chained together and
+combined with other components into
+compound AI
+systems
+
+(
+Zaharia et al. 2024
+)
+. Compound AI system
+applications include retrieval-augmented generation
+(RAG)
+(
+Lewis et al. 2020
+;
+Izacard and Grave 2021
+;
+Huang et al. 2023
+;
+Ram et al. 2023
+)
+, structured prompting
+(
+Wang et al. 2022
+;
+Yao et al. 2023
+;
+Besta et al. 2023
+)
+, chatbot
+verification
+(
+Chern et al. 2023
+;
+Dhuliawala et al. 2023
+;
+Chen et al. 2023
+;
+Semnani et al. 2023
+)
+, multi-hop question
+answering
+(
+Yao et al. 2022
+;
+Khattab et al. 2023
+)
+,
+agents
+(
+Patil et al. 2023
+;
+Liu et al. 2023
+;
+Ruan et al. 2023
+;
+Wu et al. 2023
+)
+, and SQL query generation
+(
+Li et al. 2023
+;
+Sun et al. 2023
+)
+.
+
+Figure 1
+.
+FacTool
+(
+Chern et al. 2023
+)
+-inspired pipeline for
+verifying chatbot claims. When the user asks a
+question (stage 1), claims are extracted from the response
+(stage 2) and search queries are generated for each claim
+(stage 3). The search queries retrieve relevant documents are from a knowledge corpus using BM25 (stage 4) and
+reranked by ColBERT (stages 5 and 6).
+
+This paper explores how to serve compound AI systems efficiently at
+scale. One interesting property of generative language models (LMs) is that they
+incrementally produce
+partial outputs
+, emitting a single output
+token in each iteration. While language models incrementally produce
+tokens, stages in an AI pipeline may operate at a variety of
+granularities of text, ranging from individual tokens to larger quanta
+such as sentences or paragraphs (e.g., one stage may generate a list
+of claims that another stage can verify in parallel).
+Compound AI system pipelines with language models therefore process
+partial outputs at multiple levels of quantization.
+
+This paper makes the key observation that streaming partial outputs
+between distributed stages can reduce serving latency and increase
+throughput. Streaming reduces latency by enabling downstream stages to
+begin processing intermediate tokens before an upstream LM has
+finished generating its output. Dynamically scheduling streams across
+functional units increases throughput because it prevents stages from
+falling idle when there is work to do.
+
+Figure 2
+.
+Visualizations of serving an example trace for the
+FacTool-inspired pipeline from Figure
+1
+. The
+squares at each stage represent a single unit of output; in these
+traces two claims are extracted for each global request, and two
+search queries are generated for each claim. On the left we wait for
+all output to be produced before sending intermediate data to
+downstream stages, while on the right we stream partial outputs
+between stages as soon as it is available.
+
+Figure
+1
+shows an example of this benefit for
+a pipeline inspired by FacTool
+(
+Chern et al. 2023
+)
+1
+1
+
+1
+
+The differences between our pipeline and FacTool are that we omit the final claim appraisal stage and we use local BM25 and ColBERT deployments for document retrieval rather than Google search.
+We will include the claim appraisal stage in a future version of the work.
+, a compound AI
+system that fact-checks a chatbot by retrieving relevant documents as
+corroborating evidence for factual claims. Here each claim extracted
+in stage 2 can stream to stage 3 as soon as it is available instead of
+waiting for all claims to be emitted. Each search query generated in
+stage 3 can similarly stream to stages 4 and
+5. Figure
+2
+shows how this reduces latency by overlapping computation across stages within a
+single request.
+
+Streaming partial outputs between pipeline stages introduces two
+challenges: correctness and efficient load balancing. Correctness
+challenges emerge because some pipeline stages are stateful and
+aggregate partial data across a stream. In
+Figure
+1
+, for example, stage 4 is stateful
+because it needs to aggregate document relevance scores across each
+search query token streamed from stage 3. Stateful stages impose a
+hard requirement that all partial outputs corresponding to a particular
+in-flight request must follow a consistent path throughout pipeline
+stage instances. At the same time, other stages can have their partial
+outputs fan out across different paths for greater parallelism.
+Specifying partial output routing requirements is difficult because each stage can have a dynamic fan-out spanning different
+different quanta of output (tokens, sentences, etc.) with
+complex aggregation logic.
+
+Load balancing is challenging due to the need to decide how to route
+parallel requests when the LM generates an unknown amount of fan-out.
+In particular, each prompt served in a pipeline can generate a varying number of output tokens and be queried at different frequencies depending on this fan-out. Therefore when serving many
+prompts concurrently, these streams must be load balanced across
+many instances.
+
+In this paper, we propose
+
+ALTO
+(
+A
+utomatic
+L
+anguage
+T
+oken
+O
+rchestrator), a serving system for
+automatically distributing and parallelizing compound, streaming AI pipelines.
+We describe a prototype of ALTO’s streaming architecture and show that
+streaming over multiple quanta of partial outputs provides
+performance benefits to pipelines over naïve architectures that do not support streaming.
+Our current ALTO implementation addresses the challenge of correctness with
+aggregation-aware routing
+,
+an interface to express where partial outputs must be routed for
+aggregation.
+We propose possible extensions to our current design that would enable more dynamic
+load-aware task placement while still meeting hard requirements imposed by aggregation,
+describing a design for
+distributed prompt-aware scheduling
+
+to load balance across a dynamic distribution of prompts without introducing long queueing delays.
+
+Aggregation-aware routing.
+
+ALTO introduces a novel interface to enable fine-grained
+specification of routing at multiple levels of output granularity
+through
+aggregation-aware routing
+.
+§
+4
+shows how this
+interface enables developers to specify both the quantum of partial
+output (e.g. token, sentence) to be aggregated as well as the
+aggregation destination. Using this interface ALTO is able to fully
+load balance across logically independent partial outputs while still
+enforcing any specified aggregation rules.
+
+Distributed prompt-aware scheduling.
+
+The goal of
+distributed prompt-aware scheduling
+is to dynamically load balance across a heterogeneous set of prompts, each producing varying quanta of partial outputs at different frequencies.
+We quantitatively motivate the need for distributed prompt-aware scheduling and discuss preliminary ideas toward an algorithm design.
+
+We evaluate ALTO on the FacTool-inspired pipeline from Figure
+1
+. Our results show that ALTO’s streaming
+optimizations enable
+up to 3
+\times
+higher throughput for a given latency target of 4 seconds / request while also
+reducing tail latency by 1.8
+\times
+.
+
+In summary, this paper makes the following contributions:
+
+•
+
+An empirical analysis of how streaming partial outputs can significantly accelerate compound AI systems.
+
+•
+
+An analysis of the novel correctness and load balancing challenges introduced when streaming partial outputs, which introduces the concepts of aggregation-aware routing and distributed prompt-aware scheduling.
+
+•
+
+The ALTO system which implements a network orchestration layer to efficiently forward data across pipeline stage instances while respecting aggregation constraints.
+
+2.
+Streaming can improve performance of serving pipelines
+
+In this section we demonstrate how streaming partial outputs between pipeline stages can significantly improve compound AI system serving performance in terms of both throughput and latency. In particular, we evaluate streaming performance for the FacTool-inspired pipeline presented in Figure
+1
+using a prototype version of ALTO. We spawn multiple instances of each stage as specified in the following table:
+
+Stage
+
+# Instances
+
+GPU
+
+Question Answering
+
+2
+
+✓
+
+Claim Extraction
+
+2
+
+✓
+
+Search Query Generation
+
+3
+
+✓
+
+BM25
+
+4
+
+✗
+
+ColBERT Query Encoder
+
+1
+
+✓
+
+ColBERT Reranker
+
+4
+
+✗
+
+We load balance in-flight data across the instances using round-robin scheduling; we use a simple hashing-based approach to choose the next instance for forwarding in-flight data (
+hash(request_id) % n
+, where
+n
+is the number of downstream stage instances).
+
+We measure end-to-end throughput (achieved load) and latency (median and P99) as we inject load into the system according to a Poisson distribution with varying
+\lambda
+. The achieved load here is the total number of requests sent within a time interval (in this case 12 minutes) / the wall-clock time it took to complete all requests.
+
+We use SQuAD
+(
+Rajpurkar et al. 2016
+)
+queries for the input data. We use vLLM
+(
+Kwon et al. 2023
+)
+version 0.26 for generative LM serving. For retrieval we use a retrieve-and-rerank pipeline
+(
+Nogueira et al. 2019
+)
+which uses a custom BM25
+(
+Robertson et al. 1995
+)
+implementation as the first stage retriever and then ColBERT
+(
+Santhanam et al. 2022b
+;
+Santhanam et al. 2022a
+)
+as the reranker; the BM25 implementation is specifically designed for streaming as it exposes an interface to compute document relevance scores token-by-token and then sum across all query tokens. We evaluate on a single NVIDIA HGX node with 8 80 GB A100-SXM GPUs and 256 AMD EPYC 7763 CPUs.
+
+(a)
+
+Median Latency vs Achieved Load.
+
+(b)
+
+P99 Latency vs Achieved Load.
+
+Figure 3
+.
+Serving performance for the FacTool-inspired pipeline from Figure
+1
+. We compare performance between a baseline serving approach which waits for all LM generations to complete and an approach which instead streams partial outputs between pipeline stages. We only include points where the achieved load was
+\geq
+80% of the offered load.
+
+Figure
+3
+presents the results. We observe that streaming partial outputs enables up to 3
+\times
+higher load for a given latency target of 4 seconds per request. Furthermore, streaming enables 1.8
+\times
+lower P99 latency at low load.
+These results show that a streaming architecture is not only natural for
+compound AI systems but also can provide dramatic performance improvements.
+However, realizing these improvements for general distributed systems is not as straightforward
+as running an AI system on an existing streaming architecture.
+In the next section, we detail challenges specific to the setting of streaming in compound AI systems.
+
+3.
+Challenges
+
+Running multiple instances of each pipeline stage results in new challenges when streaming partial outputs between each stage. In particular, this requires special considerations for correctness and load balancing that are unique to LM applications.
+
+3.1.
+Correctness
+
+(a)
+
+Load balancing without an aggregation constraint.
+
+(b)
+
+Load balancing with an aggregation constraint.
+
+Figure 4
+.
+Aggregation complicates load balancing. Stage 1 instances stream partial outputs to stage 2 instances; each numbered box represents a single partial output. Output streams that do not require aggregation (Figure
+4(a)
+) can be easily load balanced across instances. An aggregation-aware routing policy (Figure
+4(b)
+) that requires all outputs from each request to visit the same instance, however, forces different instances to have different loads; instance 2 falls idle after processing its three outputs while instance 1 continues processing the 4th and 5th outputs.
+
+Compound AI systems can include stateful pipeline stages which aggregate across partial outputs within a stream.
+As we discuss in §
+1
+, stage 4 in Figure
+1
+is stateful because it needs to sum across per-token relevance scores when streaming search query tokens from stage 3. In addition to sums, stateful stages may include aggregation operators such as top-k, counters, and filters.
+
+Aggregation-aware routing
+is necessary to ensure correct aggregation for stateful stages while load balancing partial outputs across multiple stage instances.
+With aggregation-aware routing, every partial output in a stream of partial outputs is routed through the same destination stage instance. The experiments discussed in §
+2
+use a simple hashing mechanism to implement aggregation-aware routing.
+This approach is suboptimal, however, because it unnecessarily forces every stage to respect a global aggregation-aware routing policy even when the stage
+performs no aggregation.
+As Figure
+4
+shows, this can compromise load balancing efficiency by limiting routing flexibility.
+The optimal approach would instead locally apply aggregation-aware routing exclusively to stateful stages.
+
+Restricting aggregation-aware routing to stateful stages requires designing a new interface for specifying the stateful stages and their respective aggregation rules to the underlying routing engine.
+This is challenging because the interface must generalize across the space of possible output quanta while capturing complex aggregation logic. Consider the aggregation-aware routing rule for partial outputs streamed from stage 3 to stage 4 in Figure
+1
+.
+A complete specification of this rule must indicate that the partial output quantum to be aggregated is a token, the tokens must be aggregated at stage 4, and the tokens should be aggregated across a given search query.
+Encoding these details is not possible with existing streaming
+interfaces, which simply emit incremental outputs.
+
+3.2.
+Efficient Load Balancing across Prompts
+
+Streaming partial outputs between pipeline stages can generate dynamic fan-out of partial outputs spanning multiple quanta.
+This can complicate load balancing for LM stages.
+Table
+1
+measures this fan-out for the LM stages within
+the FacTool-inspired pipeline from Figure
+1
+.
+We observe that each prompt generates partial outputs which vary significantly across their size and processing times.
+Figure
+5
+further illustrates the diversity
+across prompts. In this experiment we plot the latency achieved by each prompt
+type in the FacTool-inspired pipeline as we increase the number of requests; here each prompt saturates a single GPU at a different rate.
+
+Stage
+
+Overall
+
+Count
+
+Per-output
+
+Quantum
+
+Average
+
+# Outputs
+
+Average Length /
+
+Output (words)
+
+Average Time /
+
+Output (ms)
+
+Question Answering
+
+10795
+
+Response
+
+(paragraphs)
+
+-
+
+62.5
+\pm
+57.2
+
+1292.3
+\pm
+1175.0
+
+Claim Extraction
+
+10795
+
+Claim
+
+3.3
+\pm 1.8
+
+9.8
+\pm
+3.5
+
+403.6
+\pm
+1175.0
+
+Search Query
+
+Generation
+
+35516
+
+Search query
+
+2.5
+\pm
+1.3
+
+5.5
+\pm
+3.1
+
+326.6
+\pm
+252.4
+
+Search query token
+
+5.5
+\pm
+3.1
+
+-
+
+59.8
+\pm
+79.3
+
+Table 1
+.
+Statistics measured from a run of the FacTool-inspired pipeline
+from Figure
+1
+. Inputs are issued
+at a rate of 15 requests / second for 12 minutes. Each prompt generates a different output unit and number of outputs.
+
+Serving LM instances efficiently with streaming requires load balancing the dynamic fan-out across downstream stages.
+The experiment detailed in §
+2
+fixes a particular prompt
+to each LM instance, but statically assigning prompts precludes adapting to
+workload-dependent dynamic fan-out in the pipeline.
+If the static assignment does not match the relative frequencies of each
+prompt, instances serving certain prompts will be under-utilized while
+other instances serving other prompts will be over-utilized.
+
+An ideal load balancing strategy should dynamically forward requests for all
+prompts across all LM instances, without fixing a static assignment.
+Remaining completely agnostic to the prompt content, however, may also compromise serving throughput.
+LM serving engines
+(
+Kwon et al. 2023
+;
+Zheng et al. 2023
+;
+Juravsky et al. 2024
+)
+are capable of re-using KV cache state for frequently occurring prompts that share a common prefix, thereby improving overall request throughput.
+Maximally leveraging this optimization requires issuing many requests with the same prefix to the same LM instance (i.e. maximizing prompt locality).
+While LM serving engines apply local scheduling algorithms to maximize in-batch prompt locality
+(
+Zheng et al. 2023
+)
+, scheduling has to happen at the network level to encourage locality across distributed LM instances.
+
+(a)
+
+Median Latency vs Achieved Load.
+
+(b)
+
+P99 Latency vs Achieved Load.
+
+Figure 5
+.
+Microbenchmark measuring the diversity in performance achieved by each prompt in the FacTool-inspired pipeline from Figure
+1
+. We only include points where the achieved load was
+\geq
+80% of the offered load.
+
+Unfortunately, enforcing prompt locality directly conflicts with the goal of retaining load balancing flexibility across different prompts.
+Resolving this tension is a key challenge for efficient load balancing, and
+requires
+distributed prompt-aware scheduling
+; we discuss some preliminary ideas in §
+6.2
+.
+
+4.
+ALTO System Design and Interface
+
+This section describes the streaming interface of ALTO used to generate the results in
+Section
+2
+, as well as how this interface can support solutions to the
+challenges described in Section
+3
+.
+
+ALTO consists of two pieces:
+(1) an inference interface for individual pipeline stages, with queues sitting
+between stages,
+and (2) a central runtime that forwards data between these stages.
+
+ALTO has three design goals:
+
+•
+
+Ensure partial state is aggregated correctly for any stateful
+pipeline stage.
+
+When certain pipeline stages must aggregate fanned-out work, ALTO must ensure
+partial outputs that need aggregation are sent to the same instance of the
+stage.
+
+•
+
+Load balance as much work as possible evenly across replicas.
+
+While respecting aggregation constraints, ALTO should load balance work that arrives at the central scheduler as evenly as possible.
+ALTO should maximize parallelism within queries where possible when aggregation constraints permit.
+
+•
+
+Lightweight interface to specify aggregation constraints and prompt information.
+
+The interface to specify aggregation constraints and prompt information should be
+lightweight on top of the queueing interface.
+
+To fulfill these goals, ALTO is modeled off of microservices but deviates from existing microservice
+programming models in two ways. Instead of RPCs, ALTO provides an API to specify
+aggregation constraints
+and
+prompt information
+.
+The scheduling algorithm uses this information to ensure correctness and improve load balancing.
+The rest of this section describes the basic queueing interface, explains
+how developers specify aggregation constraint and prompt information,
+and defines a scheduling algorithm that uses this information to load balance across
+stages.
+
+Developer interface.
+Application developers specify a pipeline by a sequence of stages.
+Stages process data, executing LMs and aggregation or other computation steps,
+and communicate data to downstream stages through queues.
+Application developers use Protocol Buffers
+(
+Varda 2008
+)
+to specify the data format
+of each queue.
+Each stage reads data off of its input queues, processes the data, and pushes output
+data onto one or more queues to the next stages.
+
+4.1.
+Aggregation Constraints Interface
+
+At a high level, ALTO lets the central scheduler know about aggregation constraints and
+prompt affinities via a header on each data item in a queue.
+Application developers specify these headers to define when aggregation
+is required at at what granularity.
+For example, for the FacTool pipeline a query can be tagged with a
+query_id},
+but when the pipeline generates a claim for the query in a later stage,
+the application can augment the header with a \mintinline
+pythonclaim_id to ensure
+that aggregation will take place correctly at both the claim and query level.
+
+The following code snippet shows how the queue interface includes this argument:
+
+⬇
+
+write
+(
+
+queue
+="
+bm25
+",
+
+obj
+=
+Token
+(…),
+
+id
+=
+obj_id
+,
+
+constraints
+=[
+obj_id
+,
+
+claim_id
+,
+
+query_id
+]
+
+)
+
+The first part of the header is an array of integers and allows an application to express custom aggregation constraints:
+as long as the application attaches the same array of integers to any data that needs to be
+aggregated (e.g., the global
+obj_id}, \mintinline
+pythonclaim_id, and
+question_id} for any
+individual token sent to BM25 in the FacTool pipeline), the central scheduler
+will send all this data to the same instance of the destination stage.
+\subsection
+Scheduling Policy
+The ALTO runtime currently uses a simple scheduling policy
+to respect aggregation constraints while still maximizing parallelism opportunities.
+When data arrives for a given stage, the scheduler checks to see whether an
+aggregation constraint exists in front of the data.
+If it does, it hashes the aggregation constraint and mods it with the number of instances
+for the destination stage; this ensures that data with the same aggregation constraints are
+forwarded to the same instance.
+If not, ALTO chooses the next instance in a round robin fashion.
+This simple algorithm could be augmented with techniques such as consistent
+hashing to ensure even load balancing in the case of instances
+coming up and down. Note that the ALTO scheduler does not yet support distributed prompt-aware scheduling, but we discuss preliminary ideas in §
+6.2
+.
+
+5.
+Implementation
+
+Figure
+6
+presents a system diagram of ALTO. ALTO includes a centralized runtime which routes data through a series of asynchronous queues. Applications running on top of ALTO communicate with the centralized runtime by receiving data from input queues and sending intermediate data through output queues.
+
+Queues.
+ALTO uses queues to asynchronously forward data between
+pipeline stages. Each queue is a wrapper over two reliable UNIX domain
+sockets, though this can be expanded to a multi-node setting by wrapping a network socket instead.
+One socket is from the source stage to the central runtime (output queue), while the second
+socket is from the central runtime to the next stage (input queue).
+Each queue has an associated user-defined Protobuf describing the data type (e.g., Token or Claim). Deserialization only happens in the application; in-flight data is not deserialized as it is forwarded through the runtime.
+
+Centralized runtime.
+The ALTO runtime accepts as input two configuration files: the first specifies the individual pipeline stages as well as their resource requirements and input and output queue names, while the second specifies how many instances to spawn for each pipeline stage. The runtime automatically adds a global request ID to the data headers corresponding to each request. The runtime is also responsible for enforcing aggregation constraints and scheduling in-flight data as discussed in §
+4
+. The runtime is implemented in
+{\sim}7000
+lines of Rust.
+
+Applications.
+In our prototype implementation, ALTO stages are written in Python. The ALTO runtime passes the input and output queue names to each stage when it is started, and then the developer then calls an ALTO library function to initialize the application-side sockets. The application-side queues use
+asyncio} for asynchronous execution. \sys
+supports arbitrary LM serving engines as long as they can interface with
+asyncio} and asynchronously stream incremental outputs. We have currently implemented integrations with vLLM˜\cite
+kwon2023efficient and SGLang Runtime
+(
+Zheng et al. 2023
+)
+.
+
+Figure 6
+.
+ALTO system diagram. ALTO includes an asynchronous queueing interface and centralized runtime to automatically route data between pipeline stages.
+
+6.
+Discussion
+
+Here we discuss opportunities to improve the current aggregation interface and design a distributed prompt-aware scheduler.
+
+6.1.
+Improving Constraint Interface
+
+While the interface described in
+§
+4
+can correctly express
+aggregation constraints, it requires the developer to manually specify tags to define the
+aggregation logic for stateful stages. Instead,
+ALTO should automatically infer aggregation logic from the pipeline
+structure itself, via extra annotations provided by the programmer.
+The annotations would provide a way to tell ALTO which stages are stateful
+and aggregate data, and which stages cause fan-out (produce multiple partial
+outputs for a single inputs).
+Using these hints, ALTO can automatically infer tags.
+For example, in the FacTool pipeline from
+Figure
+1
+, the developer could annotate that stage 4
+is stateful, and how many levels of quanta this stage aggregates.
+The runtime could then infer the aggregation constraint that all search query tokens should
+go to a consistent BM25 instance, and generate the tags needed by the
+scheduler.
+
+Another opportunity would be to implement a general set of aggregation operators to express a wide variety of aggregation patterns. Currently each application running on top of ALTO must implement bespoke aggregation logic, but instead the common design patterns could be abstracted away into a library which is tied to the aggregation constraint interface. Potential operators for this library would include
+sum
+,
+top-k
+,
+count
+, and
+filter
+.
+
+6.2.
+Distributed Prompt-Aware Scheduling
+
+Our current implementation of the ALTO scheduler takes into account aggregation constraints
+based on developer-specified headers, but does not use information about
+prompts when scheduling.
+There are two opportunities here: profiling the relative resource
+consumption across prompts and understanding the optimal
+resource allocations between prompts, and prompt-aware routing.
+As discussed in §
+3
+, recent work on language model serving
+(
+Kwon et al. 2023
+;
+Zheng et al. 2023
+;
+Juravsky et al. 2024
+)
+
+has demonstrated that LM throughput can improve when requests sharing the same
+prompt prefix are routed through the same LM.
+ALTO can take advantage of these opportunities with a distributed prompt-aware scheduling algorithm.
+
+The design goals for a distributed prompt-aware scheduling algorithm are twofold:
+
+(1)
+
+Support flexible load balancing to handle dynamic fan-out
+(understand the relative resource consumption between prompts and
+automatically assign GPU time to prompts based on this).
+
+(2)
+
+Maximize prompt locality when possible (to take advantage of LM
+engines’ prompt sharing optimizations).
+
+A first-pass attempt at designing a distributed prompt-aware scheduling
+algorithm to achieve these goals would involve two mechanisms: a
+mechanism to measure statistics about each prompt’s relative resource
+consumption and a mechanism to route a prompt request to a particular LM
+instance.
+For the first mechanism, the scheduler could keep track of statistics related to
+how much output data each prompt request tends to create, and how long each
+request type takes to serve, and queuing delay at each LM instance.
+Measuring these statistics accurately is challenging as model serving
+engines contain internal scheduling mechanisms to handle batching, which
+sometimes de-prioritize requests relative to others (e.g., Radix
+attention).
+For the second mechanism, we speculate the scheduler could run an optimization problem using
+these statistics, which also encourages “sticky” routing rules, where it
+keeps sending requests for the same prompt to the same LM instance.
+We defer fully exploring these ideas to future work.
+
+7.
+Related Work
+
+Compound AI system front-ends
+Many frameworks and domain-specific programming languages offer interfaces for expressing compound AI systems using high level abstractions
+(
+Chase 2022
+;
+Liu 2022
+;
+Khattab et al. 2023
+;
+Zheng et al. 2023
+)
+. ALTO can efficiently serve the pipelines expressed in these higher level abstractions given some intermediate translation layer.
+
+LM serving systems
+LM serving systems optimize LM inference throughput by efficiently managing the memory used by the LM computation across requests
+(
+Kwon et al. 2023
+;
+Zheng et al. 2023
+;
+Juravsky et al. 2024
+)
+. These engines and many commercial LM API endpoints also expose interfaces for streaming tokens. Unlike ALTO, these systems do not handle distributed deployments nor the associated correctness and load balancing challenges which emerge when streaming partial outputs. Furthermore, these systems exclusively optimize LMs rather than combinations of LMs with other tools. ALTO can use these systems as high-throughput LM executors as we discuss in §
+5
+.
+
+Parallelizing compound AI systems
+Previous works have tried to automatically parallelize graphs of LM calls
+(
+Kim et al. 2023
+;
+Ning et al. 2023
+;
+Saha et al. 2023
+)
+. While ALTO can also execute logically parallel stages concurrently, these approaches do not leverage partial output streaming or handle any of the correctness and load balancing concerns discussed in §
+3
+.
+
+Stream processing
+Streaming query engines have been widely explored in the database and systems communities
+(
+Chandrasekaran et al. 2003
+;
+Abadi et al. 2003
+;
+Zaharia et al. 2013
+;
+Murray et al. 2013
+;
+Carbone et al. 2015
+)
+. These systems execute long-running queries that continuously output results while pipelining computations and reliably maintaining long-lived state. Like these systems, ALTO streams partial results between nodes, but it aims to minimize end-to-end latency for relatively short AI pipeline computations. The varying resource consumption of queries (e.g., longer or shorter LM outputs) also creates a need for dynamic pipeline-aware scheduling at a fine granularity in ALTO to keep worker nodes efficiently utilized.
+
+Microservice serving systems
+Many distributed system frameworks are capable of deploying pipelines of logically independent computation stages as microservices and using queues to communicate data between these stages
+(
+Moritz et al. 2018
+;
+Welsh et al. 2001
+)
+. Some are even optimized for machine learning workloads in particular
+(
+Crankshaw et al. 2020
+)
+. In contrast to ALTO, these systems do not leverage the autoregressive generation property of LMs to facilitate partial output streaming.
+
+8.
+Conclusion
+
+This paper presents ALTO, a system that orchestrates compound
+AI system pipelines built around generative language models.
+ALTO is based on the observation that generative language
+models produce output incrementally, such that they can be
+streamed through a distributed pipeline. However, as some pipeline
+stages can parallelize outputs while others must aggregate them,
+correctly routing tokens requires careful orchestration and
+load balancing. ALTO provides an interface to specify
+such routing requirements. Experimental results show that
+ALTO’s pipelining can both reduce latency and increase
+throughput of a representative compound AI application.
+

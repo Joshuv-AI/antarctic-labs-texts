@@ -1,0 +1,1524 @@
+FastPersist: Accelerating Model Checkpointing in Deep Learning
+Guanhua Wang, Olatunji Ruwase, Bing Xie, Yuxiong He
+
+Abstract
+Model checkpoints are critical Deep Learning (DL) artifacts that enable fault tolerance for training and downstream applications, such as inference. However, writing checkpoints to persistent storage, and other I/O aspects of DL training, are mostly ignored by compute-focused optimization efforts for faster training of rapidly growing models and datasets. Towards addressing this imbalance, we propose FastPersist to accelerate checkpoint creation in DL training. FastPersist combines three novel techniques: (i) NVMe optimizations for faster checkpoint writes to SSDs, (ii) efficient write parallelism using the available SSDs in training environments, and (iii) overlapping checkpointing with independent training computations. Our evaluation using real world dense and sparse DL models shows that FastPersist creates checkpoints in persistent storage up to 116x faster than baseline, and enables per-iteration checkpointing with negligible overhead.
+
+
+
+1
+Introduction
+
+In the field of Deep Learning (DL), model checkpoints (i.e., persistent snapshots of model state) play a critical role of providing fault tolerance for training, and enabling downstream applications such as inference, finetuning, and distillation. While DL continues to enable significant progress in a wide range of artificial intelligence domains, such as natural language processing (NLP)
+[
+16
+,
+13
+,
+48
+]
+, image processing
+[
+15
+,
+44
+,
+46
+]
+, and recommendations
+[
+36
+,
+27
+]
+, these impressive gains require dramatic scaling of model and dataset. For example, state-of-the-art NLP grew from Bert (300M parameters trained on 3B tokens)
+[
+16
+]
+to GPT3 (175B parameters trained on 300B tokens)
+[
+13
+]
+in just two years. Such dramatic DL scaling commensurately increases the amount of computation and time required for model training.
+
+Optimization efforts to ensure that high-quality DL models can be fully trained in a reasonable amount of time (e.g., few months) have mostly focused on the computation performance of training while ignoring I/O. This imbalanced optimization approach has made I/O, such as data loading
+[
+34
+,
+19
+]
+and model checkpointing
+[
+33
+,
+20
+]
+, a growing bottleneck for large-scale DL training. In Figure
+1
+, we illustrate this issue for checkpointing using
+data parallelism
+(DP), a popular large-scale training optimization that leverages parallel accelerators to reduce DL computation time. We consider a dense and a sparse GPT3
+[
+13
+]
+model, while comparing the computation latency of one training iteration using V100-32GB GPUs (
+Compute
+), versus the latency of checkpointing into locally attached Solid State Device (SSD) storage (
+Checkpoint
+). We observe
+\sim 7
+X
+Compute
+reduction for both models with DP scaling of
+8
+to
+64
+, and
+1
+to
+8
+for the dense and sparse models respectively. In contrast, we observe that
+Checkpoint
+, unchanged by DP, increasingly dominates the overall time, growing from
+50\%
+to
+89\%
+, and
+82\%
+to
+96\%
+for the dense and sparse model respectively. Thus, for large-scale DL, model checkpointing cost can significantly impact end-to-end training time.
+
+Figure 1:
+Impact of data parallelism on training time of (a) dense and (b) sparse models, on up to 128 V100-32GB GPUs.
+
+In practice, users reduce checkpointing frequency (e.g., every 10s/100s iterations) in order to limit the performance impact on training (e.g.,
+10\%
+of training time is widely accepted as a reasonably low overhead
+[
+50
+]
+). However, this approach also increases the amount of computation and time lost to training interruptions. Thus, the scaling trend of DL beyond 1000s of accelerators
+[
+48
+,
+49
+]
+, coupled with the high failure rates of large scale systems
+[
+47
+,
+18
+,
+23
+]
+makes low frequency checkpointing strategies less attractive, if still tolerable.
+
+Thus, efficient but frequent checkpointing (e.g., every iteration) becomes desirable for large-scale DL training, and in this work we propose FastPersist to provide such a capability. FastPersist improves checkpointing performance for DL training by reducing and hiding checkpointing latency. FastPersist reduces checkpointing latency by combining two novel and complimentary techniques: (i) optimizations that leverage Non Volatile Memory Express (NVMe) SSDs for faster checkpoint writes from a single rank, and (ii) parallelizing checkpoint writes across the parallel I/O paths between DP ranks and SSDs. FastPersist hides checkpointing latency by leveraging domain-knowledge of when the model is updated to overlap checkpoint writes with independent operations (i.e., forward and backward passes) of the next iteration. Since these independent operations typically account for over
+90\%
+of compute time, complete overlapping is often possible.
+
+We evaluate FastPersist using micro-benchmarks, as well as dense and sparse GPT3 models on up to
+128
+V100-32GB GPUs. The results show that FastPersist significantly accelerates checkpoint creation, and is up to
+116X
+faster than PyTorch. Also, FastPersist efficiently overlaps checkpointing so that checkpointing on each iteration incurs
+<~5\%
+overhead. FastPersist appears well suited for large-scale DL because it leverages DP to scale checkpointing performance, similar to how DP is used to scale compute performance. Also, FastPersist leverages DP to scale I/O hardware utilization and improve efficiency on increasingly larger training hardware clusters. FastPersist makes frequent checkpointing a practical solution for minimizing the impact of training interruptions, especially for large-scale DL involving 100s/1000s of servers.
+
+The key contributions of this paper are the following:
+
+1
+. To the best of our knowledge, FastPersist is the first system to optimize DL model checkpointing through efficient utilization of NVMe SSDs.
+
+2
+. We design efficient algorithms for writing checkpoint data from accelerator memory into NVMe SSD, and for parallelizing checkpoint writes among DP ranks.
+
+3
+. We implement FastPersist using popular DL frameworks, PyTorch and DeepSpeed.
+
+4
+. We evaluate FastPersist with real world DL models and show it incurs negligible overhead to checkpoint every iteration. We plan to open source FastPersist to DeepSpeed soon.
+
+2
+Background
+
+In distributed DL, a typical training run executes an iterative learning method (e.g., SGD, ADAM) among a group of
+ranks
+, where each rank represents a different framework process (e.g., a PyTorch process) and executes on a different GPU
+1
+1
+
+1
+
+Theoretically, DL frameworks generally support multi-GPUs per rank. But in production use, most users let each rank use a different GPU.
+.
+Ranks process batches of data samples parallely and iteratively. In an iteration, each rank performs a three-step
+computational procedure:
+
+1.
+
+a forward pass to compute loss.
+
+2.
+
+a backward pass to compute gradients of the model parameters.
+
+3.
+
+an optimization step to update parameters.
+
+2.1
+Checkpointing in Distributed Deep Learning Training
+
+To tolerate interruptions from failure-prone environment, users checkpoint model states after the optimization step of each one or more iterations.
+Generally speaking, checkpointing in distributed DL training is new and cannot be addressed easily by the existing approaches proposed for High Performance Computing (HPC) applications
+[
+21
+,
+25
+,
+8
+]
+, largely due to the uniqueness of training parallelism (§
+2.1.1
+), the use of gradient accumulation (§
+2.1.2
+), and the serialization in checkpoint state (§
+2.1.3
+).
+
+2.1.1
+Training Parallelism
+
+To speedup model training process, DP and model parallelism (MP) are widely adopted , where DP replicates model on each rank and let ranks train on different batches in parallel, and MP splits a model across ranks and let different ranks train on the same data jointly.
+
+Recently, users combine DP and MP to support larger datasets and models
+[
+16
+,
+48
+,
+13
+]
+. In such runs, a model is first partitioned into
+n
+slices as MP does. Next, a slice is replicated and forms
+slice replicas
+as DP does with each DP group associated with a different slice.
+Finally, a global batch is partitioned into multiple micro-batches with each micro-batch replicated and assigned to a different DP group.
+Clearly, when checkpointing in DP/MP combined runs, one rank out of the replicas of a separate slice (usually the first rank in the slice) generates a separate checkpoint file for the slice periodically.
+
+2.1.2
+Gradient Accumulation in Large Batch Training
+
+Clearly, DP and MP work efficiently when GPUs are abundant. Unfortunately, in many cases, GPUs are limited, leaving large batches failed to fit into the memories of limited GPUs.
+To address this memory limitation,
+gradient accumulation (GA) is introduced to allow GPUs continously process multiple batches and only update model once with accumulate gradients over these batches.
+For a given model executed on a fixed set of GPUs, the checkpointing state and cost are relatively consistent as they are determined by the fixed model state and hardware bandwidth capacity. With a higher degree of GA, the checkpointing overhead can be less visible, but failure recovery is more expensive. Thus, we mainly focus on training with lower degree of GA.
+
+2.1.3
+Model Checkpoint State
+
+In a distributed DL training, a model checkpoint state, abbreviated as a
+checkpoint state
+, maintains the information to restore a model and its state after interruptions. Particularly, a checkpoint state comprises of model parameters (weights and biases), optimizer parameters (e.g., momentum), data loading iterator, and learning rate schedules, etc.
+
+Creating a checkpoint state in standard DL frameworks, such as PyTorch
+[
+40
+]
+, typically involves tensor serializations before writing to persistent storage. Particularly, tensor serialization provides multiple benefits, including reduced storage footprint, checkpoint portability, and simplified loading logic. The serialization process augments the checkpoint with tensor metadata, such as data type, data size, and originating device (e.g., GPU rank). Thus, the checkpoint creation for DL training is not a single write operation of the entire checkpoint state but rather a sequence of writes of serialized tensors.
+
+The checkpoint-state size is largely determined by the parameters of the model and the optimizer in use, and is relatively consistent and predictable. In particular,
+large models with billions of parameters are commonly trained in a mixed-precision fashion, where the model parameters are low-precision values (FP16 as
+2
+bytes), while the optimizer parameters are full-precision values (FP32 as
+4
+bytes). Moreover, these large models are primarily trained using the ADAM optimizer
+[
+28
+]
+, which maintains
+12
+bytes for each model parameter. Thus, the checkpoint size of large models in bytes is roughly
+14
+X of the parameter count. Given fixed hardware bandwidth capacity, the achievable checkpointing throughout can be easily estimated and utilized to maximally overlap training computations. We return to discussion as §
+4.3
+.
+
+2.2
+Flash-based Storage
+
+Training large DL models is an extremely compute-intensive workload that in practice requires large HPC clusters of muti-GPU server machines
+[
+4
+,
+6
+]
+. To provide high I/O bandwidths to GPU-accelerated workloads,
+such clusters are also commonly equipped with flash-based storage, in the form of NVMe SSDs. These SSDs are typically configured as local attached storage, or remote disaggregated storage
+[
+29
+,
+7
+]
+.
+
+Previous efforts have been made to exploit the bandwidth capacities of SSDs for various workloads.
+For example, Bergman et.al.
+[
+12
+]
+identified the programming and performance challenges for fast data transfer between GPU and SSDs, and proposed SPIN to integrate P2P into the OS file I/O stack for better I/O performance. Another example is RocksDB
+[
+26
+]
+, a key-value store carefully designed for SSDs.
+These efforts suggest that, flash-based SSD devices can help improve the end-to-end performance significantly with careful design to address the specific needs of workloads and to fit the SSDs properties.
+Similar to these efforts,
+we build FastPersist to leverage the bandwidth capacity of SSDs for checkpointing in distributed DL training.
+
+3
+Limitations of Existing Approaches
+
+Figure 2:
+Model checkpointing with
+torch.save()
+.
+
+In this section, we identify limitations of existing DL checkpointing approaches along three dimensions: (i) SSD write efficiency, (ii) Checkpoint decoupling, and (iii) cost of recovery.
+
+3.1
+Inefficient SSD Writes
+
+Popular DL frameworks provide standard functions for model checkpointing, such as
+torch.save()
+in PyTorch
+[
+1
+]
+and
+ModelCheckpoint
+in TensorFlow
+[
+2
+]
+. These functions build on traditional I/O system libraries with little optimizations for NVMe SSDs. Prior work indicate that
+torch.save
+often provides better performance
+[
+45
+]
+. We measure the throughput of
+torch.save()
+using five GPT3 dense models (Table
+2
+) and the local SSDs in our cluster(§
+5.2.1
+), and report the results as a percentage of the available SSD peak write throughput (i.e.,
+24.8
+GB/sec/machine) in Figure
+2
+. Since these five models are trained with different MP degrees, they present different degrees of write parallelism (§
+2.1.1
+).
+
+We first look at
+gpt3-0.7b
+for the write performance of a single GPU on a single machine. We observe that on this setting, only
+\sim 3\%
+of the SSD deliverable performance of a node is utilized. Since the
+10
+GB checkpoint size is large enough to enable efficient I/O, we believe the delivered bandwidth of a single GPU on a single machine is low.
+
+Second, we focus on the results of
+gpt3-13b
+for its performance of write parallelism in a machine. Clearly, the
+gpt3-13b
+achieves
+\sim 7X
+better performance than the
+gpt3-0.7b
+does in a machine. But considering the
+16X
+more parallel writes in
+gpt3-13b
+, it suggests that
+the individual writes for
+gpt3-13b
+are less efficient than the single write for
+gpt3-0.b
+, indicating the parallelism inefficiencies in a single machine.
+
+Finally, we take a look on the performance of scaling. We observe that the peak performance is
+<20\%
+of the hardware bandwidth capacity for all five models.
+Moreover, when scaling up to 8 machines, the SSD write bandwidths are severely underutilized,
+which is concerning given the importance of hardware scaling for optimizing large-scale model training.
+
+Observation
+1
+: Inefficient SSD Writes
+. We observe low bandwidth utilization in the exising checkpointing scheme for individual writes, and parallel writes in a machine and across machines. These inefficienties root from the use of traditional I/O libraries and poor design on write parallelism, motivating us to design new scheme to better exploit NVMe capabilities (§
+4.1
+) and the scaling characteristics of DL training (§
+4.2
+).
+
+Figure 3:
+Data dependencies in training iterations.
+
+3.2
+Ineffective Checkpoint Decoupling
+
+Prior work has leveraged data dependencies of DL training to improve performance by decoupling checkpointing from independent operations in subsequent iterations
+[
+33
+,
+20
+,
+38
+]
+. Figure
+3
+illustrates these dependencies using two iterations (
+i
+,
+i+1
+), and arrows to connect data dependent components. We see that checkpointing (C) has no data dependency with either
+forward
+(F) or
+backward
+(B) pass, and so can execute independently of them. In contrast, checkpointing (C) is data dependent on
+optimizer
+(O), because it reads the model updates created by
+optimizer
+, and so both require synchronization. However, we observe two issues with prior work: (i) risk of data loss, and (ii) unsuitability for frequent checkpointing.
+
+First, prior work
+[
+33
+]
+splits checkpointing into two phases: (i) a
+snapshot
+phase that writes checkpoints into volatile memory (e.g., accelerator or CPU memory), and (ii) a
+persist
+phase that writes checkpoints into persistent storage. While the
+snapshot
+phase is synchronized with the
+optimizer
+pass, the
+persist
+phase is completely asynchronous. In contrast, FastPersist writes checkpoints directly to persistent storage, and is synchronized with
+optimizer
+pass. Thus, while prior work incurs the risk of losing checkpoint
+snapshots
+to training interruptions, no such risk exists with FastPersist.
+
+Second, prior work
+[
+33
+,
+20
+]
+targets infrequent checkpointing, e.g., intervals of tens or hundreds of iterations. In contrast, FastPersist is designed for the more challenging case of frequent checkpointing (e.g., every iteration). We conduct a simple analysis to estimate the minimum checkpoint write bandwidth required to overlap checkpointing for an arbitrary model, and to show that the required bandwidth can be met using a reasonable number of SSDs.
+We express the bandwidth objective for a given model
+M
+in equation
+1
+, where
+T_{F}
+, and
+T_{B}
+represent the latency of
+forward
+, and
+backward
+respectively,
+S_{C}
+represents the checkpoint size, and
+B_{C}
+represents the target write bandwidth. This means that if the checkpoint can be created with
+B_{C}
+then this creation will overlap the
+forward
+and
+backward
+of the next iteration.
+
+B_{C}(M)>=\frac{S_{C}(M)}{T_{F}(M)+T_{B}(M)}
+
+(1)
+
+Note that equation
+1
+is constrained in the sense that it assumes a specific distributed training configuration where GBS, DP, GA, and hardware are pre-determined. Thus, for a given training configuration,
+T_{F}
+and
+T_{B}
+can be empirically obtained through measurements of a few training iterations. For a given model,
+S_{C}
+is fixed and independent of distributed training configuration, and could be measured once or estimated using the model parameter count and optimizer type.
+
+We obtain
+B_{C}
+estimates for a training configuration with the most stringent checkpointing latency, and thus the most demanding bandwidth requirements. For each model, this means using the largest valid DP for the published GBS (Table
+2
+), which minimizes iteration time. The required number of DGX-2 nodes for these configurations are reported in Table
+1
+. Since we have only
+8
+DGX-2 nodes, fewer than required, we estimate
+T_{F}
+and
+T_{B}
+using training iterations without GA. This gives smaller
+T_{F}
+and
+T_{B}
+values compared to the required number of nodes due to cheaper gradient reduction.
+We report the
+B_{C}
+estimates in Table
+1
+. We observe that although
+B_{C}
+increases with model size, the available SSD bandwidth also increases since node count also increases with model size. Moreover, the available SSD write bandwidth on the required node count is larger than
+B_{C}
+(maximum of hundreds of GB/sec).
+
+Observation
+2
+: Ineffective Decoupling
+. Prior work risks data loss by using volatile memory, and is unsuitable for frequent checkpointing. However, with efficient SSD utilization and decoupling, checkpointing latency can be hidden, even on every iteration, without sacrificing data safety.
+
+Table 1:
+Estimated required write bandwidth (
+B_{C}
+) to hide checkpoint latency for maximum DP with DGX-2 machines.
+
+Model
+
+DP
+
+# Nodes
+
+B_{C}
+(GB/sec)
+
+gpt3-0.7B
+
+256
+
+16
+
+34
+
+gpt3-1.3B
+
+512
+
+64
+
+59
+
+gpt3-2.7B
+
+512
+
+128
+
+81
+
+gpt3-6.7B
+
+1024
+
+512
+
+160
+
+gpt3-13B
+
+1024
+
+1024
+
+28
+
+3.3
+High Recovery Costs
+
+After an interruption, a DL training job resumes by loading the most recent checkpoint. Because of infrequent checkpointing, the checkpoint could have been created tens or hundreds of iterations prior to the interruption, which means those iterations must be repeated as part of recovery. Assuming DL training with
+m
+GPUs, checkpointing every
+n
+iterations, and iteration time of
+t
+. Assuming training could interrupted at any point in the
+n
+iterations with uniform probability, then the average job recovery overhead is estimated by Equation
+2
+.
+
+\frac{n}{2}*m*t
+
+(2)
+
+For large-scale DL training with infrequent checkpointing (where
+n
+is 10s/100s iterations), Equation
+2
+represents a significant overhead since
+m
+could be
+1000s
+of GPUs, and
+t
+could be 10s of seconds
+[
+48
+,
+49
+]
+. Since
+m
+and
+t
+are typically fixed for a training job, the only way to reduce this overhead is to decrease
+n
+(i.e., increase checkpointing frequency). In particular, the overhead is minimized when
+n=1
+, i.e., checkpointing on every iteration. This is a key motivation of enabling frequent checkpointing for large-scale DL.
+
+Observation
+3
+: Expensive recovery
+. The infrequent checkpointing strategy of prior work (i.e., 10s/100s of iterations) incurs high recovery costs for large-scale DL training.
+
+4
+FastPersist Design
+
+FastPersist combines three optimizations to improve checkpointing of DL training in NVMe devices: (i) acceleration of checkpoint writes, (ii) parallelizing checkpoint writes over DP ranks, and (iii) pipelining checkpoint writes. Figure
+4
+presents a high-level illustration of these optimizations compared to baseline checkpointing. The setting for this comparison is two training iterations of DP training on two accelerators, where checkpoint is created for each iteration. For the baseline case (i.e., Figure
+4
+(a)),
+rank0
+creates the checkpoint at the end of the first iteration, while
+rank1
+stalls so that both ranks commence the next iteration simultaneously.
+
+Figure 4:
+Comparing (a) baseline checkpointing against FastPersist using two training iterations and DP=2. FastPersist improves checkpointing efficiency with three techniques: (b) NVMe-based acceleration, (c) parallelism, and (d) pipelining.
+
+4.1
+Accelerating Checkpoint Writes
+
+The first optimization leverages the multi-gigabyte write bandwidths of NVMe devices. As shown in Figure
+4
+(b), this optimization reduces checkpoint stall and overall iteration time compared to baseline. It is inspired by the observation that traditional I/O system libraries, used by existing DL frameworks are not designed to exploit the performance capability of NVMe devices. Differently, FastPersist relies on newer I/O libraries (e.g.,
+libaio
+
+[
+3
+]
+and
+io_uring
+
+[
+10
+]
+in Linux) that are designed with asynchronous and parallelism optimizations for extracting maximum NVMe performance. Obtaining these performance gains, however, requires dealing with more complex programming abstractions than traditional I/O libraries.
+In particular, FastPersist addresses restrictions relating to memory buffers and data sizes in the following manner.
+
+Figure 5:
+Writing tensors
+T_{i}
+and
+T_{i+1}
+from accelerator memory to NVMe. Instead of (a) serializing the two data transfers, (b) FastPersist overlaps them by double-buffering the DRAM.
+
+Memory buffer restrictions:
+The input data must reside in a memory buffer that allows direct memory access (DMA) transfer to NVMe memory. In commodity systems, such buffers are page-locked CPU memory because DMA between accelerator and NVMe is not yet broadly available despite the recent significant advances
+[
+11
+,
+39
+]
+. Consequently, there are two data transfers involved in checkpoint writes: (i) from accelerator memory to page-locked CPU memory, and (ii) from page-locked CPU memory to NVMe memory. Serializing these two data transfers, as illustrated in Figure
+5
+(a), limits write performance. Thus, FastPersist employs double buffering of the page-locked CPU memory to overlap the data transfers and improve write performance, as shown in Figure
+5
+(b). In particular, FastPersist initiates the second data transfer once the first transfer is halfway done, which essentially eliminates the extra transfer latency.
+
+Data size restrictions:
+The input data size is required to be of a certain alignment (e.g., 512-byte boundary in Linux), due to the use of DMA, and the block size of SSDs. This could hinder checkpointing in two ways. First, checkpoints which do not meet this requirement are excluded from the optimization. Second, checkpoint creation typically involves multiple disk writes of serialized tensors (§
+2.1.3
+), some of which might fail the alignment requirement. Although padding could be used to meet alignment requirements in both cases, it is undesirable because of checkpoint bloat, as well as breaking compatibility and complicating checkpoint loading. Instead, FastPersist addresses this issue in a different way.
+
+For the first case, FastPersist supports checkpoints of arbitrary size by conceptually partitioning the checkpoint data into two: (i) a prefix made up of the largest data subset that meets the alignment requirements, and (ii) a suffix that fails the alignment requirement. This partitioning scheme results in the suffix making up an insignificant portion of the GB-sized checkpoint data for large models (e.g.,
+<512
+bytes in Linux). FastPersist writes the checkpoint prefix using NVMe-optimized libraries, and the suffix using traditional I/O libraries, into the same checkpoint file (preserving compatibility). This approach achieves virtually all the NVMe performance benefits because of the negligible suffix size.
+
+For the second case, FastPersist aggregates the serialized tensors into a queue of pending bytes that is routinely flushed when alignment requirement is satisfied. This approach could result in the bytes of a tensor being persisted by different write operations, and the bytes of different tensors being persisted by the same write operation. Nevertheless, FastPersist preserves correctness by ensuring that the order in which tensors (and their bytes) are persisted to disk remains unchanged.
+
+4.2
+Parallelizing Checkpoint Writes
+
+The second optimization leverages the parallel I/O hardware of DP ranks, such as the local SSDs across machines, to further reduce checkpoint write latency. As shown in Figure
+4
+(c), this optimization improves performance with two key changes. First, it divides checkpoint creation among DP ranks so that each rank writes only a portion of checkpoint data, as opposed to
+rank 0
+writing the entire checkpoint. Second, it uses more I/O hardware for checkpoint creation as opposed to using only the I/O hardware of
+rank 0
+. As a result of these changes, checkpointing performance and efficiency is improved in two ways: (i) reduced latency through the increased write bandwidth from using more I/O hardware simultaneously for checkpoint creation, and (ii) increased utilization of I/O hardware.
+
+This optimization is inspired by the observation that DP ranks (a.k.a., model replicas) hold identical checkpoint data, and so each rank can create any subset of the checkpoint data. This means that it is relatively easy to ensure that the entire checkpoint data is persisted in storage for any partitioning scheme, which is a correctness requirement. However, achieving high efficiency in terms of reducing latency proportionally to I/O hardware scaling is more challenging and requires careful handling of communication, load balancing, and hardware efficiency. We now describe how FastPersist addresses these issues in order to realize highly efficient write parallelism.
+
+Communication:
+A potential source of overheads during parallel checkpoint writing is communication or coordination among the participating DP ranks. FastPersist avoids such overheads by partitioning the checkpointing task among DP ranks during the distributed model training setup, i.e., before the first training iteration. This means that during checkpoint creation, each DP rank already knows the checkpoint data portion that it is responsible for writing to storage, and can therefore complete its task without communicating with others. This approach assumes that the work partitioning among DP ranks will be fixed for the entire training run. However, a number of events could occur during training that violate this assumption, such as model changes (e.g., parameter freezing) or hardware failures. Nevertheless, we expect FastPersist to work well in practice, since such events would generally require a repeat of the training setup, creating the opportunity to recompute the partitioning.
+
+Figure 6:
+T
+raining model
+M
+on 2 nodes with DP=4. While (a) baseline uses only rank 0 to write checkpoints (shaded box), FastPersist parallelizes checkpoint writes (shaded slices) across either (b) four DP ranks or (c) two DP ranks.
+
+Hardware efficiency:
+Since DP training does not change checkpoint size, we consider two situations where using all the DP ranks to parallelize checkpoint creation could prove sub-optimal: (i) the checkpoint partition assigned to each rank is reduced to a size that prevents efficient disk write, and (ii) contention for shared I/O hardware (e.g., PCIe or SSD) by the ranks is increased to a magnitude that hurts hardware efficiency. In these cases, checkpoint write bandwidth improves sub-linearly with respect to DP because of reduction in average bandwidth of ranks (or devices). In contrast, using a subset of the DP ranks, to increase write size per rank and reduce hardware contention, could yield better performance. Thus, in order to ensure good performance across many usage scenarios, FastPersist provides the flexibility of using a subset of DP ranks to parallelize checkpoint creation.
+
+We illustrate the flexibility of FastPersist checkpointing parallelism in Figure
+6
+for model
+M
+trained on two nodes with DP=4. In the baseline approach, Figure
+6
+(a), the model checkpoint is created by
+rank 0
+using the I/O hardware of
+node 0
+. In contrast, FastPersist parallelizes checkpoint creation using I/O hardware of both nodes, and with the flexibility of using four ranks (Figure
+6
+(b)) or two ranks (Figure
+6
+(c)). In this example, parallelizing with two ranks instead of four increases write size per rank, and avoids I/O hardware contention.
+
+FastPersist avoids selecting an arbitrary subset of DP ranks for checkpoint parallelism because some subsets hurt performance compared to using all DP ranks. Consider Figure
+6
+, parallel checkpointing using two ranks from the same node (i.e.,
+rank 0
+&
+rank 1
+, or
+rank 2
+&
+rank 3
+) is worse than using all four ranks because of under-utilization of I/O hardware. Thus, FastPersist chooses a subset of DP ranks that maximizes the utilization of, but minimizes contention for I/O hardware.
+
+Load balancing:
+The partitioning algorithm must ensure that the checkpointing load is evenly balanced among the participating DP ranks to avoid
+straggler effects
+and resulting performance problems. Since our target are homogeneous hardware clusters where ranks have identical write bandwidth (GB/sec), the load of each rank is the size in bytes of the partition assigned to it. This requirement makes the simple approach of dividing the model layers among the DP ranks an unsuitable solution, because it would result in load imbalance for models with different types of layers. For example, large language models consist of different layer types (e.g., embedding, transformer, normalization, etc.), and the count and size (bytes) of these types are significantly different. Dividing the tensors among the ranks is similarly unsuitable.
+
+FastPersist partitions data on byte granularity to achieve load balancing among the parallel checkpoint writers. This approach depends on the actual number of bytes written out to disk, and so partitioning is done after tensor serialization and other in-memory processing that modify checkpoint size. Delaying the partitioning step like this helps to tightly bound imbalance to at most one byte. Loading parallel checkpoints is a two step process where each DP rank: (i) loads its checkpoint partition, if any, into GPU memory, and (ii) performs an
+allgather
+collective communication with other DP ranks of the model slice to assemble the full checkpoint state.
+
+4.3
+Pipelining Checkpoint Writes
+
+The third optimization overlaps checkpoint creation with independent operations of the next iteration in order to reduce or avoid training stalls. As shown in Figure
+4
+(d), this optimizations improves performance by allowing the
+forward
+and
+backward
+passes of the next iteration to run immediately after the
+optimizer
+pass, and concurrently with the checkpoint creation. The
+optimizer
+pass of the next iteration is stalled only if checkpoint creation is not completed at the time, otherwise it proceeds with updating the model and training runs entirely without stalling. Synchronizing checkpointing and
+optimizer
+in this fashion is sufficient to satisfy the correctness requirement of the data dependency.
+
+For each training rank, this optimization introduces sharing of GPU compute and memory between a main thread and a helper thread. The main thread handles the compute (i.e.,
+forward
+,
+backward
+, and
+optimizer
+) and communication (e.g., gradient reduction) aspects of distributed training, while the helper thread handles checkpoint creation.
+
+The two threads cooperate in the following fashion. The helper thread executes an infinite loop where it blocks until woken by the main thread to create checkpoints. The helper thread then proceeds to write the relevant tensors to persistent storage, signals completion to the main thread, and then blocks until the next request. The main thread blocks before
+optimizer
+to receive confirmation of the completion of the previous checkpoint creation request, and sends a new checkpoint creation request to the helper thread after
+optimizer
+.
+
+Since the main thread handles the critical path of training, we use the following design choices for the helper thread to reduce contention for GPU compute and memory. First, the helper thread’s use of GPU memory is restricted to reading existing tensors, and so it does not allocate GPU memory. Second, the helper thread reads GPU tensors into page-locked CPU memory which uses DMA transfers and minimizes GPU cycles. Third, our write parallelization scheme is communication-free (§
+4.2
+), so the helper thread does not need to execute GPU communication kernels. In summary, by ensuring that the helper thread mainly consumes CPU and I/O resources, we reduce contention with the GPU-bound main thread, and thus improve overall efficiency.
+
+5
+Evaluation
+
+We now evaluate the performance of FastPersist for DL model training in the challenging scenario of checkpointing in every iteration. Our results are organized in the following way. First, we study the effectiveness our NVMe and parallelism optimizations for reducing checkpointing latency. For this, we use micro-benchmarks on single GPU and multi-node environments to measure checkpointing throughput (§
+5.3
+), and real world dense and sparse DL models to additionally measure training speedups relative to baseline (§
+5.4
+, §
+5.5
+). Second, we study the effectiveness of our decoupling strategy to hide checkpointing latency to achieve negligible training slowdowns (§
+5.6
+). Finally, we estimate FastPersist performance for DP larger than our GPU availability (§
+5.7
+).
+
+5.1
+Implementation.
+
+We build FastPersist on PyTorch
+[
+40
+]
+and DeepSpeed
+[
+5
+]
+.
+
+Checkpoint creation:
+
+torch.save()
+in PyTorch provides flexible interface that allows a destination file to be optionally specified as an object which implements I/O routines (e.g.,
+write()
+). We exploit this flexibility by implementing FastPersist in a compatible object that we pass to
+torch.save()
+. Our integration enables
+torch.save()
+to use FastPersist for disk writes instead of standard I/O routines, with no change to other operations (e.g., tensor serialization).
+
+NVMe optimizations:
+DeepSpeed provides an NVMe-optimized module for fast tensor offloading
+[
+43
+,
+9
+]
+. We extend this module to support a file creation pattern involving multiple segment writes to increasing offset positions. This matches the standard way of creating checkpoints through multiple writes of serialized tensors (§
+2.1.3
+).
+
+Checkpoint pipelining:
+The standard behavior of DeepSpeed is to create a single Python process for each training rank to perform training and checkpointing operations on the GPU. We extend DeepSpeed for checkpoint pipelining by creating a second and dedicated Python process for each rank for checkpointing, since multi-threading is inefficient due to python GIL.We leverage CUDA multiprocessing support to coordinate the training and checkpointing processes.
+
+5.2
+Methodology
+
+5.2.1
+Hardware
+
+We evaluated FastPersist on a cluster consisting of
+8
+DGX-2 machines connected via Infiniband. Each machine contains
+16
+Nvidia V100 GPUs with 32GB on-device memory, for a total of
+128
+GPUs. There are
+8
+locally attached NVMe SSDs on each machine, configured into a single RAID-0 volume, a combined peak write bandwidth of
+24.8
+GB/sec.
+
+5.2.2
+Models
+
+Table 2:
+Experiment details of GPT-3 models.
+
+Model
+
+Dense
+
+Model/Expert
+
+Global
+
+Checkpoint
+
+Size
+
+Parallelism
+
+Batch Size
+
+Size (GB)
+
+0.7B
+
+Yes
+
+1
+
+256
+
+10
+
+1.3B
+
+Yes
+
+2
+
+512
+
+17
+
+2.7B
+
+Yes
+
+4
+
+512
+
+35
+
+6.7B
+
+Yes
+
+8
+
+1024
+
+88
+
+13B
+
+Yes
+
+16
+
+1024
+
+173
+
+1.8B-MoE
+
+No
+
+16
+
+256
+
+67
+
+For our experiments, we use the dense and sparse DL models listed in Table
+2
+, all of which are based on the GPT-3
+[
+13
+]
+model architecture. The five dense models range in size from
+0.7
+to
+13
+billion parameters, and are configured, in terms of model parallelism (MP), and global batch size (GBS), based on details in
+[
+13
+]
+. Dense models with
+MP>1
+use only tensor parallelism (TP), except
+gpt3-13B
+which also uses pipeline parallelism (PP) (i.e., TP=
+8
+, PP=
+2
+). The sparse model is a
+1.8
+billion parameter Mixture of Experts (MoE), with expert parallelism (EP) degree of
+16
+and GBS of
+256
+, based on details in
+[
+42
+]
+. Table
+2
+reports the checkpoint sizes. We use gradient accumulation (GA) to align our experiments with
+[
+13
+,
+42
+]
+due to the data parallelism (DP) limits of our cluster.
+
+(a)
+
+Single GPU,
+16MB Checkpoint
+
+(b)
+
+Single GPU,
+512MB Checkpoint
+
+Figure 7:
+Varying
+IO Buffer
+size on single GPU
+
+(a)
+
+2 Nodes (4 Sockets).
+
+(b)
+
+8 Nodes (16 Sockets).
+
+Figure 8:
+Parallel checkpointing of
+gpt3-0.7b
+.
+
+5.3
+Micro Benchmark
+
+Here we evaluate the proposed schemes of overlapped checkpoint writes (§
+4.1
+) and write parallelism (§
+4.2
+).
+
+5.3.1
+Single GPU Experiments
+
+A core aspect of our NVMe optimizations is using page-locked CPU memory (a.k.a.,
+IO Buffer
+) to write checkpoint data from accelerator memory to SSD. In this set of single GPU experiments we study four aspects of these optimizations: (i) speedup over baseline
+torch.save()
+, (ii) checkpoint data size, (iii)
+IO Buffer
+size, and (iv) single buffer and double buffer write modes. We measure the bandwidth of writing GPU tensors of sizes ranging from
+16
+MB to
+512
+MB to SSD. We chose this size range to represent the per rank checkpoint load in training scenarios where FastPersist parallelizes GBs/TBs of checkpoint data over dozens/hundreds of DP ranks. In Figure
+7
+, we report the relative bandwidth of FastPersist over baseline for
+16
+MB and
+512
+MB checkpoints and
+IO Buffer
+sizes of
+2
+MB
+\sim
+
+128
+MB. We see similar results for
+32
+MB
+\sim
+
+256
+MB checkpoints but leave those to appendix.
+
+First, we see that FastPersist, in either single or double buffer mode, consistently outperforms
+torch.save()
+. For all checkpoint sizes, we observe performance improvements of 1.8X
+\sim
+3.6X, and 1.8X
+\sim
+6.6X for single and double buffer modes respectively. These results show significant efficiency benefits of FastPersist, even on a single GPU.
+
+Second, we see that the benefits of FastPersist increases with checkpoint data size. For single buffer mode, the maximum improvement increases from
+2.5
+X for
+16
+MB checkpoints to
+3.6
+X for
+512
+MB. Similarly, for double buffer mode, the maximum improvement increases from
+3.6
+X for
+16
+MB to
+6.6
+X for
+512
+MB. While it is known that disk write efficiency improves with size, these results show that FastPersist achieves better efficiency improvement compared to baseline.
+
+Third, we see that
+IO Buffer
+size affects both single and double buffer modes, and in different ways for different checkpoint sizes. For 16MB checkpoints, the lowest performance of both modes is with 2MB
+IO Buffer
+, while the best performance is with 16MB (single buffer) and 8MB (double buffer). Also, the performance ratio of the best over the worst is 1.38X (single buffer) and 1.43X (double buffer). Similarly, for 512MB checkpoints, the lowest performance of both modes with 2MB
+IO Buffer
+, and the best performance is with 64MB (single buffer) and 32MB (double buffer). In this case, the performance ratio of best over the worst is 1.6X (single buffer) and 2.87X (double buffer). Thus, careful
+IO Buffer
+size configuration is rewarding, especially for large checkpoints.
+
+Fourth, double buffer mode is faster than single buffer mode for most
+IO Buffer
+and checkpoint data sizes. For the studied seven
+IO Buffer
+sizes, double buffer mode is better in five cases for 16MB checkpoints (1.01X
+\sim
+1.4X faster), and in six cases for 512MB checkpoints (1.2X
+\sim
+1.77X faster). In the few cases where single buffer mode is better, the performance gap is
+\leq
+3%. Moreover, double buffer mode obtains the best performance for both 16MB (5.18GB/s) and 512MB (10.9GB/s) checkpoints. Thus, double buffer mode is generally preferable, especially for well configured
+IO Buffer
+.
+
+5.3.2
+Multi-Node Experiments
+
+For DP training, FastPersist can parallelize checkpoint writes using all or some DP ranks. In this set of experiments, we study the performance of these two options by measuring the bandwidth of writing a
+gpt3-0.7b
+checkpoint (
+\sim 10
+GB) from GPU memory to SSD. Each DGX-2 node has two CPU sockets, and so in our experiments, we configure write parallelism with some DP ranks as one writer per CPU socket for higher CPU and PCIe utilization. In our results, we label using all DP ranks as
+Replica
+, and using some DP ranks as
+Socket
+. We collect results on up to
+8
+nodes, using up to
+16
+GPUs per node. Figure
+8
+presents the results of
+2
+and
+8
+nodes. We see the similar patterns in the results of 1 and 4 nodes, and leave their results to the appendix to save space.
+
+We observe that the relative performance of
+Replica
+and
+Socket
+depends on interaction of the benefits of increasing write parallelism degree, increased available bandwidth, and the downsides, increased I/O hardware contention and reduced per rank write size. From Figure
+8
+, we see that the best write parallelism degree is
+8
+and
+16
+for
+2
+and
+8
+nodes respectively. On
+2
+nodes, this corresponds to
+4
+GPUs per node, is possible only with
+Replica
+(
+Socket
+is restricted to
+4
+), and achieves
+41.8
+GB/sec write bandwidth (
+91\%
+of SSD peak). On
+8
+nodes, this corresponds to
+2
+GPUs per node, is possible with both
+Replica
+and
+Socket
+, but
+Socket
+achieves the best aggregate bandwidth of
+129.8
+GB/sec (
+87\%
+of SSD peak). We observe that scaling beyond these parallelism degrees degrades
+Replica
+performance (especially on
+8
+nodes) due to the aforementioned downsides. These results show the benefit of
+Socket
+write parallelism for large-scale DP training.
+
+5.4
+Real World Dense Models
+
+We study the performance benefits of FastPersist for dense models in terms of checkpointing and end-to-end training.
+
+(a)
+
+Checkpointing speedup
+
+(b)
+
+Checkpoint throughput scaling
+
+(c)
+
+Training speedup on 8 nodes
+
+(d)
+
+Training speedup relative to DP
+
+Figure 9:
+FastPersist on GPT3 dense model training.
+
+5.4.1
+Checkpoint Speedup
+
+We observe that FastPersist creates checkpoints significantly faster than baseline. Figure
+9(a)
+shows that on
+128
+V100 GPUs, FastPersist achieves speedups ranging from
+28
+x (
+gpt3-13B
+) to
+116
+x (
+gpt3-0.7B
+). These improvements demonstrate the effectiveness of our NVMe and parallelism optimizations. Speedup decreases as model size increases because larger models have smaller DP degree, for a fixed GPU count, and thus lower checkpointing parallelism. For example, DP degrees of
+gpt3-0.7B
+and
+gpt3-13B
+are
+128
+and
+8
+respectively.
+
+Figure
+9(b)
+reports the checkpointing throughput of FastPersist for the configurable DP degrees of each model on up to
+128
+GPUs. We make three observations: (i) FastPersist throughput scales with DP degree for all models, (ii) FastPersist writes checkpoints at up to
+146
+GB/sec (
+gpt3-13b
+), which is
+80\%
+of theoretical peak on
+8
+nodes, and (iii) for a DP degree, FastPersist is more efficient on larger models due to larger writes per parallel writer.
+
+5.4.2
+E2E Training Speedup
+
+We study the speedup provided FastPersist over baseline for end-to-end training with checkpointing on every iteration. Figure
+9(c)
+reports that for training on
+128
+GPUs, FastPersist speedups are in the range of
+1.6
+x (
+gpt3-13B
+) to
+21.8
+x (
+gpt3-0.7B)
+. As explained earlier, we observe higher speedups for smaller models (e.g.,
+gpt3-0.7B
+because their higher DP degree enables higher write parallelism. This speedup trend is better illustrated by Figure
+9(d)
+, which reports training speedups as a function of DP degree. We observe that for a given DP degree, FastPersist achieves similar speedups for all the models. However, since FastPersist speedup increases with DP degree, smaller models (e.g.,
+gpt3-0.7B)
+enjoy higher speedups as they can be trained with higher DP degrees in our cluster. We expect that the speedups of larger models (e.g.,
+gpt3-13B
+) will increase with DP, and we test this conjecture in §
+5.7
+by projecting DP degree to
+128
+.
+
+5.5
+Real World Sparse Models
+
+Sparse models have recently gained attention as way to scale model size without increasing the computation requirements
+[
+32
+,
+22
+,
+42
+]
+. We study the performance benefits of FastPersist for sparse models in terms of checkpointing and end-to-end training. We use
+gpt3-1.8B-MoE
+with EP=
+16
+, which means a model replica occurs a node and restricts DP to
+\leq 8
+.
+
+(a)
+
+Speedups.
+
+(b)
+
+Throughput scaling with DP.
+
+Figure 10:
+FastPersist on
+gpt3-1.8B-MoE
+.
+
+5.5.1
+Checkpointing Speedup
+
+Similar as Section 5.4.1, blue bars in Figures
+10(a)
+shows our speedup over baseline on MoE model. Compared with our results on dense models, we achieve higher speedup on sparse models with the same DP degree. For example, compared with the dense counterpart GPT-3 13b which also use 16 GPUs per DP group, we can achieve 32x speedup in MoE models with 8 DP degree whereas GPT-3 13b achieve 28x speedup in Figure
+9(a)
+. Furthermore, we can even achieve 7x speedup with just DP=1. This is mainly because sparse models need to checkpoint more data compared with dense models.
+
+In Figure
+10(b)
+, we show our MoE checkpoint performance over DP scaling. Baseline performs pooly in this case, which only achieve around 4GB/s writing throughput. As shown in Figure
+10(b)
+, we achieve near linear scalability from 1 node to 8 nodes and very close to hardware upperbound, which also verifies the effectiveness of our implementation.
+
+5.5.2
+E2E Training Speedup
+
+For orange bars in Figure
+10(a)
+, we report training time speedup for MoE model. Compared with results in Figure
+9(d)
+, here we achieve higher speedup with the same DP degree. For example, the iteration time is less than 2x given DP degree of 8 in dense models in Figure
+9(d)
+. In contrast, in MoE case as orange bars in Figure
+10(a)
+, we can achieve 15x end-to-end iteration time speedup with same DP degree of 8. It shows the trend that FastPersist’s performance can be more pronounced or amplified in sparse model scenarios.
+
+(a)
+
+Impact of DP and GAS
+
+(b)
+
+Training slowdown on 8 nodes
+
+Figure 11:
+FastPersist pipelining performance.
+
+5.6
+Pipelined Checkpointing
+
+We now evaluate the additional benefits of using pipelining to reduce checkpointing stalls (§
+4.3
+).
+
+5.6.1
+Sensitivity Analysis
+
+We run
+gpt3-1.3B
+with DP=
+1
+and compare the training slowdown of checkpointing on each iteration for baseline and FastPersist with and without pipelining. We use GPU
+0
+and
+8
+to minimize DRAM and PCIe bandwidth interference. As discussed in §
+2.1.2
+, higher GAS values (lower DP values) increases compute time and lowers checkpointing overhead. So, we sweep over gradient accumulation step (GAS)
+1
+to
+512
+to observe the interaction of GAS and DP on checkpointing performance. The results summarized in Figure
+11(a)
+, show that pipelining is better for GAS
+<64
+, and achieves negligible slowdown earlier (
+8\%
+at GAS=
+8
+).
+
+Figure 12:
+Projecting to DP
+\leq 128
+.
+
+5.6.2
+Training Overheads of Frequent Checkpointing
+
+We use the dense GPT3 models to evaluate the effectiveness of FastPersist in reducing the training overheads of checkpointing on every iteration. We fix the number of nodes to
+8
+and measure FastPersist slowdown with and without pipelined checkpointing. In Figure
+11(b)
+, the results show that checkpoint pipelining consistently provides additional benefits to checkpoint acceleration. Moreover, we observe that for model size between 1.3b to 13b, we can achieve
+<5\%
+overhead when checkpointing at every training iteration, which can be negligible. It indicates that we can checkpoint large NLP models at every iteration for almost free, which is quite impressive.
+
+5.7
+Projection to Larger Scale
+
+Given GPU hardware constrain, we simulate performance results for big dense models like GPT-3 6.7B and 13B by projecting up to 128 DP degree (i.e., 1024 GPUs for 6.7B, 2048 GPUs for 13B). For 6.7B with DP degree of 16, we omit simulation since it is evaluated in Figure
+9(c)
+.
+
+Figure
+12
+shows the projected training speedup numbers that FastPersist achieves over the baseline, where blue/orange bars are for 6.7B/13B model respectively. When scaling out to thousands of GPUs, FastPersist maintains consistent checkpointing overhead (
+<2\%
+of training computation time) whereas baseline checkpointing overheads grows proportionally to DP degree. For 6.7B and 13B models, we achieve up to 10.2x and 3.6x training speedup over baseline, separately.
+
+To further reduce computation time for 13B model, we abandon PP and apply fully TP over 16 GPUs as a DP group. As grey bars in Figure
+12
+, FastPersist achieves much higher speedup numbers over the baseline when comparing with standard TP and PP combined model split (i.e., orange bars in Figure
+12
+). We can achieve up to 11.3x training speedup over baseline in this full TP setting.
+
+6
+Related Work
+
+Checkpointing
+[
+41
+]
+has been studied in distributed systems with various goals
+[
+14
+,
+30
+,
+17
+,
+35
+,
+51
+,
+24
+,
+31
+]
+. We summarize the related works into following three categories.
+
+The first line of work is decoupling checkpointing from model training process
+[
+33
+,
+20
+]
+. Particularly, CheckFreq
+[
+33
+]
+conducts training workload profiling and automatically tunes checkpoint frequency given different software and hardware configurations. Moreover, it decouples checkpointing from the training pipeline.
+Similarly, Check-N-Run
+[
+20
+]
+utilizes checkpointing decoupling and further reduces checkpoint size via quantization and only persists the changed values. These works complete model checkpointing in 2 steps: first persist data in volatile host memory and return, then flush data to non-volatile storage in the background. Different from these arts, FastPersist’s single writer directly write data from GPU memory to non-volatile SSDs and achieve similar throughput as writing data to host memory. In addition, compared with quantization scheme in Check-n-run
+[
+20
+]
+, FastPersist further reduces checkpoint overhead to be negligible by adopting parallel writers without losing data precision.
+
+The second line for boosting-up checkpoint speed is model sharding and using parallel writers. The works like DeepFreeze
+[
+37
+]
+achieve in-parallel checkpointing in data parallel dimension. However, it is only applicable for checkpointing of small models and focus on CPU cluster. In contrast, FastPersist adopts similar approach but applies the parallelism on giant deep learning model checkpointing on GPUs.
+
+In addition, neither of the aforementioned works is specially optimized for NVMe storage. Besides deep learning workloads, FastPersist’s optimization on NVMe device can be generally applicable to any data persistence process (e.g., data persistence in database, mapreduce systems).
+
+The last line of related literature is to utilize SSD to accelerate GPU workloads
+[
+43
+,
+11
+]
+. Spin
+[
+11
+]
+integrates peer-to-peer (p2p) access between disk and GPU into file I/O layer and activates p2p functionality when necessary, which achieves decent throughput for data transfer between GPU memory and SSDs. Zero-infinity
+[
+43
+]
+treats NVMe as the backbone slow memory and transfers data into GPU HBM memory when needed, which empowers giant deep learning model to be trained on limited number of GPUs. Different from above work, FastPersist is specially designed for deep learning checkpoiting workload and leveraging data parallel model replicas to further reduce data persistence overhead.
+
+7
+Conclusion
+
+To the best of our knowledge, FastPersist is the first system effort that utilizes NVMe capability to improve efficiency of DL model checkpointing. FastPersist leverages NVMe optimizations and data parallel writes to near-linearly scale checkpointing performance. Furthermore, FastPersist leverages DL domain knowledge to overlap model checkpointing with training iteration to reduce checkpointing stalls. Evaluation results show that, FastPersist can checkpoint large models frequently, on every training iteration, with negligible overhead.
+
+8
+Appendix
+
+This section presents more results of micro-benchmark (§
+5.3
+). In particular, we report the IO buffer size in the range of
+32
+MB–
+256
+MB on a single GPU in Figures
+13
+and
+14
+. Moreover, we also report the multi-node experiment results in Figure
+15
+for 1 node and 4 nodes. The conclusions can be found in §
+5.3
+.
+
+(a)
+
+Single GPU,
+32MB Checkpoint
+
+(b)
+
+Single GPU,
+64MB Checkpoint
+
+Figure 13:
+Varying
+IO Buffer
+size (32MB and 64MB) on single GPU
+
+(a)
+
+Single GPU,
+128MB Checkpoint
+
+(b)
+
+Single GPU,
+256MB Checkpoint
+
+Figure 14:
+Varying
+IO Buffer
+size (128MB and 256MB) on single GPU
+
+(a)
+
+1 Nodes (2 Sockets).
+
+(b)
+
+4 Nodes (8 Sockets).
+
+Figure 15:
+Parallel checkpointing of
+gpt3-0.7b
+.
+
