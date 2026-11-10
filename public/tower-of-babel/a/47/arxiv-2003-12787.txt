@@ -1,0 +1,2720 @@
+Vectorization and Minimization of Memory Footprint for Linear High-Order Discontinuous Galerkin Schemes
+Jean-Matthieu Gallard, Leonhard Rannabauer, Anne Reinarz, Michael Bader
+
+Abstract
+We present a sequence of optimizations to the performance-critical compute kernels of the high-order discontinuous Galerkin solver of the hyperbolic PDE engine ExaHyPE – successively tackling bottlenecks due to SIMD operations, cache hierarchies and restrictions in the software design. Starting from a generic scalar implementation of the numerical scheme, our first optimized variant applies state-of-the-art optimization techniques by vectorizing loops, improving the data layout and using Loop-over-GEMM to perform tensor contractions via highly optimized matrix multiplication functions provided by the LIBXSMM library. We show that memory stalls due to a memory footprint exceeding our L2 cache size hindered the vectorization gains. We therefore introduce a new kernel that applies a sum factorization approach to reduce the kernel’s memory footprint and improve its cache locality. With the L2 cache bottleneck removed, we were able to exploit additional vectorization opportunities, by introducing a hybrid Array-of-Structure-of-Array data layout that solves the data layout conflict between matrix multiplications kernels and the point-wise functions to implement PDE-specific terms. With this last kernel, evaluated in a benchmark simulation at high polynomial order, only 2% of the floating point operations are still performed using scalar instructions and 22.5% of the available performance is achieved.
+
+
+
+I
+Introduction
+
+Developing an exascale-ready solver framework for systems of partial differential equations (PDEs) is not a simple task.
+On the one hand, it requires fine-tuning of its performance-critical components with respect to both the user-written application
+and the target architecture on which the production code is expected to run. On the other hand, it must retain flexibility and usability.
+The EU Horizon 2020 project ExaHyPE (“An Exascale Hyperbolic PDE Engine”,
+www.exahype.eu
+) had just this goal:
+published as open source, ExaHyPE should allow
+medium-sized research teams to quickly realize extreme-scale simulations. It is intended as an
+engine
+(as in “game engine”)
+and while focusing on a dedicated numerical scheme and on a fixed mesh infrastructure,
+it provides flexibility in the PDE system to be solved
+[
+1
+]
+.
+
+ExaHyPE employs a high-order discontinuous Galerkin (DG) method combined with ADER (Arbitrary high-order DERivative) time-stepping first proposed in
+[
+2
+]
+.
+A-posteriori Finite-Volume-based limiting addresses the problem of instabilities that may occur for non-linear setups
+[
+3
+]
+.
+The ADER method is an explicit one-step predictor-corrector scheme. The solution is first computed element-locally and then corrected using contributions from neighboring elements.
+A cache-aware, communication-avoiding ADER-DG realization
+[
+4
+]
+allows high-order accuracy in time with just a single (amortized) mesh traversal, which leads to high arithmetic intensity.
+This high arithmetic intensity leads to advantages in performance and time-to-solution compared to Runge-Kutta-DG (RK-DG) approaches (cf.
+[
+5
+]
+).
+Previous performance studies
+[
+6
+]
+also showed, however, that these advantages can be impeded by a large memory footprint for the element-local predictor step.
+ADER-DG hence faces slightly different optimization challenges than the more widespread RK-DG methods.
+
+For flexibility and modularity, ExaHyPE isolates the performance-critical components of the ADER-DG scheme into compute kernels.
+Multiple variants of each kernel exist, allowing the user to adapt the scheme to a given application’s numerical requirements –
+for example, choosing between a scheme for a linear or a non-linear PDE system.
+Furthermore, code generation utilities are used before compilation to produce kernels that are tailored toward both the given application and the target architecture,
+as specified by the user
+[
+7
+]
+.
+
+ExaHyPE’s performance is heavily dominated by the Space Time Predictor (STP),
+which computes an entirely element-local time extrapolation of the solution.
+For linear PDE systems, such as in the context of seismic simulations
+[
+8
+]
+, the STP is computed via a Cauchy-Kowalewsky scheme, which requires tensor operations that imply calls to PDE-specific
+user functions
+.
+This generates conflicting requirements on the ExaHyPE API: the data layout needed for optimization of the tensor operations and that needed for vectorization of the user functions differs (AoS vs. SoA).
+
+In this paper, we show the gradual optimization of the linear STP kernel starting from the generic non-optimized algorithm.
+As each further optimization step also requires more work by the user, each new variant is added as an opt-in feature.
+Combined with the code generation approach used in ExaHyPE this ensures continuing sustainability of the code.
+
+We start with a brief overview of the engine, the ADER-DG scheme, kernels and a focus on the linear STP kernel’s Cauchy-Kowalewsky scheme.
+In Sec.
+III
+we justify the choice of data layout and discuss the optimization of the STP kernel
+using ExaHyPE’s code generation utilities and the LIBXSMM library
+[
+9
+]
+.
+Next we discuss how memory stalls impede efficiency of these optimizations and how to reformulate the kernel’s algorithm to reduce its memory footprint and thus memory stalls.
+In Sec.
+V
+we describe how this removed bottleneck allows to exploit further vectorization opportunities by using a hybrid data layout to solve the data layout conflict caused by the API requirements.
+Finally, we evaluate and compare the performance of all STP kernel variants in various benchmarks,
+focusing on the Intel Skylake architecture.
+
+II
+The ExaHyPE Engine
+
+II-A
+
+ADER-DG solver
+
+The ExaHyPE engine is designed to solve a wide class of systems of linear and non-linear hyperbolic PDEs. However, in this paper we focus on efficiently solving linear equations. In matrix form the equations are as follows
+
+\textrm{Q}_{t}=\textrm{M}\left(\nabla\cdot\left(\textrm{F}\left(\textrm{Q}\right)\right)+\textrm{B}\cdot\nabla\textrm{Q}\right)+\delta_{x_{0}}\textrm{,}
+
+(1)
+
+where
+Q
+represents the time and space dependent physical quantities of the system. The temporal evolution of the quantities is defined by the conservative flux
+\textrm{F}\left(\textrm{Q}\right)=\left(F_{1}\textrm{Q},F_{2}\textrm{Q},F_{3}\textrm{Q}\right)
+, as well as the non-conservative flux term
+\textrm{B}\cdot\nabla\textrm{Q}=\left(B_{1}\nabla_{x}\textrm{Q},B_{2}\nabla_{y}\textrm{Q},B_{3}\nabla_{z}\textrm{Q}\right)
+.
+1
+1
+
+1
+
+\nabla\cdot\textrm{F}
+denotes divergence of
+F
+,
+\nabla\textrm{Q}
+the spatial gradient of
+Q
+.
+
+M
+models material properties. Point sources are modeled via
+\delta_{x_{0}}
+.
+
+In a DG scheme the numerical solution of (
+1
+) is represented by polynomials within each cell. We use a nodal basis given by the Lagrange polynomials with either Gauss-Legendre or Gauss-Lobatto interpolation points.
+The hexahedral mesh used in ExaHyPE allows us to use a tensor product basis, i.e.
+each basis function is composed of one-dimensional basis functions
+\Phi_{\mathbf{k}}\left(x,y,z\right)=\phi_{k_{1}}\left(x\right)\phi_{k_{2}}\left(y\right)\phi_{k_{3}}\left(z\right)
+.
+The multiindex
+\mathbf{k}=(k_{1},k_{2},k_{3})
+refers to a specific nodal coordinate.
+The unknown state vector can now be approximated in each element by
+\textrm{Q}(x,y,z,t)\approx\sum_{\mathbf{k}}\phi_{k_{1}}(x)\phi_{k_{2}}(y)\phi_{k_{3}}(z)q_{\mathbf{k}}(t)
+.
+
+For brevity we refer to
+[
+3
+,
+1
+]
+for a more detailed introduction of the semi-discrete scheme, which relies on a strong formulation of (
+1
+) and
+can be summarized as follows.
+
+•
+
+Multiply (
+1
+) with a test function from the same space as the ansatz function and integrate over each element.
+
+•
+
+Integration by parts (twice) of the flux terms.
+After this step we are left with volume and face integrals. To compute the face integrals we introduce numerical fluxes
+\mathcal{F}^{*}
+. Here we assume that
+\mathcal{F}^{*}
+is linear in
+Q
+and
+F
+, which simplifies the algorithm significantly.
+
+•
+
+Project the equation from the mesh elements onto the reference unit cube.
+
+To solve linear problems of the form (
+1
+) for suitable initial and boundary conditions we implemented the Cauchy-Kowalewsky (CK) method in ExaHyPE.
+
+After the discretization in space the computation of the required volume and face integrals reduces to the computation of cell-local tensor operations. To evaluate the necessary integrals we apply a quadrature rule based on the nodal points chosen for the Lagrange polynomials.
+We require
+N
+nodal points per dimension to achieve
+N
+-th order convergence.
+
+In each cell we must compute the following matrices:
+
+•
+
+the discrete mass matrix
+M
+–
+this results in a diagonal mass matrix with the quadrature weights as entries, saving us the effort of inverting the mass matrix.
+
+•
+
+the discrete derivative operator
+D
+.
+
+•
+
+a projection operator
+P
+–
+this projection is needed to compute the effect of the point source on each node. It projects the point source onto each nodal basis function.
+
+•
+
+\textrm{F}^{1},\textrm{F}^{2},\textrm{F}^{3}
+: the physical flux in each direction
+
+•
+
+\textrm{B}^{1},\textrm{B}^{2},\textrm{B}^{3}
+: the non-conservative flux in each direction
+
+In the resulting scheme we compute two kernels. The first incorporates all integrals in the reference element, which we call the volume term.
+Each degree of freedom is given by a multiindex for the basis function and an index for the variable:
+
+\displaystyle V_{\mathbf{k}r,\mathbf{l}s}q_{\mathbf{l}s}
+
+\displaystyle=\textrm{M}_{sr}\bigl(\textrm{D}_{l_{1}k_{1}}\textrm{F}^{1}_{sr}q_{k_{1}l_{2}l_{3}r}+\textrm{B}^{1}_{sr}\textrm{D}_{l_{1}k_{1}}q_{k_{1}l_{2}l_{3}r}
+
+\displaystyle+\textrm{D}_{l_{2}k_{2}}\textrm{F}^{2}_{sr}q_{l_{1}k_{2}l_{3}r}+\textrm{B}^{2}_{sr}\textrm{D}_{l_{2}k_{2}}q_{l_{1}k_{2}l_{3}r}
+
+\displaystyle+\textrm{D}_{l_{3}k_{3}}\textrm{F}^{3}_{sr}q_{l_{1}l_{2}k_{3}r}+\textrm{B}^{3}_{sr}\textrm{D}_{l_{3}k_{3}}q_{l_{1}l_{2}k_{3}r}\bigr)+\textrm{P}_{\mathbf{l}}\delta_{x_{0}}
+
+The second kernel includes all integrals along the boundary of the reference element.
+We denote the neighborhood of a given cell with
+\mathcal{N}
+, and then sum over
+the adjacent faces
+f
+:
+
+\displaystyle\sum_{f\in\mathcal{N}}\mathcal{F}^{*}\bigl(q^{f}(t)_{\mathbf{k}r},\hat{q}^{f}(t)_{\mathbf{k}p},\textrm{F}^{f}(t)_{\mathbf{k}r},\hat{\textrm{F}}^{f}(t)_{\mathbf{k}r}\bigr)\textrm{,}
+
+where
+q^{f}
+denotes the projected degrees of freedom of the face and
+\hat{q}^{f}
+those of the neighboring element.
+
+In this notation the time-integrated semi-discrete scheme can be written as:
+
+\displaystyle\begin{split}q_{\mathbf{k}r}&(t_{n+1})=q_{\mathbf{k}r}(t_{n})+V_{\mathbf{k}r,\mathbf{l}s}\int_{t_{n}}^{t_{n+1}}q_{\mathbf{l}s}(t)dt\\
+&-\sum_{f\in\mathcal{N}}\int_{t_{n}}^{t_{n+1}}\mathcal{F}^{*}(q^{f}(t)_{\mathbf{k}r},\hat{q}^{f}(t)_{\mathbf{k}r},\textrm{F}^{f}(t)_{\mathbf{k}r},\hat{\textrm{F}}^{f}(t)_{\mathbf{k}r})\end{split}
+
+(2)
+
+To complete the discretization we need to discretize (
+2
+) in time. The underlying assumption in this step is that for a small enough timestep
+\Delta t
+the volume operator is approximately equal to the temporal derivative:
+
+\displaystyle\frac{\delta q_{\mathbf{l}s}(t_{n})}{\delta t}\approx V_{\mathbf{k}r\mathbf{l}s}q_{\mathbf{l}s}(t_{n})
+
+(3)
+
+By evolving
+q_{\mathbf{l}s}(t)
+in a Taylor series of order
+N
+and using (
+3
+) we can compute (
+2
+):
+
+\displaystyle\begin{split}\int_{t_{n}}^{t_{n+1}}q_{\mathbf{k}r}(t)dt\approx\sum_{o=0}^{N}\frac{(\Delta t)^{o+1}}{\left(o+1\right)!}V^{o}_{\mathbf{k}r,\mathbf{l}s}q_{\mathbf{l}s}(t_{n})=:\bar{q}_{\mathbf{l}s}(t_{n})\textrm{,}\end{split}
+
+(4)
+
+The summands of (
+4
+) can be computed iteratively.
+
+p_{o\mathbf{k}r}:=V^{o}_{\mathbf{k}r,\mathbf{l}s}q_{\mathbf{l}s}(t_{n})=V_{\mathbf{k}r,\mathbf{l}s}p_{o-1,\mathbf{l}s}.
+
+The vector
+p_{i\mathbf{k}p}
+is called Space Time Predictor (STP) and its computation is the main focus of this work. It operates only on cell-local information and is considerably more expensive to compute than the corrector step. Since
+\mathcal{F}^{*}
+is a linear operation, the semi-discrete scheme can be transformed to
+
+\displaystyle\begin{split}q_{\mathbf{k}r}&(t_{n+1})=q_{\mathbf{k}r}(t_{n})+V_{\mathbf{k}r,\mathbf{l}s}\bar{q}_{\mathbf{l}s}(t_{n})+\\
+&\sum_{f\in\mathcal{N}}\mathcal{F}^{*}\bigl(\bar{q}^{f}(t_{n})_{\mathbf{k}r},\hat{\bar{q}}^{f}(t_{n})_{\mathbf{k}r},\bar{\textrm{F}}^{f}(t_{n})_{\mathbf{k}r},\hat{\bar{\textrm{F}}}^{f}(t_{n})_{\mathbf{k}r}\bigr)\end{split}
+
+(5)
+
+We call this the corrector step.
+
+II-B
+
+Kernels and Linear STP
+
+In this paper we discuss various implementations of the STP kernel.
+For each implementation the output must be the required input of the corrector step, i.e.
+\bar{q}_{\mathbf{l}s}(t_{n})
+,
+\bar{q}_{\mathbf{k}r}^{f}(t_{n})
+and
+\bar{\textrm{F}}^{f}(t_{n})_{\mathbf{k}r}
+.
+The projection onto the face of an element is performed by a single matrix-matrix multiplication, leaving no room for optimization.
+We will thus only present implementations to compute
+\bar{q}_{\mathbf{l}s}(t_{n})
+and
+\bar{\textrm{F}}_{\mathbf{l}s}(t_{n})
+.
+
+The generic implementation of the STP follows the mathematical formulation of (
+4
+).
+We iterate over the derivatives of the Taylor series of (
+4
+) and store the whole STP (in the array
+p
+) and its fluctuations (in the array
+dF
+). Using these we can compute the time averaged degrees of freedom (in the array
+qavg
+) and fluctuations (in the array
+favg
+). See Fig.
+1
+for the entire pseudocode.
+
+⬇
+
+p
+[0,
+k
+]
+
+=
+
+q
+[
+k
+]
+
++
+
+pointSource
+(
+t
+=
+t_n
+,
+
+coordinate
+
+=
+
+k
+)
+
+for
+
+(
+
+o
+
+=
+
+0;
+
+o
+
+<
+
+N
+;
+
+o
+++
+
+)
+
+{
+
+for
+
+(
+
+k
+
+=
+
+0;
+
+k
+
+<
+
+N
+^3;
+
+k
+++
+
+)
+
+{
+
+for
+
+(
+
+d
+
+=
+
+0;
+
+d
+
+<
+
+3;
+
+d
+++
+
+)
+
+{
+
+flux
+[
+o
+,
+d
+,
+k
+]
+
+$
+\
+gets$
+
+computeF
+(
+p
+[
+o
+,
+k
+],
+
+dim
+=
+d
+)
+
+}
+
+}
+
+for
+
+(
+
+d
+
+=
+
+0;
+
+d
+
+<
+
+3
+
+;
+
+d
+++
+
+)
+
+{
+
+for
+
+(
+
+k
+
+=
+
+0;
+
+k
+
+<
+
+N
+^3;
+
+k
+++
+
+)
+
+{
+
+dF
+[
+o
+,
+d
+,
+k
+]
+
+$
+\
+gets$
+
+derive
+(
+flux
+[
+o
+,
+d
+,*],
+
+coordinate
+=
+k
+,
+
+dim
+=
+d
+)
+
+}
+
+}
+
+for
+
+(
+
+d
+
+=
+
+0;
+
+d
+
+<
+
+3;
+
+d
+++
+
+)
+
+{
+
+for
+
+(
+
+k
+
+=
+
+0;
+
+k
+
+<
+
+N
+^3;
+
+k
+++
+
+)
+
+{
+
+gradQ
+[
+o
+,
+d
+,
+k
+]
+
+$
+\
+gets$
+
+derive
+(
+p
+[
+o
+,
+d
+,*],
+
+coordinate
+=
+k
+,
+
+dim
+=
+d
+)
+
+}
+
+}
+
+for
+
+(
+
+d
+
+=
+
+0;
+
+d
+
+<
+
+3;
+
+d
+++
+
+)
+
+{
+
+for
+
+(
+
+k
+
+=
+
+0;
+
+k
+
+<
+
+N
+^3;
+
+k
+++
+
+)
+
+{
+
+dF
+[
+o
+,
+d
+,
+k
+]
+
+$
+\
+gets$
+
+dF
+[
+o
+,
+d
+,
+k
+]
+
++
+
+computeNcp
+(
+gradQ
+[
+o
+,
+k
+],
+
+dim
+=
+d
+)
+
+}
+
+}
+
+for
+
+(
+
+k
+
+=
+
+0;
+
+k
+
+<
+
+N
+^3;
+
+k
+++
+
+)
+
+{
+
+p
+[
+o
++1,
+k
+]
+
+$
+\
+gets$
+
+p
+[
+o
+,
+k
+]
+
++
+
+derive
+(
+pointSource
+(
+t
+=*,
+
+coordinate
+=
+k
+),
+
+dim
+=
+time
+,
+
+order
+=
+o
+)
+
+for
+(
+
+d
+=0;
+
+d
+
+<
+
+3;
+
+d
+++
+
+){
+
+p
+[
+o
++1,
+k
+]
+
+$
+\
+gets$
+
+p
+[
+o
++1,
+k
+]
+
++
+
+dF
+[
+o
+,
+d
+,
+k
+]
+
+}
+
+}
+
+}
+
+/*
+
+Compute
+
+the
+
+time
+
+averaged
+
+values
+
+*/
+
+for
+
+(
+
+o
+
+=
+
+0
+
+o
+
+<
+
+N
+;
+
+o
+++
+
+)
+
+{
+
+for
+
+(
+
+k
+
+=
+
+0;
+
+k
+
+<
+
+N
+^3;
+
+k
+++
+
+)
+
+{
+
+qavg
+[
+k
+]
+
+$
+\
+gets$
+
+qavg
+[
+k
+]
+
++
+
+p
+[
+o
+,
+k
+]
+
+*
+
+(
+
+dt
+^{
+o
++1}
+
+/
+
+(
+o
++1)!
+
+)
+
+}
+
+}
+
+for
+
+(
+
+d
+
+=
+
+0;
+
+d
+
+<
+
+3;
+
+d
+++
+
+)
+
+{
+
+for
+
+(
+
+o
+
+=
+
+0;
+
+o
+
+<
+
+N
+;
+
+o
+++
+
+)
+
+{
+
+for
+
+(
+
+k
+
+=
+
+0;
+
+k
+
+<
+
+N
+^3;
+
+k
+++
+
+)
+
+{
+
+favg
+[
+d
+,
+k
+]
+
+$
+\
+gets$
+
+favg
+[
+d
+,
+k
+]
+
++
+
+dF
+[
+o
+,
+d
+,
+k
+]
+
+*
+
+(
+
+dt
+^{
+o
++1}
+
+/
+
+(
+o
++1)!
+
+)
+
+}
+
+}
+
+}
+
+Fig. 1:
+Pseudocode for the generic implementation of the STP.
+
+II-C
+
+Engine structure
+
+Fig. 2:
+ExaHyPE’s structure with kernels (taken from
+[
+1
+]
+).
+
+Fig.
+2
+shows the architecture of ExaHyPE, which follows a strict separation of concerns.
+It builds on the Peano framework
+[
+10
+]
+(dark-green box),
+which provides dynamical adaptive mesh refinement on tree-structured Cartesian meshes together with shared- and distributed-memory parallelization.
+
+Application-specific contributions of users (i.e., developers of applications using the engine) are illustrated as cyan boxes.
+To write an ExaHyPE application users provide a specification file, which is passed to the ExaHyPE
+Toolkit
+.
+The Toolkit creates glue code, empty application-specific classes and (most important for this paper) core kernels that are tailored towards application and architecture (light-green box)
+[
+7
+]
+.
+Users need to complete the application-specific classes by providing PDE- and scenario-specific implementations (of flux functions, boundary conditions, etc.).
+Note that these
+user functions
+also depend on the requirements of the specification file and the kernel variant used.
+For example, ExaHyPE’s API by default relies on point-wise user functions that operate on a single quadrature node.
+However some kernels, like the STP kernel variant described in Sec.
+V
+, work on user functions that operate on vectorizable chunks.
+
+In the context of this paper it is also important to note the optional usage of LIBXSMM
+[
+9
+]
+(red box).
+This library provides efficient routines for small matrix multiplications, which are used by the optimized ADER-DG kernels.
+
+II-D
+
+Kernel Generator
+
+To generate application and architecture tailored kernels, the Toolkit uses a Kernel Generator submodule. The Kernel Generator is a Python 3 module that can be invoked manually or automatically by the Toolkit.
+If invoked by the Toolkit, the optimized kernels are called by the generated glue code.
+The generic kernels used by default only provide minimal customizability toward the application and none toward the architecture.
+The Kernel Generator, like the Toolkit, follows the Model-View-Controller (MVC) architectural pattern and uses the template engine Jinja2 to generate the C++ kernels.
+This facilitates the introduction of new variants of a given kernel as a new template (View) in the module, and decouples the algorithmic optimizations from the low-level optimizations using Jinja2’s template macro functionalities.
+As architecture-specific optimizations are abstracted behind macros and template functionalities, these can easily be extended to support new architectures, e.g. by extending support for AVX-512 instruction sets.
+A more detailed description of the Kernel Generator and Toolkit design can be found in
+[
+7
+]
+.
+
+In the following sections, we introduce three variants of the generic STP kernel with increasing level of optimization. Each variant is implemented as a new template in the Kernel Generator
+and reuses existing optimization macros.
+As the later variants require an increasing amount of work from the end-user regarding the user functions, they are optional and can be enabled by a flag in the specification file.
+
+III
+Optimized implementation of the linear STP kernel: vectorization and tensor operations
+
+In this section we describe optimizations employed by the Kernel Generator to improve the STP kernel performance. These optimizations include
+SIMD vectorization and performing tensor contractions with
+Loop-over-GEMM
+(LoG). The algorithm in this LoG variant of the STP kernel remains similar to the generic variant in order to preserve the user API.
+The use of slicing techniques to perform LoG by mapping tensor contraction to BLAS operations, in particular GEMM (matrix-matrix multiplication), has previously been explored by Di Napoli et al.
+[
+11
+]
+and Shi et al.
+[
+12
+]
+.
+
+III-A
+
+SIMD and data layout conflict
+
+SIMD instructions require a unit-stride, i.e. the vectorized innermost loop must iterate over the fastest running index.
+For ExaHyPE, this causes conflicting data layout requirements.
+The kernels, in particular the STP kernel, perform the same operations for each quantity.
+The operations can thus be vectorized in the quantity dimension, corresponding to an
+Array-of-Structure
+(AoS) data layout.
+In contrast, the user functions are evaluated pointwise for each quadrature node with the quantities as parameters.
+Vectorization can therefore only be performed by applying the user functions on multiple quadrature nodes at a time.
+This requires a
+Structure-of-Array
+(SoA) data layout.
+We expect the user functions to be less complex than the kernels and to be written by users who may be less familiar with code optimization.
+We therefore chose the AoS data layout for the ExaHyPE engine and thus prioritize optimization of the kernels.
+
+Using the AoS data layout, kernel operations can be vectorized using compiler auto-vectorization with the corresponding pragmas or specialized code for critical operations.
+
+Furthermore, to fully exploit the SIMD capabilities, all tensors and matrices are memory aligned and their leading dimensions are zero-padded to the next multiple of a SIMD vector length, such that each slice is also aligned in the slowest dimensions.
+It should be noted, that the zero-padding will increase the number of floating point operations that need to be performed.
+However, these come for free or even provide a speedup as a single vector instruction containing the zero-padding will replace one or more scalar instructions and also remove the need for masking or loop spilling.
+
+Since the alignment and padding-size depend on the target architecture supported SIMD instruction set, e.g. AVX-512 on Skylake,
+the Kernel Generator uses Jinja2’s template variables and macros to abstract these optimizations in its templates.
+These variables are calculated by the Kernel Generator Controller and are used by Jinja2 when rendering the macros and templates.
+The templates are rendered with the correct alignment and padding-size and future architectures can be added by simply extending the macros’ definitions,
+as was done when adding Knights Landing and Skylake (AVX-512) support from previous Haswell (AVX2) optimizations.
+
+III-B
+
+Tensor products as Loop-over-GEMM with LIBXSMM
+
+The computation-heavy operations performed in the STP kernel reflect derivatives on tensors along one spatial dimension,
+as seen in the pseudocode of Fig.
+1
+. These derivatives are computed as a matrix multiplication with the discrete derivative operator
+D
+, as described in Sec.
+II-A
+.
+This reduces the computation to tensor contraction operations.
+
+For example, let
+F_{\mathbf{k},s}
+be a 4-dimensional tensor with
+\mathbf{k}=(k_{1},k_{2},k_{3})
+corresponding to the
+z
+,
+y
+, and
+x
+spatial dimensions respectively, and
+s
+giving the quantity of the state-vector
+q
+currently being computed.
+Then the discrete derivatives
+dF
+of
+F
+along the
+x
+dimension, take the form:
+
+\forall\mathbf{k},\,\forall s\colon~dF_{\mathbf{k},s}=\sum_{l}\textrm{D}_{k_{3},l}F_{k_{1},k_{2},l,s}.
+
+where
+D
+is specific to the quadrature nodes and order.
+If we first only consider the loops on
+k_{3}
+and
+s
+, we need to compute the following intermediate result.
+
+\forall k_{3},\,\forall s\colon~dF^{\prime}_{k_{3},s}=\sum_{l}\textrm{D}_{k_{3},l}F^{\prime}_{l,s},
+
+which is a matrix multiplication with
+F^{\prime}=F_{k_{1},k_{2},:,:}
+the tensor
+F
+’s matrix slice at a given
+(k_{1},k_{2})
+, and similarly
+dF^{\prime}=dF_{k_{1},k_{2},:,:}
+.
+
+Thus, we can perform the discrete derivative of
+F
+more efficiently as a matrix multiplication on matrix slices of the tensors
+F
+and
+dF
+for fixed
+k_{1}
+and
+k_{2}
+values.
+The computation of the tensor
+dF
+can be reformulated using a sequence of BLAS
+MatMul
+operations, as
+
+\forall k_{1},\,\forall k_{2}\colon~\texttt{MatMul}(F_{k_{1},k_{2},:,:},D,dF_{k_{1},k_{2},:,:})
+
+This reformulation of tensor contraction using batched matrix multiplications on matrix slices of the tensors is explored in more detail by Di Napoli et al.
+[
+11
+]
+and Shi et al.
+[
+12
+]
+, e.g.
+
+Small matrix multiplications (matrix sizes are determined by the polynomial order
+N
+of the ADER-DG scheme and the number
+m
+of quantities in the PDE) are thus the performance-critical part of the STP kernel and need to be performed as efficiently as possible.
+Exploitation of SIMD instructions demands a unit stride in the innermost loop of the matrix operations.
+As the quantity dimension (index
+s
+in the example) is involved in all operations, using an AoS data layout implies that the quantity dimension should be the fastest running index of the tensors.
+
+For highest-possible performance on Intel architectures, the Kernel Generator relies on the library LIBXSMM
+[
+9
+]
+,
+which provides highly optimized assembly code for the required small dense matrix multiplications (
+gemm
+routines).
+
+Fig. 3:
+Extracting matrix slices from a tensor.
+
+Fig.
+3
+illustrates how to extract matrix slices from the array storing a 3-dimensional tensor.
+To extract a tensor matrix slice along the two fastest dimension (indexes
+i
+and
+j
+)
+it is sufficient to specify an offset, as the matrix slice is a contiguous subarray of the array storing the tensor.
+Doing so along other dimensions (indexes
+i
+and
+k
+in the figure) can be achieved by determining a
+slice stride
+, if one of the dimensions features a unit stride (here
+i
+).
+The slice stride reflects the distance between the matrix rows that are stored in unit stride.
+LIBXSMM allows us to define the leading dimension of a matrix with and without padding, e.g. to align matrix rows to cache line boundaries.
+We utilize these padding hints by interpreting the slice stride as the padded row size of the matrix leading dimension.
+We thus efficiently restrict matrix operations to tensor matrix slices without requiring extra memory transfers.
+
+Thus, all the tensor operations can be reformulated as a batch of matrix multiplications on subsequent slices in the different dimensions.
+The zero-padding introduced earlier ensures that each slice is also aligned for optimal performance.
+We stress again that we rely on the quantity dimension being the leading dimension of the tensors and of the matrix slices. This requires an AoS data layout.
+
+LIBXSMM is integrated into the Kernel Generator via a custom
+matmul
+Jinja2 template macro as described in
+[
+7
+]
+.
+This macro can also generate a generic triple-loop matrix multiplication, if LIBXSMM is not available for an architecture.
+The use of a template macro facilitates integration of other libraries for small GEMM code, e.g. for other architectures.
+It also improves the readability of the template code by encapsulating the respective low-level optimizations.
+
+III-C
+
+Further optimizations
+
+As a benefit of using code generation, compile time constants and known constant parameters are directly hard coded into the kernels – as are the dimensionality of the problem and the location and exact name of the user functions.
+The latter, when combined with interprocedural optimizations (IPO) during compilation, allows inlining of the user functions in the kernels, even though these functions are virtual in the API.
+In addition, frequently used matrices or combinations of matrices, such as cross products or the inverses of quadrature weights, can be precomputed by the Kernel Generator. They can then be directly hard coded, thus saving redundant operations.
+
+III-D
+
+Intermediate performance results
+
+Fig. 4:
+Available performance reached and percentage of pipeline slots affected by memory stalls on the test benchmark (on Intel Skylake, see Sec.
+VI
+)
+with the generic (green), LoG for AVX-512 (turquoise), and LoG for AVX2 (light turquoise) kernels for order 4 to 11.
+
+Fig.
+4
+compares the performance
+(as percentage of available performance
+2
+2
+
+2
+
+defined as the ratio of the average GFlops reached by the maximal amount of GFlops possible on this hardware as described in Sec.
+VI
+)
+reached by the STP kernel in its generic variant vs. the LoG implementation that exploits the optimizations described in Sec.
+III
+.
+Benchmark and architecture (Intel Skylake) are described in detail in Sec.
+VI
+.
+The LoG setup was tested with one setup optimized toward Skylake (AVX-512) and one toward the older Haswell architecture (AVX2) for comparison.
+
+As expected the performance of the generic setup is quite low and quickly stagnates since only a fraction of the code can be auto-vectorized by the compiler.
+In contrast, more than 90% of the floating point operations result from SIMD operations in the LoG AVX-512 setup (measured via Intel VTune Profiler, see Fig.
+9
+in Sec.
+VI-A
+).
+Neither of the LoG setups shows significant improvement at low order as the tensors are too small for the loop-vectorizations and matrix multiplications to be efficient.
+For higher order, they quickly improve to 8–11% of the available performance.
+
+However, the achieved performance does not reflect the potential expected from vectorization.
+In fact, when comparing the LoG setup for Skylake and the setup optimized toward the previous Haswell architecture using AVX2,
+we obtain similar performance with a speedup of only 23–30% obtained by going from AVX2 to AVX-512.
+If the benchmarks were compute-bound, then a speedup closer to 100% could be expected.
+This discrepancy is explained by the significant amount of pipeline slots affected by memory stalls.
+While they were expected, especially at low order when the arithmetic intensity of the ADER-DG scheme is lower,
+the percentage of pipeline slots impacted by memory stalls stays above 41% in the LoG AVX-512 test and 34% in the AVX2 setup. In the generic setup, however, the percentage goes down to around 27%. At order 11 we observe a performance loss compared to order 9 and 10 for the LoG AVX-512 setup, which is due to the increase of memory stalls.
+
+IV
+SplitCK: Dimension splitted Cauchy-Kowalewsky scheme
+
+The LoG optimization of the STP kernel, as described in Sec.
+III
+
+did not lead to the desired performance improvement.
+In this section we show that this is due to memory stalls, most likely because the required data is not held in the fast cache levels.
+We therefore introduce a reformulation of the Cauchy-Kowalewsky scheme that reduces the memory footprint of the STP kernel.
+Similar sum factorization approaches are used in other PDE solver frameworks, such as
+[
+13
+,
+14
+,
+15
+,
+16
+]
+.
+
+IV-A
+
+Motivation: LoG is bound by the capacity of the L2 cache
+
+Performance benchmarks with the LoG kernel variant using Intel’s VTune Amplifier display a high amount of pipeline slots impacted by memory stalls that plateau toward 40% starting at order 6 instead of steadily decreasing as expected (see Fig.
+6
+).
+L2 cache overflow is to be expected around this order.
+The benchmarks were performed on Intel Xeon Platinum 8174 CPUs, which have 1MB of L2 cache available per core.
+
+For the generic scheme from Sec.
+II-B
+the storage required for temporary arrays is
+\mathcal{O}(N^{d+1}md)
+, where
+N
+is again the polynomial order of the ADER-DG scheme,
+
+m
+the number of quantities in the PDE, and
+d
+its dimension.
+Thus, for a 3D medium-sized problem (e.g.
+m=25
+,
+d=3
+), the 1MB limit will be exceeded as soon as
+N=6
+and temporary arrays will fall out of the L2 cache.
+
+At high order the previous optimizations cannot be fully exploited, because the code stops being compute-bound and is instead dominated by memory stalls, mostly cache-related ones.
+Therefore the algorithm described in Sec.
+II-B
+, used by both the generic and LoG STP variants,
+needs to be improved toward cache awareness and a reduced memory footprint, even at the cost of slightly more computations.
+
+IV-B
+
+Reformulation of the Cauchy-Kowalewsky scheme
+
+We reformulate the STP kernel’s algorithm along the general paradigm to increase the number of memory accesses in lower level caches by reusing arrays as soon as possible.
+Instead of computing and storing the fluxes for all dimensions at once, the tensor basis allows us to consider each dimension separately.
+To decrease the overall memory footprint we do not keep the whole STP and its fluxes in memory, but directly add the contribution of each loop to the sum of the time averaged degrees of freedom and do not store the fluxes.
+In the end we exploit the linearity of the scheme to recompute the time averaged fluxes from the time averaged degrees of freedom.
+
+⬇
+
+p
+[*]
+
+$
+\
+gets$
+
+q
+[*]
+
+ptemp
+[*]
+
+$
+\
+gets$
+
+0
+
+qavg
+[*]
+
+$
+\
+gets$
+
+dt
+
+*
+
+q
+[*]
+
+for
+
+(
+
+o
+
+=
+
+0;
+
+o
+
+<
+
+N
+;
+
+o
+++
+
+)
+
+{
+
+for
+
+(
+
+d
+
+=
+
+0;
+
+d
+
+<
+
+3;
+
+d
+++
+
+)
+
+{
+
+for
+
+(
+
+k
+
+=
+
+0;
+
+k
+
+<
+
+N
+^3;
+
+k
+++
+
+)
+
+{
+
+flux
+[
+k
+]
+
+$
+\
+gets$
+
+computeF
+(
+p
+[
+k
+],
+
+dim
+=
+d
+)
+
+}
+
+for
+
+(
+
+k
+
+=
+
+0;
+
+k
+
+<
+
+N
+^3;
+
+k
+++
+
+)
+
+{
+
+ptemp
+[
+k
+]
+
+$
+\
+gets$
+
+derive
+(
+flux
+[*],
+
+coordinate
+=
+k
+,
+
+dim
+=
+d
+)
+
+}
+
+for
+
+(
+
+k
+
+=
+
+0;
+
+k
+
+<
+
+N
+^3;
+
+k
+++
+
+)
+
+{
+
+gradQ
+[
+k
+]
+
+$
+\
+gets$
+
+derive
+(
+p
+[*],
+
+coordinate
+=
+k
+,
+
+dim
+=
+d
+)
+
+}
+
+for
+
+(
+
+k
+
+=
+
+0;
+
+k
+
+<
+
+N
+^3;
+
+k
+++
+
+)
+
+{
+
+qtemp
+[
+k
+]
+
+$
+\
+gets$
+
+qtemp
+[
+k
+]
+
++
+
+computeNcp
+(
+gradQ
+[
+k
+],
+
+dim
+=
+d
+)
+
+}
+
+}
+
+for
+
+(
+
+k
+
+=
+
+0;
+
+k
+
+<
+
+N
+^3;
+
+N
+++
+
+)
+
+{
+
+qavg
+[
+k
+]
+
+$
+\
+gets$
+
+qavg
+[
+k
+]
+
++
+
+ptemp
+[
+k
+]
+
+*
+
+(
+
+dt
+^(
+o
++1)
+
+/
+
+(
+o
++1)!
+
+)
+
+}
+
+swap
+(
+p
+[
+k
+],
+
+ptemp
+[
+k
+])
+
+}
+
+/*
+
+Compute
+
+favg
+
+*/
+
+favg
+[*]
+
+$
+\
+gets$
+
+0
+
+for
+
+(
+
+d
+
+=
+
+0;
+
+d
+
+<
+
+3;
+
+d
+++
+
+)
+
+{
+
+for
+
+(
+
+k
+
+=
+
+0;
+
+k
+
+<
+
+N
+^3;
+
+k
+++
+
+)
+
+{
+
+flux
+[
+k
+]
+
+$
+\
+gets$
+
+computeF
+(
+p
+[
+k
+],
+
+dim
+=
+d
+)
+
+}
+
+for
+
+(
+
+k
+
+=
+
+0;
+
+k
+
+<
+
+N
+^3;
+
+k
+++
+
+)
+
+{
+
+favg
+[
+k
+]
+
+$
+\
+gets$
+
+favg
+[
+k
+]
+
++
+
+derive
+(
+flux
+[*],
+
+coordinate
+=
+k
+,
+
+dim
+=
+d
+)
+
+}
+
+}
+
+Fig. 5:
+Pseudocode for the cache aware SplitCK scheme for the STP.
+
+The resulting scheme (outlined in Fig.
+5
+) reduces the memory footprint of the largest tensors by a full time dimension by performing the time integration on-the-fly. A further reduction by a factor 3 is achieved by reusing the same tensors for all three spatial dimensions. The SplitCK memory footprint is thus
+\mathcal{O}(N^{d}m)
+, compared to
+\mathcal{O}(N^{d+1}md)
+previously.
+Cache locality is also taken into consideration.
+However, the recomputation of the time averaged flux outside of the time loop adds the equivalent of almost one iteration to the computation, a cost that becomes increasingly insignificant at higher order.
+
+IV-C
+
+Performance evaluation
+
+Fig. 6:
+Available performance reached and percentage of pipeline slots affected by memory stalls on the test benchmark (see Sec.
+VI
+)
+with the LoG variant (turquoise) and the SplitCK one (blue) for order 4 to 11.
+
+Fig.
+6
+shows that the new SplitCK scheme substantially reduces the memory stalls compared to the LoG scheme for all orders
+with a steady decrease as the order increases – whereas the memory stalls for the LoG do not fall below 41% and even increase after order 9.
+The improvement in memory stalls is directly reflected by a performance that keeps growing with increasing order and comes closer to matching the expected speedup compared to the generic kernels.
+
+V
+AoSoA data layout
+
+Removing the L2 cache bottleneck via the SplitCK scheme not only leads to direct performance increases compared to the LoG scheme – it enables further improvements by increasing the ratio of vectorized floating point operations.
+To achieve this, we address the AoS-vs.-SoA data layout conflict by introducing a hybrid data layout that can serve as AoS for the GEMM kernels and also as SoA for the user functions. Similar hybrid data layouts were also explored in the PyFR Navier–Stokes solver
+[
+17
+]
+and are used by the YATeTo code generator
+[
+18
+]
+to optimize complex tensor operations.
+
+V-A
+
+Motivation
+
+The data layout conflict between AoS and SoA and the choice of an AoS data layout means that vectorization opportunities in the user functions are lost as they are computed pointwise using scalar instructions.
+To allow for SIMD instructions, they require inputs in an SoA data layout so that operations can be performed on a vector of individual quantities.
+
+One way to get around this issue is to transpose the tensors on-the-fly to switch the data layout from AoS to SoA and back before and after calling the user functions.
+This was tested in both linear and non-linear STP kernels for various applications.
+It proved effective for complex non-linear scenarios,
+where the cost and complexity of the user functions were high enough that the performance gains of the vectorizations more than compensated for the cost of the transpositions.
+However, the linear PDE systems in the targeted seismic applications have too simple (and inexpensive) user functions for such a solution to be effective,
+despite achieving the targeted high ratio of vectorized floating point operations.
+
+By taking inspiration from the PyFR framework, where a similar conflict occurs
+[
+17
+]
+, and from the optimization of tensor operations in YATeTo
+[
+18
+]
+
+(both are open source software), we implemented a hybrid Array-of-Structure-of-Array (AoSoA) data layout.
+In this hybrid layout, the quantity dimension is put in between the spatial dimensions:
+for a tensor
+A
+, instead of having the quantity dimension
+s
+being the fastest, i.e.
+A_{k,j,i,s}
+(in AoS layout), or the slowest,
+A_{s,k,j,i}
+(in SoA layout),
+our AoSoA layout mixed it in between the spatial dimension, resulting in a
+A_{k,j,s,i}
+hybrid data layout.
+While this layout is slightly less intuitive to work with, it allows the kernels to keep working with a pseudo-AoS layout and to trivially extract SoA subarrays for the user functions.
+
+To preserve alignment the fastest dimension is zero-padded as with the AoS data layout.
+On AVX-512 architectures order 8 is a sweetspot with no padding required, whereas order 9 suffers from a particularly large padding overhead.
+
+V-B
+
+Data layout in the kernel
+
+In the kernel, whenever tensor operations are performed on tensor’s matrix slices,
+one of two cases can occur depending on which dimensions the slices are taken from:
+
+In the first case the slices are on the
+x
+dimension, now the fastest running index.
+When compared to the previously used AoS data layout, the matrix slices of the AoSoA tensors are now transposed, as the quantity and
+x
+dimensions where swapped in the tensors.
+Thus the matrix multiplications can simply be transposed too by using
+C^{T}=(A\cdot B)^{T}=B^{T}\cdot A^{T}
+.
+Performing the matrix multiplications in this case only requires to precompute the transpose of the second matrix
+B
+(e.g. the discrete derivative operator matrix)
+and swap the tensor slice and
+B^{T}
+in the
+MatMul
+operation.
+
+In the second case the slices are on another dimension, i.e. on a slower running index than the quantity dimension.
+If both tensors have the same dimensions ordering and size, it is possible – when reformulating the tensor operations to Loop-over-GEMM – to extract bigger slices by fusing multiple dimensions.
+The code excerpt in Fig.
+7
+shows a derivative along the
+y
+-dimension (index
+j
+) with the quantity and
+x
+-dimension fused (indexes
+s
+and
+i
+),
+with an explicit matrix multiplication instead of a LIBXSMM GEMM.
+Here, by fusing the quantity- and
+x
+-dimensions of the tensors when extracting the slices, it does not matter in which order they were in the initial tensor. This means that the same kind of matrix multiplications can be used as with the AoS data layout.
+However, it forces minor API changes to ensure that the dimensions can be fused every time it is required.
+
+⬇
+
+for
+
+(
+int
+
+k
+
+=
+
+0;
+
+k
+
+<
+
+6;
+
+k
+++)
+
+//
+
+MatMul(Q,
+
+dudx,
+
+gradQ)
+
+//
+
+[j][is]
+
+slices,
+
+fuse
+
+i
+
+and
+
+s
+
+for
+
+(
+int
+
+j
+
+=
+
+0;
+
+j
+
+<
+
+6;
+
+j
+++)
+
+for
+
+(
+int
+
+l
+
+=
+
+0;
+
+l
+
+<
+
+6;
+
+l
+++)
+
+#pragma
+
+omp
+
+simd
+
+aligned
+([...])
+
+for
+
+(
+int
+
+is
+
+=
+
+0;
+
+is
+
+<
+
+72;
+
+is
+++)
+
+gradQ
+[
+k
+*432+
+j
+*72+
+is
+]
+
++=
+
+Q
+[
+k
+*432+
+l
+*72+
+is
+]
+
+*
+
+dudx
+[
+j
+*8+
+l
+];
+
+Fig. 7:
+Tensor contraction expressed as Loop-over-GEMM with the quantity- and
+x
+-dimensions fused (
+N=6
+and
+m=12
+hard-coded).
+
+Vectorization of the STP kernel’s operations can thus be preserved with the AoSoA data layout and LIBXSMM can still be used to optimize the
+MatMul
+operations.
+However, the rest of the engine still expects an AoS data layout, thus the kernel inputs use the AoS data layout and are transposed to the AoSoA layout and the outputs are transposed back to AoS at the end of the STP kernel.
+The performance impact of these transpositions is minimal compared to the cost of the kernel itself.
+In all cases this costs less performance-wise than using on-the-fly transposes between AoS and SoA at each user functions call.
+Finally it could be avoided altogether by switching the whole engine to an AoSoA data layout. At the time of this paper this has not been done due to API compatibility issues with other parts of the engine.
+
+V-C
+
+Vectorization of the user functions
+
+In the AoSoA STP kernel, instead of looping over all spatial dimensions to call a pointwise user function,
+the
+x
+direction is now excluded from the loop and the vectorized user function is expected to be applied on the full
+x
+dimension in one call.
+When calling a user function the input subarrays of the AoSoA tensors are a full line of quadrature nodes, which corresponds to an SoA data layout within the subarray. Here the
+x
+dimension is the fastest running index.
+
+As the user functions are working on arrays in an SoA layout, they can easily be vectorized by looping over the fastest running index, replacing scalar operations by SIMD operations.
+The
+x
+dimension of the tensor is zero-padded to the next SIMD vector register size and the tensors are memory aligned, therefore each subarray is also memory aligned for maximal SIMD performance.
+
+⬇
+
+//scalar
+
+formulation
+
+of
+
+flux_x
+
+void
+
+flux_x
+(
+double
+*
+
+Q
+,
+
+double
+*
+
+F
+)
+
+{
+
+F
+[0]
+
+=
+
+-(
+Q
+[0]+
+Q
+[3]+
+Q
+[4]);
+
+F
+[1]
+
+=
+
+-(
+Q
+[1]+
+Q
+[3]+
+Q
+[5]);
+
+F
+[2]
+
+=
+
+-(
+Q
+[2]+
+Q
+[4]+
+Q
+[5]);
+
+}
+
+//vectorized
+
+formulation
+
+of
+
+flux_x
+
+void
+
+flux_x_vect
+(
+double
+*
+
+Q
+,
+
+double
+*
+
+F
+)
+
+{
+
+#pragma
+
+omp
+
+simd
+
+aligned
+(
+Q
+,
+F
+:
+ALIGNMENT
+)
+
+for
+(
+int
+
+i
+=0;
+
+i
+<
+VECTLENGTH
+;
+
+i
+++)
+
+{
+
+F
+[0*
+VECTSTRIDE
++
+i
+]
+
+=
+
+-(
+Q
+[0*
+VECTSTRIDE
++
+i
+]
+
++
+Q
+[3*
+VECTSTRIDE
++
+i
+]+
+Q
+[4*
+VECTSTRIDE
++
+i
+]);
+
+F
+[1*
+VECTSTRIDE
++
+i
+]
+
+=
+
+-(
+Q
+[1*
+VECTSTRIDE
++
+i
+]
+
++
+Q
+[3*
+VECTSTRIDE
++
+i
+]+
+Q
+[5*
+VECTSTRIDE
++
+i
+]);
+
+F
+[2*
+VECTSTRIDE
++
+i
+]
+
+=
+
+-(
+Q
+[2*
+VECTSTRIDE
++
+i
+]
+
++
+Q
+[4*
+VECTSTRIDE
++
+i
+]+
+Q
+[5*
+VECTSTRIDE
++
+i
+]);
+
+}
+
+}
+
+Fig. 8:
+Vectorization of a
+flux_x
+user function.
+
+The code excerpt in Fig.
+8
+illustrates that in most applications, the scalar code can be adapted in three steps to enable the compiler auto-vectorization:
+
+1.
+
+Enclose the code in a for loop to vectorize running over
+VECTLENGTH
+.
+
+2.
+
+Add the new dimension to the arrays’ indexes knowing that its size is
+VECTSTRIDE
+.
+
+3.
+
+Use the correct pragma over the loop to enable auto-vectorization; here
+omp simd
+is used and an optional alignment specifier is given.
+
+VECTLENGTH
+,
+VECTSTRIDE
+, and
+ALIGNMENT
+are integer constants known at compile-time:
+
+VECTLENGTH
+is the size of the
+x
+dimension without padding,
+
+VECTSTRIDE
+the size with padding and thus the stride of the SoA data layout, and
+ALIGNMENT
+is the memory alignment adapted to the architecture.
+In most cases, a simple compiler enabled auto-vectorization proved sufficient to achieve optimal performance when compared to user-written optimized code with Intel intrinsics for SIMD operations.
+
+However, to achieve optimal performance in the user functions, special consideration is required regarding the zero-padding used to preserve alignment.
+The zero-padded vectors can cause issues in the user functions when zero is not a valid input value. This can lead to numerical errors such as division by zero.
+Thus, in most cases, the user function vectorization should only be performed on the non-padded dimension size.
+But in doing so, masking or scalar loop spilling may be involved, decreasing performances.
+Consequently, while vectorizing a user function is trivial, fully optimizing its performance requires careful consideration of potential numerical issues.
+For this reason these optimizations have been made available only as opt-in features.
+
+VI
+Results
+
+We evaluate the performance of all the above-described kernel optimizations when simulating the elastic wave equations in first order formulation on curvilinear boundary-fitted meshes, as described in
+[
+8
+]
+.
+The equations are characterized by three quantities for particle velocity and six variables for the stress tensor. Three material parameters define density and the velocity of P- and S-waves.
+To incorporate the geometry we store the transformation and its Jacobian in each vertex, adding a further nine parameters. Hence, we store
+m=21
+quantities at each integration point.
+As a scenario we run the established LOH1 benchmark
+[
+19
+]
+, with a curvilinear mesh to fit the elements to the material parameter interface.
+
+All tests were performed on SuperMUC-NG at Leibniz Supercomputing Centre.
+SuperMUC-NG uses two Intel Xeon Platinum 8174 CPUs
+3
+3
+
+3
+
+https://doku.lrz.de/display/PUBLIC/Details+of+Compute+Nodes
+per node, with 24 cores per socket running at 1.9GHz when using AVX-512.
+Each core has two AVX-512 FMA units, thus the available performance per core is
+1.9\cdot 2\cdot 2\cdot 8=60.8
+double precision GFlops/s.
+Note that the CPU base frequency is reduced by almost 30%, from 2.7 GHz to 1.9 GHz, when using AVX-512 instructions.
+Thus, while these offer a theoretical speedup of a factor 8 in double precision FLOPs compared to scalar instructions,
+the actual speedup from vectorizing scalar operations is only a factor
+\approx
+5.6.
+Tests were compiled using the Intel Compiler 19.0.5 with aggressive optimization flags
+4
+4
+
+4
+
+-O3 -xCORE-AVX512 -restrict -fma -ip -ipo
+.
+
+Multi-node parallelism of the ExaHyPE engine is handled by the Peano Framework
+[
+10
+]
+, which uses a hybrid MPI+TBB (Intel Threading Building Blocks) approach.
+Due to NUMA effects, each MPI rank should be restricted to a single socket for optimal performance.
+Furthermore Peano’s task-based shared-memory parallelization begins to deteriorate beyond
+\approx
+10 cores, at least for our linear-PDE setup.
+We conclude that splitting each socket of 24 cores into 3 MPI ranks of 8 cores parallelized with TBB
+is the optimal layout used for large scale runs of the engine on SuperMUC-NG.
+
+As we focus only on single node performance in this work, we therefore run all benchmarks on 8 cores parallelized with TBB on a single socket.
+
+Performance is measured using Intel VTune Profiler 2019 on the full application, only excluding the engine initialization step, which is negligible in runtime for large scale runs.
+The benchmarks thus measure end-to-end performance, with all kernels and engine overhead included – though performance stays dominated by the STP kernel and its user functions.
+The setups are named after the STP kernel variant used: generic (Sec.
+II-B
+), LoG (Sec.
+III
+), SplitCK (Sec.
+IV
+) and AoSoA SplitCK (Sec.
+V
+).
+
+VI-A
+
+Instruction mix
+
+Fig. 9:
+Distribution of the packing size used to perform the floating point operations with the four kernel variants at orders
+N=4,\dots,11
+.
+
+Fig.
+9
+displays the SIMD instruction mix for the four optimization variants at increasing orders.
+“Scalar” corresponds to no vectorization; “512 bits” to SIMD packing with AVX-512 instructions.
+As compiler auto-vectorization is used, 128- and 256-bit packing is also used following compiler heuristics.
+
+For the generic setup, only a fraction of the FLOPs are packed by compiler auto-vectorization and most are computed using scalar instructions.
+This changes with the LoG and SplitCK setups were over 80% of the FLOPs are packed, either in 256- or 512-bit packed instructions.
+This confirms that prioritizing the vectorization of the kernel was the right choice as it vectorizes most of the FLOPs.
+However, still close to 10% of the FLOPs, mostly coming from the user functions, are performed using scalar instructions.
+Using the AoSoA SplitCK kernel, where the user functions are vectorized too, brings the amount of FLOPs performed with scalar instructions down to 2-4%, close to full vectorization of the code.
+
+VI-B
+
+Available performance reached and memory stalls
+
+Fig. 10:
+Available performance reached and percentage of pipeline slots affected by memory stalls for all four kernel variants at orders
+N=4,\dots,11
+.
+
+Fig.
+10
+shows how much of the available performance was reached by each benchmark and plots the evolution of the ratio of pipeline slots affected by memory stalls.
+As the ADER-DG scheme becomes more arithmetically intensive at higher order, the performance is expected to increase, while the memory stalls should steadily decrease for all kernel variants.
+On the other hand, improving the compute speed of the STP kernels through vectorization and other optimizations increases the stress on memory and should result in an increased ratio of memory stalls compared to slower setups.
+
+The generic kernels quickly reach a performance plateau around 3.8%, which is consistent with expected performance from an almost scalar code on Skylake architectures
+[
+20
+,
+21
+]
+.
+The LoG setup is constrained by memory stall issues in its progress, starting from
+N=6
+, as discussed in Sec.
+IV-A
+.
+
+Reducing the memory footprint of the STP kernel with the SplitCK scheme proved effective as the memory stalls ratio not only starts at a slightly lower value than in the LoG setup
+but also decreases faster (and steadily) with the order, even going below the generic setup for
+N=11
+.
+Using the AoSoA SplitCK scheme to vectorize the user function does not impact the memory stalls significantly,
+slightly more are observed as this STP kernel variant is faster but the same trend as the default AoS SplitCK setup is preserved.
+Thus, both SplitCK based setups increase in performances at higher orders with the setup using the AoSoA reaching 22.5% at order
+N=11
+.
+This is a speedup of a factor 6 compared to the generic benchmark at the same order.
+Taking into account the CPU base frequency reduction this is above the maximal speedup expected only from the AVX-512 vectorization of the algorithm.
+This is made possible by the reduced memory footprint of the new scheme.
+
+VII
+Conclusions
+
+To exploit the potential of modern CPU architectures such as Skylake, relying solely on the vectorization of the most critical operations is not sufficient to improve performance. As we have seen in ExaHyPE, not taking memory and caches into account can significantly impact the overall performance of the code.
+Since the processor–memory performance gap is expected to further increase, this issue will become even more relevant on future architectures.
+Additionally, the acceleration potential of AVX-512 implies that each missed vectorization opportunity can considerably impact performance. The AoSoA layout provided a considerable speedup despite only reducing the ratio of scalar FLOPs from around 10% to around 3% and in spite of adding the cost of computing transposes.
+
+However, the modification of the STP kernel to reduce the memory footprint and improve vectorization also impacted the user API
+and increase the users’ programming effort, if they want to use the SplitCK and hybrid layout scheme. The introduced hybrid AoSoA data layout is also less intuitive to use than the common AoS or SoA data layouts, which complicates development and maintenance of the code.
+
+Code generation proved to be a very valuable tool to solve these two issues.
+For ExaHyPE users, the new variants, SplitCK and AoSoA SplitCK, are optional and can easily be introduced later by adapting an application developed for the simpler default user API.
+For the engine developers, the template macros and high level abstractions available in the Kernel Generator greatly simplify the data layout change.
+
+VIII
+Acknowledgements and Funding
+
+This project has received funding from the European Union’s Horizon 2020 research and innovation programme under grant agreements No 823844 (project ChEESE,
+
+www.cheese-coe.eu
+) and No 671698 (ExaHyPE,
+www.exahype.eu
+).
+
+We thank the Gauss Centre for Supercomputing e.V. (
+www.gauss-centre.eu
+) for providing computing time on the GCS supercomputers SuperMUC and SuperMUC-NG at Leibniz Supercomputing Centre (
+www.lrz.de
+).
+
+We especially want to thank Carsten Uphoff for his support and advice on optimization of small tensor operations.
+

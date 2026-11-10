@@ -1,0 +1,621 @@
+An Architecture for Memory Centric Active Storage (MCAS)
+Daniel G. Waddington, Clem Dickey, Moshik Hershcovitch, Sangeetha Seshadri
+
+Abstract
+The advent of CPU-attached persistent memory technology, such as Intel’s Optane Persistent Memory Modules (PMM), has brought with it new opportunities for storage. In 2018, IBM Research Almaden began investigating and developing a new enterprise-grade storage solution directly aimed at this emerging technology. MCAS (Memory Centric Active Storage) defines an “evolved” network-attached key-value store that offers both near-data compute and the ability to layer enterprise-grade data management services on shared persistent memory. As a converged memory-storage tier , MCAS moves towards eliminating the traditional separation of compute and storage, and thereby unifying the data space. This paper provides an in-depth review of the MCAS architecture and implementation, as well as general performance results.
+
+
+
+1
+Introduction
+
+Traditionally, the separation between volatile data in memory and
+non-volatile data in storage devices (e.g., SSD) has been clear. The
+interface and semantics between the two domains is well defined; that
+is, in the event of power-reset or power-fail events, data in memory
+is lost and, in turn, is then retrieved from storage during the
+recovery process.
+
+With the advent of Persistent Memory (herein abbreviated to PM),
+such as Intel’s Optane DC Persistent Memory Modules (see
+Figure
+1
+), this conventional separation of memory and
+storage begins to blur. Because PM behaves like memory, operations
+on data held within PM can be performed in-place without having to
+first load, and potentially de-serialize, from storage. Likewise,
+data written to PM need not be pushed down to storage to assure its
+retention. The result is that operations on durable data can be
+performed at an order-of-magnitude lower latency than has been
+previously possible. Nevertheless, the Achilles’ heel of PM is
+that data management services traditionally realized by enterprise
+storage systems (e.g., access control, encryption, replication,
+compression, versioning, geo-distribution) cannot be easily realized
+with additional software.
+
+Figure 1:
+Optane DC Persistent Memory Module
+
+PM raises the data preservation boundary up
+the stack into the main memory space. It provides non-volatile memory
+hardware that sits below existing volatile caches but that, unlike
+existing DRAM-based memory, retains data in the event of failure
+or reset. The caveat is that data must be explicitly flushed from the
+CPU cache (e.g. via
+clflushopt
+) for its persistence to be guaranteed.
+
+It is also “byte-addressable” in that it is directly accessed via
+load-store instructions provided by the CPU. Intel Optane DC PMM,
+which uses 3D XPoint (3DXP) technology, operates at a cache-line read-write
+latency of around
+300ns
+(see
+[
+spectra2020
+,
+izraelevitz2019basic
+]
+for more detail). Even though this is slower
+than DRAM access latencies (
+\sim 100ns
+) it is at least 30x faster
+than state-of-the-art storage (e.g., NVMe SSD). Capacity of PM is
+also about 8x that of DRAM
+1
+1
+
+1
+
+For 3DXP, which is based on
+lattice-arranged Phase Change Memory (PCM).
+.
+
+Another consequence of PM being attached to the system as memory
+is that it allows use of Direct Memory Access (DMA) and
+Remote DMA (RDMA) to move data around. For example, data can be
+copied from PM to the network (via RDMA) or to another device such as
+a GPU (via DMA), without requiring execution by the CPU. This frees
+the CPU to perform other tasks rather than executing
+memcpy
+
+loops in order to move data. Today, NVIDIA/Mellanox RDMA network
+adapters can transfer data at near 400Gbps (50GiB/s) and therefore,
+using multiple adapters, can even keep pace with the performance of PM.
+
+1.1
+Current Limitations of Intel Optane PM
+
+While Intel Optane PMM provides many useful PM features as just
+discussed a number of limitations are evident in the current generation.
+
+•
+
+Endurance
+- lifetime endurance of the hardware is
+significantly less than DRAM (3DXP at
+10^{6}
+writes, DRAM at
+10^{10}
+)
+although orders-of-magnitude higher than NAND-flash. For intensive
+data write operations pushing through the cache this may be a
+significant limitation
+[
+227810
+]
+.
+
+•
+
+Asymmetric Performance Scaling
+- write performance does
+not scale with increasing number of threads, while read performance
+scales at around 1.2% degradation (from linear) per-core up to 28
+cores
+[
+9238605
+]
+.
+
+•
+
+64-bit Aligned Atomicity
+- only aligned 64-bit writes
+can be guaranteed to happen atomically by the hardware. There is
+currently no hardware support for multi-write atomicity/transactions and
+therefore this burden is left to the software.
+
+•
+
+Reliability & Serviceability
+- to provide maximum
+performance DIMMs must be configured to stripe data across 6
+devices. In the event of a single DIMM failure, data on all of the
+DIMMs is effectively lost.
+
+•
+
+Cost
+- although current 4Q2020 cost is
+\sim 0.5
+x than
+that of DRAM, it is an order-of-magnitude higher than NAND-flash
+(
+\sim 7\$/GB
+versus
+\sim 1\$/GB
+)
+
+2
+Design Objectives and Solution Positioning
+
+With the previously discussed characteristics of PM in mind, the following
+tenets in the design of MCAS were made. The solution should:
+
+1.
+
+Allow PM h/w resources to be shared as a network-attached
+capability using RDMA to provide maximum transfer speed. Data
+sharing across independent nodes should be possible with appropriate
+locking/serialization provided by the MCAS system.
+
+2.
+
+Maintain an immediate consistency model with guaranteed
+persistence (i.e. data is known to be flushed from volatile caches when a write is made).
+
+3.
+
+Support zero-copy (RDMA-only) transfer of large data chunks
+enabling bulk data movement with CPU
+memcpy
+execution.
+
+4.
+
+Minimize round-trip latency so that small reads/writes can be
+performed synchronously reducing s/w complexity in the client.
+
+5.
+
+Scale through sharding to bound any performance degradation due
+to locking.
+
+6.
+
+Provide flexible software-defined deployment for both
+on-premises and cloud. Support both containerized and
+virtual-machine based deployment scenarios.
+
+7.
+
+Enable safe, in-place user-defined operations directly on PM (both general and domain-specific).
+
+8.
+
+Provide flexibility in the custom service layering (e.g.,
+combining replication and tiering).
+
+MCAS is positioned as a
+converged memory-storage tier
+
+providing high-performance random access to durable data. Because
+MCAS is based on PM it can provide fine-grained durability (per
+write) as opposed to snap-shotting. Even with synchronous, consistent
+and guaranteed-persistent replication across multiple nodes, MCAS can
+support still millions of updates per second.
+
+3
+MCAS Core Architecture
+
+MCAS is implemented as a Linux process (known as the ’shard’ process)
+of which multiple instances can be concurrently deployed on the same
+machine. An MCAS process instance manages one or more network
+end-points, each corresponds to a separate
+shard
+(see
+Figure
+2
+).
+
+Shards are single-threaded and manage request handling for a
+
+set
+of pools. They can be accessed concurrently by multiple
+clients (from different nodes in the network) and can be
+grouped into larger virtual data domains through client-side
+clustering techniques such as consistent
+hashing
+[
+TanenbaumSteen07
+]
+.
+
+Each shard optionally maintains Active Data Object (ADO) processes
+that provide custom functionality to the store. The ADO processes
+themselves may act as clients to other MCAS nodes (back-flow). ADOs
+are discussed in more detail in Section
+.
+
+Figure 2:
+MCAS High-Level Architecture
+
+Resources (memory, CPU cores) are statically allocated to
+each shard through the MCAS configuration file. An example two-shard
+configuration file is shown in Listing
+1
+.
+
+⬇
+
+1
+
+{
+
+2
+
+"shards"
+
+:
+
+3
+
+[
+
+4
+
+{
+
+5
+
+"core"
+
+:
+
+0
+,
+
+6
+
+"port"
+
+:
+
+1
+1
+9
+1
+1
+,
+
+7
+
+"net"
+
+:
+
+"mlx5_0"
+,
+
+8
+
+"default_backend"
+
+:
+
+"hstore"
+,
+
+9
+
+"dax_config"
+
+:
+
+[
+{
+
+10
+
+"path"
+:
+
+"/dev/dax0.0"
+,
+
+11
+
+"addr"
+:
+
+"0x9000000000"
+
+}
+]
+
+12
+
+},
+
+13
+
+{
+
+14
+
+"core"
+
+:
+
+1
+,
+
+15
+
+"port"
+
+:
+
+1
+1
+9
+1
+2
+,
+
+16
+
+"net"
+
+:
+
+"mlx5_0"
+,
+
+17
+
+"default_backend"
+
+:
+
+"hstore"
+,
+
+18
+
+"dax_config"
+
+:
+
+[
+{
+
+19
+
+"path"
+:
+
+"/dev/dax0.1"
+,
+
+20
+
+"addr"
+:
+
+"0xA000000000"
+
+}
+]
+
+21
+
+}
+
+22
+
+]
+,
+
+23
+
+"net_providers"
+
+:
+
+"verbs"
+
+24
+
+}
+
+Listing 1:
+Example MCAS two-shard configuration
+
+Each shard serves a single network end-point established using the
+
+libfabric
+library, which is part of the Open Fabric
+Interfaces (OFI)
+framework
+2
+2
+
+2
+
+https://ofiwg.github.io/libfabric/
+. This library
+provides a common abstraction layer and services for high-performance
+fabrics such as RDMA verbs, Intel TrueScale, and Cisco VIC. It also
+includes a provider for plain TCP/IP socket (TCP or UDP) but without
+user-level and zero-copy capabilities. MCAS primarily supports the
+RDMA verbs and sockets providers.
+
+Pools are they next level of data collection. Each pool can only
+belong to a single shard, which in turn means that the handling of
+operations for a specific key-value pair is always performed by the
+same shard and thus same thread. Pools represent the
+security
+boundary
+from a client perspective. That is, access control and
+memory resources are all bound to a pool. If a client has
+access-rights to a pool, then they also have access-rights to all
+other key-value pairs in the pool.
+
+The overall data entity schema is given in Figure
+3
+.
+
+Figure 3:
+MCAS Entity Relationships
+
+3.1
+Client API
+
+Client applications interact with MCAS by linking to the client-API
+library (
+libcomponent-mcasclient.so
+). This library provides a
+C++ based interface to MCAS. The basic operations are very typical of
+a traditional key-value store (see Table
+1
+); they
+operate on
+opaque
+values that are identified by a unique
+key. Both keys and values are variable length and there is no
+restriction on their size.
+
+Function
+
+Description
+
+create_pool
+
+Create a new pool or open existing pool
+
+open_pool
+
+Open existing pool (optional create on demand)
+
+close_pool
+
+Release handle to pool
+
+delete_pool
+
+Securely delete pool and release pool memory to shard
+
+configure_pool
+
+Configure pool (e.g., add secondary index)
+
+put
+
+Write small (
+<
+2MiB) key-value pair. Optionally allow overwrites
+
+get
+
+Read small (
+<
+2MiB) key-value pair
+
+async_put
+
+Asynchronous version of put
+
+async_get
+
+Asynchronous version of get
+
+free_memory
+
+Free memory allocated by get call
+
+erase
+
+Erase key-value pair from pool
+
+async_erase
+
+Asynchronous version of erase
+
+get_attributes
+
+Get attributes for pool or key/value pair
+
+get_statistics
+
+Get shard statistics
+
+find
+
+Search key space in secondary index
+
+Table 1:
+Basic Client API Summary
+
+3.1.1
+Zero-copy Bulk Transfers
+
+MCAS also provides APIs for moving data to and from client-host memory
+without a memory copy (memcpy) operation being performed under the
+hood. These
+direct transfer
+APIs
+(see Table
+) are realized through the
+underlying RDMA network hardware and allow data to be moved directly
+from packet buffers into user-space memory (see
+Figure
+4
+). The memory for the direct APIs must be
+allocated (e.g., via POSIX
+alloc_aligned
+) and then registered
+with the RDMA stack via the MCAS
+register_direct_memory
+call.
+Under the hood, the direct APIs use RDMA read/write operations.
+However, because the semantics of the MCAS protocol is
+persistent-on-completion, two-sided operations (i.e. send/recv) are
+still used to provide the acknowledgments (see Appendix A for detail).
+
+The direct APIs can also be used with NVidia GPU-direct capabilities
+3
+3
+
+3
+
+https://docs.nvidia.com/cuda/gpudirect-rdma/index.html
+.
+This allows data to move from the MCAS server, across the network and
+then directly from the NIC hardware into an application-defined region
+of memory allocated inside the GPU.
+In this scenario,
+the CPU
+“host-code” on the client must acquire the region of GPU memory
+(e.g., via
+cuMemAlloc
+) and then register this memory with the
+MCAS
+register_direct_memory
+call. On completion of the
+direct call on the CPU, movement of data into or out of the GPU is
+known to be complete.
+
+Depending on the PCIe arrangement and NIC hardware, direct transfers
+are able to achieve transfer rates of tens of GiB/s. Of course, these
+transfers do not require CPU instruction execution and therefore the CPU is
+free to perform other useful work.
+
+Figure 4:
+MCAS Direct Transfers
+
+Function
+
+Description
+

@@ -1,0 +1,2807 @@
+Atos: A Task-Parallel GPU Dynamic Scheduling Framework for Dynamic Irregular Computations Conference: the 27th Symposium on Principles and Practice of Parallel Programming; February 12–16, 2022; Seoul, South Korea CCS: Theory of computation Massively parallel algorithms CCS: Theory of computation Parallel computing models
+Yuxin Chen, Benjamin Brock, Serban Porumbescu, Aydın Buluç, Katherine Yelick, John D. Owens
+
+Abstract
+. We present Atos, a task-parallel GPU dynamic scheduling framework that is especially suited to dynamic irregular applications. Compared to the dominant Bulk Synchronous Parallel (BSP) frameworks, Atos exposes additional concurrency by supporting task-parallel formulations of applications with relaxed dependencies, achieving higher GPU utilization, which is particularly significant for problems with concurrency bottlenecks. Atos also offers implicit task-parallel load balancing in addition to data-parallel load balancing, providing users the flexibility to balance between them to achieve optimal performance. Finally, Atos allows users to adapt to different use cases by controlling the kernel strategy and task-parallel granularity. We demonstrate that each of these controls is important in practice. We evaluate and analyze the performance of Atos vs. BSP on three applications: breadth-first search, PageRank, and graph coloring. Atos implementations achieve geomean speedups of 3.44x, 2.1x, and 2.77x and peak speedups of 12.8x, 3.2x, and 9.08x across three case studies, compared to a state-of-the-art BSP GPU implementation. Beyond simply quantifying the speedup, we extensively analyze the reasons behind each speedup. This deeper understanding allows us to derive general guidelines for how to select the optimal Atos configuration for different applications. Finally, our analysis provides insights for future dynamic scheduling framework designs.
+
+
+
+1
+
+1.
+Introduction
+
+Bulk-synchronous parallel (BSP) programming
+(
+Valiant 1990
+)
+is the traditional model for GPU applications. It is a natural fit for statically schedulable, regular problems, such as many dense matrix, image analysis, and structured grid computations. Programming environments like NVIDIA’s CUDA and Khronos’s SYCL support this relatively simple model, which maps efficiently to the massive fine-grained parallelism on GPUs and can deliver near-peak performance.
+
+However, some important problems are instead irregular, with frequent control flow branches, non-unit stride memory accesses, variable amounts of work across loop iterations, and dynamically varying degrees of parallelism. Algorithms that operate on graphs or trees or those with recursive formulations often exhibit such irregularity. These more naturally use a task-based programming model. Programming systems like Legion
+(
+Bauer
+et al. 2012
+)
+, PTask
+(
+Rossbach et al. 2011
+)
+and StarPU
+(
+Augonnet et al. 2010
+)
+use tasking on the CPU to feed GPUs with kernels to mask the latency of communication and keep the GPU busy.
+In contrast, we consider the problem of very fine-grained tasking where a set of similar application level tasks are aggregated to form a data-parallel GPU task. This idea is used in state-of-the-art GPU graph libraries like Gunrock
+(
+Wang et al. 2017
+)
+, where the application level tasks are vertices or edges. Each frontier in a graph sweep is launched as a separate GPU kernel in the BSP model; this raises issues of insufficient parallelism, uneven finish times, and high kernel launch overhead for small frontiers.
+
+To address the above issues, we present the design of Atos, a task-scheduling framework for GPUs that is adaptable to different usage scenarios:
+
+•
+
+It supports both expensive and inexpensive frontiers by providing persistent and non-persistent task schedulers. The persistent scheduler is a GPU kernel that runs continuously to minimize launch overhead.
+
+•
+
+It allows the user to trade off task and data parallelism by selecting the worker size, which is the number of GPU threads within each worker, and the number of items in each task.
+
+•
+
+It uses a single shared task queue, which balances load more quickly than a distributed queue, yet is fast enough to keep GPU workers occupied.
+
+•
+
+It supports asynchronous execution across frontiers to maximize available parallelism, while mostly preserving cross-frontier ordering and thus minimizing overwork.
+
+We study three graph algorithms on a variety of graph datasets that stress the importance of each of the above controls. These problems have nested parallelism with outer loop dependencies, and the ability to relax those dependencies comes at the cost of possible overwork. Thus a second major theme in this paper is this tradeoff between increased parallelism and overwork. Each of our three algorithms explores this tradeoff in a somewhat different manner and detailed discussion and analysis is presented in Section
+5
+and
+6
+.
+
+Our contributions include:
+
+•
+
+Developing a generalized GPU task-parallel framework that explores a broad design space of possible task-parallel implementations;
+
+•
+
+A demonstration of the benefits of mixed task and data parallelism for fine-grained parallel applications;
+
+•
+
+Identifying relaxed-synchronization applications as a strong candidate for acceleration with a GPU task-parallel framework; and
+
+•
+
+A detailed analysis of application performance that highlights the impact of design decisions both within the task scheduler and at the application level.
+
+2.
+A Dynamic, Irregular Application Pattern
+
+Atos handles a broad set of applications with fine-grained task and data parallelism, but we choose to focus here on a particularly challenging class of irregular nested loops with the following form:
+
+⬇
+
+in_frontier
+
+=
+
+initialize
+()
+
+while
+
+(
+stop
+
+condition
+
+not
+
+met
+):
+
+//
+
+outer
+
+loop
+
+—————
+CUDA
+-
+KERNEL
+——————
+
+for
+
+(
+i
+
+in
+
+in_frontier
+):
+
+//
+
+inner
+
+loops
+
+for
+
+(
+j
+
+=
+
+0
+
+to
+
+workload
+(
+i
+).
+size
+()):
+
+out_frontier
+.
+append
+(
+f
+(
+in_frontier
+[
+i
+],
+
+j
+))
+
+———————————————
+
+cudaDeviceSynchronize
+()
+
+in_frontier
+
+=
+
+out_frontier
+
+A program with nested loops, expressed with a frontier abstraction.
+
+The inner loops produce data parallelism that may be flattened as in NESL
+(
+Blelloch and
+Sabot 1990
+)
+or Gunrock
+(
+Wang et al. 2017
+)
+to maximize parallelism and to implement a data-parallel load-balancing technique. For example, if the inner loops are iterating over graph vertices and outgoing edges, some pre-analysis may be used to evenly distribute the edges rather than the vertices. Our work also relaxes the outer loop iterations, which will expand opportunities to find parallelism.
+
+Our applications exhibit one or more of the following forms of dynamic, irregular parallelism:
+
+•
+
+The number of tasks varies across outer loop frontiers:
+Work is generated dynamically and the number of output tasks produced from each input task is not fixed.
+
+•
+
+The cost of each inner loop task (lines 4–5 in Listing
+1
+) may vary:
+The loop bound (
+workload(i).size()
+) in line 5 is not fixed.
+
+•
+
+Total work may vary:
+The outer loop has a loop-carried dependence, so while dynamic generation of tasks will enforce some dependencies, parallel execution of tasks across frontiers can change program behavior, including the total number of tasks processed.
+
+2.1.
+Performance Challenges of Dynamic, Irregular Problems
+
+Traditional BSP implementations of such applications usually launch a series of kernels, with each kernel corresponding to a bulk-synchronous step (one iteration of the outer loop). Between each step is a global synchronization barrier. The kernels themselves parallelize over the inner loops, with the list of work passed between iterations forming the “frontier”.
+While optimized BSP implementations of many dynamic irregular applications achieve impressive performance, we identify three performance challenges with this approach.
+
+Small frontier problem
+The runtime of a kernel is the sum of fixed costs (the cost of the global synchronization barrier plus the kernel launch cost) and the amount of time to process the input frontier. The size of input frontiers across iterations may vary significantly over the lifetime of the program. A small frontier has two performance consequences: (1) The fixed costs dominate the overall processing cost; the GPU is spending a significant amount of time setting up or waiting for computation rather than performing it. (2) A small frontier may not be large enough to fill the GPU with work, leaving processing units idle
+(
+team 2017
+)
+.
+
+Load imbalance
+Because of the irregular nature of work in the inner loop, efficiently assigning work to GPU threads is critical to achieve the highest performance. Statically computing work assignment is infeasible because work is produced dynamically, so lines 4–6 in Listing
+1
+are usually implemented with data-parallel load balancing techniques
+(
+Merrill
+et al. 2012
+;
+Davidson
+et al. 2014
+;
+Wang et al. 2017
+)
+that compute work assignment at runtime. However, the optimal load-balancing technique is problem-dependent and even for a fixed problem may be input-dependent. And the runtime cost of that technique may be high.
+
+Loss of concurrency opportunities
+The BSP model enforces an ordering between every operation in iteration
+i
+with every operation in iteration
+i+1
+, even if some of those pairs may be independent. We relax this cross-frontier ordering in two ways. One is to consider problems whose typical formulation is as nested loops but whose computation is
+amenable to reordering
+across BSP iterations. Two is to
+speculate
+that work in later iterations is not dependent on work in earlier iterations and to repair the misspeculation or retry the computation if it is incorrect.
+
+3.
+Our Task-Parallel Programming Model and Design Space
+
+Our programming model allows implementations of task-parallel formulations of the workloads we discussed in Section
+2
+, with a focus on providing solutions to BSP’s three challenges: small-frontier, load-imbalance, and loss of concurrency opportunities.
+We use the following terminology:
+
+worker::
+
+one or a group of GPU threads.
+
+task::
+
+one or more pieces of work that are scheduled as a single unit in our system.
+
+application function
+f()
+::
+
+the code that processes each task. Each application function declares the worker size it requires to run.
+
+⬇
+
+——–
+CUDA_KERNEL
+———-
+
+for
+
+each
+
+worker
+:
+
+while
+
+not
+
+queue
+.
+empty
+():
+
+task
+
+=
+
+queue
+.
+concurrent_pop
+(
+task
+.
+size
+())
+
+new_tasks
+
+=
+
+f
+(
+task
+)
+
+queue
+.
+concurrent_push
+(
+new_tasks
+)
+
+—————————–
+
+SPMD code of each thread worker in Atos.
+
+At a high level, our model maintains a queue of tasks. Workers fetch a task from the queue, process the task, and add newly generated tasks (if any) to the queue. The program runs until either a stop condition is met or the queue is empty (Listing
+2
+). This programming model addresses the performance challenges from Section
+2.1
+:
+
+•
+
+We can implement Listing
+2
+with a single kernel invocation, avoiding multiple launches of small kernels.
+
+•
+
+Task parallelism is implicitly load-balanced because workers can run independently and stay busy even if tasks require different amounts of work.
+
+•
+
+Listing
+2
+has no global synchronization; instead the programmer controls the scheduling of work, allowing more flexible dependencies and thus more opportunities for concurrency.
+
+The primary focus of this paper is how to best implement Listing
+2
+on the GPU. We identify below the four key design decisions in such an implementation.
+
+Relaxing barriers:
+
+A BSP implementation separates work in each iteration with a global barrier. Can we benefit from relaxing this global barrier constraint?
+
+Worker size:
+
+We can choose what GPU resources we assign to each worker. What is the worker size that yields the best performance?
+
+Data vs. Task Parallelism:
+
+We expect to leverage the parallelism between tasks. We can also choose the size of our tasks, and within each task, potentially leverage data parallelism. What is the right balance between task and data parallelism?
+
+Kernel strategy:
+
+Listing
+2
+is written in a “persistent” style, implementable with a single kernel call. We could alternatively interchange its outer and inner loops, making one “discrete” kernel call per iteration. Which is best for optimal performance?
+
+3.1.
+Relaxing Barriers
+
+As discussed in Section
+2
+, many applications have the nested loop structure from Listing
+1
+and their BSP implementations may lose concurrency opportunities because of the global barrier between the outer loops.
+In many cases, we
+can
+remove the barrier and relax the outer loop dependency while still computing the correct result. How? Consider two tasks
+A
+and
+B
+that, in a BSP implementation, are ordered:
+A
+is in an iteration that precedes
+B
+and thus must run before
+B
+.
+
+•
+
+One possibility is to
+speculate
+that we can compute
+A
+and
+B
+at the same time, or even in the order
+B
+then
+A
+, without changing the correctness of the computation. If our speculation is correct, then we expose more concurrency. If our speculation is incorrect, then we must fix it. This fix might be cheap or costly.
+
+•
+
+A second possibility is a problem formulation that is robust to computing items out of order. This is also called Dijkstra’s don’t care non-determinism
+(
+Dijkstra 1976
+)
+.
+
+In either case, we can relax global barriers and expose additional concurrency; depending on the problem and dataset, we may see significant performance gains. However, relaxing barriers may incur additional costs: the cost of performing incorrectly speculated work, the cost of repairing incorrectly speculated work, and less predictable convergence rates when compared to the BSP counterpart. Overall, if the performance improvements from increased concurrency outweigh these costs, we can deliver performance gains.
+
+Related work:
+
+Hassaan et al.
+(
+Hassaan
+et al. 2011
+)
+studied unordered and ordered versions of several algorithms, demonstrating a tradeoff between parallelism and work efficiency. However, the relaxed barrier formulations we study differ from unordered ones. Consider breadth-first search (BFS). Both Hassaan et al. and we begin with a work-efficient Dijkstra BFS, but they compare to a work-inefficient Bellman-Ford BFS, while we compare to a relaxed (speculative) Dijkstra BFS (Section
+5.1
+). The speculative Dijkstra BFS is more work-efficient than Bellman-Ford BFS. Empirically, speculative Dijkstra’s workload is within a small constant factor of that of BSP Dijkstra, which is
+\#edges
+(see Table
+4
+). This is much smaller than Bellman-Ford’s workload of
+diameter\times\#edges
+.
+Kulkarni et al.
+(
+Kulkarni et al. 2007
+)
+studied an abstraction and runtime scheme for workloads with optimistic parallelism, which differ from the relaxing barriers we study in this paper.
+Their notion of optimistic parallelism assumes many tasks can run in parallel and stops a task the moment it violates a dependency.
+In contrast, we allow the computation to commit, even if it violates a dependency, and only fix the mistake afterwards.
+
+3.2.
+Worker Size
+
+Previous task-parallelism work
+(
+Cederman and
+Tsigas 2008
+;
+Chen
+et al. 2010
+;
+Augonnet et al. 2010
+;
+Rossbach et al. 2011
+;
+Krieder et al. 2014
+;
+Ben-Nun
+et al. 2017
+)
+uses the whole GPU as a single worker. They maintain a task dependency graph on the CPU side and orchestrate the execution by launching a CUDA kernel for each task when dependencies are satisfied. We use
+GPU-wide-worker
+to describe such an organization. Tasks in those GPU-wide-worker task-parallel frameworks are usually very large to better utilize the entire GPU’s resources. This organization is easy to program and has low scheduling overhead.
+
+However, the GPU-wide-worker scheme is a poor match when task dependencies require finer management. Consider the following extreme example: Task
+A
+and Task
+B
+both contain 10,000 data items, and only a single data item in
+B
+depends on a single item in
+A
+. A GPU-wide-worker implementation must wait for
+A
+to complete before beginning work on
+B
+, even though most of the data items can be processed independently and concurrently. We use the term
+false dependency
+to describe the situation when a data item has all its dependencies satisfied, but cannot be processed because another data item in the same task has unresolved dependencies. One can reduce such false dependencies by decomposing a large task into many smaller tasks to expose more parallelism. As a result, workers should be smaller, matching the size of tasks and allowing full utilization of the GPU’s resources. This approach has motivated a number of recent task-parallelism frameworks
+(
+Tzeng
+et al. 2010
+;
+Tzeng
+et al. 2012
+;
+Yeh et al. 2017
+;
+Belviranli et al. 2018
+;
+Steinberger et al. 2014
+)
+, which use workers sized as either warps or Cooperative Thread Arrays (CTAs). The resulting additional complexity in scheduling many smaller workers motivates also moving scheduling decisions from the CPU to the GPU.
+
+Most task-parallelism frameworks only provide one worker size. Our framework provides thread-, warp-, and CTA-sized workers, to support tasks of different size and different synchronization requirements. The only prior work that uses multiple granularities is Whippletree
+(
+Steinberger et al. 2014
+)
+. Whippletree’s thread and warp worker sizes are primarily a programming model concept and suffer from synchronization penalties at the implementation level. In Whippletree’s implementation, threads are still synchronized within entire CTAs, suffering from false dependencies if tasks require finer synchronization than at CTA granularity.
+
+3.3.
+Balance Between Data and Task Parallelism
+
+Many parallel applications have work items that require different amounts of processing. Traditional BSP applications address this challenge with explicitly coded data-parallel load balancing techniques. We describe two different approaches in the context of Listing 1:
+One widely used technique is load balancing search
+(
+Davidson
+et al. 2014
+)
+, which dynamically computes the prefix-sum of
+workload(i).size()
+for
+i\in
+
+in_frontier
+, then flattens the two for-loops into one big array and redistributes the work in the array to each CUDA thread (see Baxter
+(
+Baxter 2013
+)
+for details). Another popular data-parallel load balancing technique separates the work in
+in_frontier
+into different buckets based on
+workload(i).size()
+and launch a separate kernel with the best processing strategy for that size for each bucket
+(
+Merrill
+et al. 2012
+)
+.
+
+Task parallelism is a natural fit for these irregular applications. Workers in our framework do not directly synchronize with each other. One of the primary advantages of this lack of coordination is that it allows workers to attend to any available work items as soon as they become available
+(“implicit task-parallel load balancing”).
+
+Task parallelism and data parallelism are not exclusive– individual tasks of sufficient size may also exploit data parallelism in their execution. Thus we consider a continuous spectrum with pure task-parallel and pure data-parallel load balancing at the extremes, and expect that the optimal trade-off will be application-dependent.
+Our framework supports two worker sizes larger than a thread (warp and CTA) and offers the programmer the ability to exploit data parallelism within each warp-sized or CTA-sized task. In the framework, workers operate on tasks asynchronously, but an individual worker itself is executed synchronously. Therefore, we can use a worker’s capacity as a parameter to control the tradeoff between data and task parallelism. Given a fixed number of threads available, increasing a worker’s capacity reduces the total number of workers available for a given application. At the same time, an increase in worker capacity results in more opportunities to perform data-parallel load balancing within each worker. In the extreme, setting a worker’s capacity to the entire GPU leaves no room for task parallelism and is equivalent to the BSP model. We found that data-parallel load balancing inside the worker combined with task-parallel load balancing provided by Atos results in better overall load balancing (Section
+6
+). We are not aware of any previous work that combines these two types of load balancing.
+
+3.4.
+Kernel Strategy
+
+Traditional GPU kernels divide a variable amount of input work into fixed-size CTAs and launch a kernel over a CTA count proportional to the amount of input work. Persistent kernels
+(
+Gupta
+et al. 2012
+)
+decouple the relationship between data size and launched CTAs. A persistent kernel launches only enough CTAs to fill the GPU. These CTAs remain resident for the entire kernel and run a loop that matches naturally to the task-parallelism model in Listing
+2
+.
+
+Advantages of persistent kernels
+Persistent kernels reduce kernel launch overhead and CPU/GPU communication. This is particularly significant where many small kernels are required. The persistent kernel reduces CPU involvement in favor of programmer-written GPU logic within the persistent kernel.
+
+Disadvantages of persistent kernels
+GPU workers in the persistent kernel concurrently pop from a shared queue; this requires atomic operations to ensure exclusive pops. Persistent kernels have higher register usage than discrete kernels (requiring extra registers to maintain the queue loop).
+
+Intuitively, if a discrete-kernel application suffers from large kernel overhead (exhibits the small frontier problem), a persistent kernel may be preferred. Otherwise, it may be better and simpler to choose a discrete kernel. Previous task-parallelism frameworks either use discrete kernels
+(
+Cederman and
+Tsigas 2008
+;
+Augonnet et al. 2010
+;
+Rossbach et al. 2011
+;
+Krieder et al. 2014
+)
+) or persistent kernels
+(
+Tzeng
+et al. 2010
+;
+Tzeng
+et al. 2012
+;
+Yeh et al. 2017
+;
+Belviranli et al. 2018
+;
+Steinberger et al. 2014
+)
+, but none of them provide both and/or expose that decision to the programmer. In Section
+6.6
+, we discuss the results of our experiments with respect to this choice.
+
+4.
+Framework API
+
+With the discussion from Section
+3
+in mind, we introduce the Atos API shown in Listing
+1
+.
+
+⬇
+
+template
+<
+typename
+
+T
+,
+
+typename
+
+COUNTER_T
+>
+
+struct
+
+Queues
+
+{
+
+__host__
+
+void
+
+init
+
+(
+COUNTER_T
+,
+
+int
+
+num_queues
+,
+
+int
+
+iteration
+);
+
+template
+<
+typename
+
+F1
+,
+
+typename
+
+F2
+,
+
+typename
+…
+
+Args
+>
+
+__host__
+
+void
+
+launchThread
+
+(
+bool
+
+ifPersist
+,
+
+int
+
+numBlock
+,
+
+int
+
+numThread
+,
+
+int
+
+shareMem_size
+,
+
+F1
+
+f1
+,
+
+F2
+
+f2
+,
+
+Args
+…
+
+arg
+);
+
+template
+<
+typename
+
+F1
+,
+
+typename
+
+F2
+,
+
+typename
+…
+
+Args
+>
+
+__host__
+
+void
+
+launchWarp
+
+(
+bool
+
+ifPersist
+,
+
+int
+
+numBlock
+,
+
+int
+
+numThread
+,
+
+int
+
+sharedMem_size
+,
+
+F1
+
+f1
+,
+
+F2
+
+f2
+,
+
+Args
+…
+
+arg
+);
+
+template
+<
+int
+
+FETCH_SIZE
+,
+
+typename
+
+F1
+,
+
+typename
+
+F2
+,
+
+typename
+…
+
+Args
+>
+
+__host__
+
+void
+
+launchCTA
+
+(
+bool
+
+ifPersist
+,
+
+int
+
+numBlock
+,
+
+int
+
+numThread
+,
+
+int
+
+shareMem_size
+,
+
+F1
+
+f1
+,
+
+F2
+
+f2
+,
+
+Args
+…
+
+arg
+);
+
+}
+
+Listing 1
+
+Atos framework APIs
+
+launch*
+API functions are used to launch workers who repeatedly pop tasks from the work queue; each worker then applies function
+f1
+to the task popped. When the worker fails to pop, it runs function
+f2
+(default noop) instead. Under persistent kernel mode,
+numThread
+\times
+numBlock
+cannot exceed the maximum number of threads that can concurrently reside on the GPU based on the application’s register and shared memory usage. By default, these are set to the maximum allowed values, but can be overridden by users.
+As discussed in Section
+3
+, when we execute
+launchCTA
+, the choice of
+numThread
+will determine the fraction of task- and data-parallelism. Argument
+FETCH_SIZE
+defines how many data items constitute a task to be popped from the queue by a worker. Given
+numBlock
+, the
+FETCH_SIZE
+should be set accordingly. Increasing
+FETCH_SIZE
+will reduce available tasks for other workers but increase local data parallelism, and decreasing
+FETCH_SIZE
+will have the opposite effect.
+
+5.
+Three Case Studies
+
+In this paper we select three classic nested loop problems in the domain of graph computation for in-depth study. We choose them because their implementations are well-studied in the BSP model so we can be confident that our results are meaningful.
+Also when run on particular datasets, their BSP implementations exhibit one or more of the challenges described in Section
+2.1
+. In Algorithms 1–6, we use CUDA atomic operation APIs
+(
+CUDA 2019
+)
+.
+
+5.1.
+Breadth-First Search
+
+The pseudocodes of BSP BFS and relaxed-barrier BFS (“Speculative BFS”) are shown in Algorithms
+1
+and
+2
+. Algorithm
+1
+shows that BSP BFS is exactly Dijkstra’s algorithm: BSP BFS advances the outer iteration only when all vertices in the
+in_frontier
+are traversed; thus strict breadth-first ordering is preserved, ensuring every vertex will first be reached via its optimal path.
+
+In contrast, in Algorithm
+2
+, Speculative BFS relaxes the barrier constraints of the outer loop of BSP BFS. Speculative BFS has a single dynamic frontier, and many independent CUDA workers asynchronously push and pop vertices to the frontier. Consequently, vertices at different distances can be processed simultaneously. This raises the possibility of extra work, since out-of-order iteration may require visiting vertices multiple times in order to find the shortest path.
+
+Despite this difference, we stress that both algorithms are based on a similar vertex traversal.
+Speculative BFS is more precisely seen as Dijkstra with relaxed barrier constraints, and differs from SSSP algorithms such as Bellman-Ford.
+
+5.2.
+PageRank
+
+PageRank computes the importance (rank) of nodes in a graph.
+PageRank has a “push” and a “pull” formulation. Both BSP and relaxed-barrier PageRank (asynchronous PageRank) use push and their pseudocodes are shown in Algorithm
+3
+and
+4
+. The algorithm begins with an initial rank and residue value per node. In Algorithm
+3
+, BSP PageRank is computed by two kernels that are repeatedly called in an outer loop until all vertices converge. The first kernel pushes a fraction of the residue of each vertex on the
+frontier
+to its neighbors. The second kernel aggregates all vertices with residue
+>\epsilon
+and adds them to the
+frontier
+. Having two separate kernels allows threads to be remapped for more flexible load balancing.
+
+Asynchronous PageRank (Algorithm
+4
+) removes the global synchronization and fuses the two kernels from the BSP implementation together. In asynchronous PageRank, CUDA workers pop vertices from the queue asynchronously, push their residue to their neighbors, then exclusively reserve
+Check_Size
+number of vertices and push those vertices onto the queue if their residue
+>\epsilon
+.
+
+PageRank is an iterative unordered algorithm as it is essentially a random walk
+(
+Chung and Zhao 2010
+;
+Fortunato and
+Flammini 2007
+)
+. In theory, the BSP global barrier is not necessary or beneficial. In our experiments, BSP PageRank does not converge faster than asynchronous PageRank.
+
+5.3.
+Graph Coloring
+
+Graph coloring is usually implemented using either an independent-set-based approach or a greedy approach. In this paper,
+both
+the BSP and relaxed barrier graph coloring use a speculative greedy graph coloring algorithm
+(
+Gebremedhin and
+Manne 2000
+)
+shown in Algorithms
+5
+and
+6
+.
+In Algorithm
+5
+, the BSP implementation uses a double buffer and consists of two kernels that are called in the outer loop until all vertices are appropriately colored. The first kernel assigns colors to vertices from
+in_frontier
+while avoiding color conflicts with their neighbors. The second kernel aggregates each vertex that, after the first kernel’s color assignment, still has a color conflict with a neighbor, and adds it to
+out_frontier
+. The speculative part of this algorithm is in the first kernel: it allows a vertex to be colored using the outdated color information from its neighbors and if the vertex color assignment fails (and is detected in the second kernel), that vertex is re-added to the frontier for recoloring.
+
+In contrast, in Algorithm
+6
+, the relaxed barrier version fuses the two kernels by an uberkernel
+(
+Hargreaves 2004
+)
+; we use the sign of the vertex ID to distinguish between the color assignment task and the conflict detection task. Specifically, if we pop a vertex with positive ID, we perform color assignment (lines 8–11 of Algorithm
+6
+, identical to lines 11–14 of Algorithm
+5
+), and if we pop a vertex with negative ID, we perform conflict detection (lines 16–18 of Algorithm
+6
+, identical to lines 21–23 of Algorithm
+5
+). Thus, Algorithm
+6
+is almost identical to Algorithm
+5
+. The only difference is that Algorithm
+6
+does not enforce a global barrier between the color assignment and conflict detection kernels.
+
+⬇
+
+#
+
+Initialization
+
+Graph
+
+G
+
+in_frontier
+
+=
+
+[
+source
+]
+
+for
+
+vertex
+
+in
+
+G
+:
+
+vertex
+.
+dist
+
+=
+
+MAX_UINT32
+
+#
+
+Start
+
+BFS
+
+while
+
+not
+
+in_frontier
+.
+empty
+():
+
+out_frontier
+
+=
+
+[]
+
+————-
+CUDA_KERNEL
+————–
+
+for
+
+vertex
+
+in
+
+in_frontier
+:
+
+for
+
+neighbor
+
+in
+
+vertex
+.
+neighbors
+:
+
+neighber_dist
+=
+atomicMin
+(&
+neighbor
+.
+dist
+,
+
+vertex
+.
+dist
++1)
+
+if
+
+vertex
+.
+dist
+
++
+
+1
+
+<
+
+neighbor_dist
+:
+
+out_frontier
+.
+append
+(
+neighbor
+)
+
+—————————————–
+
+cudaDeviceSynchronize
+()
+
+in_frontier
+
+=
+
+out_frontier
+
+Algorithm 1
+
+Bulk Synchronous BFS
+
+⬇
+
+#
+Same
+
+initialization
+
+as
+
+Algorithm
+
+1
+
+#
+Start
+
+BFS
+
+————-
+CUDA_KERNEL
+—————-
+
+while
+
+not
+
+frontier
+.
+empty
+():
+
+vertex
+
+=
+
+frontier
+.
+pop
+()
+
+for
+
+neighbor
+
+in
+
+vertex
+.
+neighbors
+:
+
+neighber_dist
+=
+atomicMin
+(&
+neighbor
+.
+dist
+,
+
+vertex
+.
+dist
++1)
+
+if
+
+vertex
+.
+dist
+
++
+
+1
+
+<
+
+neighbor_dist
+:
+
+frontier
+.
+append
+(
+neighbor
+)
+
+—————————————-
+
+Algorithm 2
+
+Speculative BFS
+
+⬇
+
+#
+
+Initialization
+
+Graph
+
+G
+
+rank
+[
+G
+.
+total_vertices
+]
+
+=
+
+{1-
+lambda
+}
+
+residue
+[
+G
+.
+total_vertices
+]
+
+=
+
+{0}
+
+for
+
+vertex
+
+in
+
+G
+.
+all_vertices
+():
+
+atomicAdd
+(
+residue
++
+vertex
+,
+
+(1-
+lambda
+)/
+lambda
+*
+vertex
+.
+neighborLen
+)
+
+frontier
+.
+append
+(
+vertex
+)
+
+#
+
+Start
+
+PageRank
+
+while
+
+not
+
+frontier
+.
+empty
+():
+
+————-
+CUDA_KERNEL
+—————-
+
+for
+
+vertex
+
+in
+
+frontier
+:
+
+res
+
+=
+
+atomicExch
+(
+residue
++
+vertex
+,0)
+
+rank
+[
+vertex
+]
+
+=
+
+rank
+[
+vertex
+]+
+res
+
+res
+
+=
+
+res
+*
+lambda
+/
+vertex
+.
+neighborLen
+
+for
+
+neighbor
+
+in
+
+vertex
+.
+neighbors
+:
+
+atomicAdd
+(
+residue
++
+neighbor
+,
+
+res
+)
+
+—————————————-
+
+cudaDeviceSynchronize
+()
+
+frontier
+
+=
+
+[]
+
+————-
+CUDA_KERNEL
+—————-
+
+for
+
+vertex
+
+in
+
+G
+.
+all_vertices
+():
+
+if
+
+residue
+[
+vertex
+]
+
+>
+
+epsilon
+:
+
+frontier
+.
+append
+(
+vertex
+)
+
+—————————————-
+
+cudaDeviceSynchronize
+()
+
+Algorithm 3
+
+Bulk Synchronous PageRank
+
+⬇
+
+#
+Same
+
+initialization
+
+as
+
+Algorithm
+
+3
+
+#
+Start
+
+PageRank
+
+————-
+CUDA_KERNEL
+———————–
+
+while
+
+not
+
+frontier
+.
+empty
+():
+
+vertex
+
+=
+
+frontier
+.
+pop
+()
+
+res
+
+=
+
+atomicExch
+(
+residue
++
+vertex
+,0)
+
+atomicAdd
+(
+rank
++
+vertex
+,
+
+res
+)
+
+res
+
+=
+
+res
+*
+lambda
+/
+vertex
+.
+neighborLen
+
+for
+
+neighbor
+
+in
+
+vertex
+.
+neighbors
+:
+
+atomicAdd
+(
+residue
++
+neighbor
+,
+
+res
+)
+
+check_start
+
+=
+
+atomicAdd
+(
+check
+,
+
+Check_Size
+)
+
+for
+
+check_id
+
+in
+
+check_start
++
+Range
+[0,
+Check_Size
+):
+
+if
+
+residue
+[
+check_id
+%
+G
+.
+total_vertices
+]
+
+>
+
+epsilon
+:
+
+frontier
+.
+append
+(
+check_id
+%
+G
+.
+total_vertices
+)
+
+———————————————-
+
+Algorithm 4
+
+Asynchronous PageRank
+
+⬇
+
+#
+
+Initialization
+
+Graph
+
+G
+
+in_frontier
+
+=
+
+G
+.
+all_vertices
+()
+
+for
+
+vertex
+
+in
+
+in_frontier
+:
+
+vertex
+.
+color
+
+=
+
+-1;
+
+#
+
+Start
+
+graph
+
+coloring
+
+while
+
+not
+
+in_frontier
+.
+empty
+():
+
+#
+
+Assign
+
+each
+
+vertex
+
+a
+
+color
+
+different
+
+from
+
+neighbors
+’
+
+————-
+CUDA_KERNEL
+———————–
+
+for
+
+vertex
+
+in
+
+in_frontier
+:
+
+forbidden
+[
+G
+.
+max_degree
+]
+
+=
+
+{0}
+
+for
+
+neighbor
+
+in
+
+vertex
+.
+neighbors
+:
+
+forbidden
+[
+neighbor
+.
+color
+]
+
+=
+
+1
+
+vertex
+.
+color
+
+=
+
+find_min_color
+(
+forbidden
+[
+color
+]
+
+==
+
+false
+)
+
+———————————————-
+
+cudaDeviceSynchronize
+()
+
+#
+
+Collect
+
+vertices
+
+whose
+
+colors
+
+collide
+
+with
+
+neighbors
+’
+
+out_frontier
+
+=
+
+[]
+
+————-
+CUDA_KERNEL
+———————–
+
+for
+
+vertex
+
+in
+
+in_frontier
+:
+
+for
+
+neighbor
+
+in
+
+vertex
+.
+neighbors
+:
+
+if
+
+vertex
+.
+color
+
+==
+
+neighbor
+.
+color
+:
+
+out_frontier
+.
+append
+(
+vertex
+)
+
+———————————————-
+
+cudaDeviceSynchronize
+()
+
+in_frontier
+
+=
+
+out_frontier
+
+Algorithm 5
+
+Bulk Synchronous speculative Graph Coloring
+
+⬇
+
+#
+Same
+
+initialization
+
+as
+
+Algorithm
+
+5
+
+#
+Start
+
+graph
+
+coloring
+
+————-
+CUDA_KERNEL
+———————–
+
+while
+
+not
+
+frontier
+.
+empty
+():
+
+#
+
+Assign
+
+each
+
+vertex
+
+a
+
+color
+
+different
+
+from
+
+neighbors
+’
+
+vertex
+
+=
+
+frontier
+.
+pop
+()
+
+if
+
+vertex
+
+>
+
+0
+
+forbidden
+[
+G
+.
+max_degree
+]
+
+=
+
+{0}
+
+for
+
+neighbor
+
+in
+
+vertex
+.
+neighbors
+:
+
+forbidden
+[
+neighbor
+.
+color
+]
+
+=
+
+1
+
+vertex
+.
+color
+
+=
+
+find_min_color
+(
+forbidden
+[
+color
+]
+
+==
+
+false
+)
+
+frontier
+.
+append
+(-1*
+vertex
+)
+
+#
+
+push
+
+vertices
+
+whose
+
+colors
+
+collide
+
+with
+
+neighbors
+’
+
+else
+
+if
+
+vertex
+
+<
+
+0
+
+vertex
+
+=
+
+-1
+
+*
+
+vertex
+
+for
+
+neighbor
+
+in
+
+vertex
+.
+neighbors
+:
+
+if
+
+vertex
+.
+color
+
+==
+
+neighbor
+.
+color
+:
+
+frontier
+.
+append
+(
+vertex
+)
+
+———————————————-
+
+Algorithm 6
+
+Asynchronous speculative Graph Coloring
+
+6.
+Experiments and Analysis
+
+6.1.
+System and Hardware Information
+
+All experiments in this paper are run on a Linux workstation with 2.20 GHz Intel(R) hyper-threaded E5-2698 v4 Xeon(R) CPUs, 528 GB of main memory, and an NVIDIA V100 GPU with 32 GB on-board memory. All programs were compiled with NVIDIA’s nvcc compiler (version 11.1.168) with the -O3 flag and gcc 9.3.0 with the -O3 flag. All results ignore transfer time and are averaged over 20 runs.
+
+6.2.
+Experimental Overview
+
+We evaluate the design principles discussed in Section
+3
+using three implementation variants based on a combination of Atos configurations. (1) “persist-32” utilizes persistent kernels with
+warp-sized
+workers. It has no data-parallel load balancing within a worker, instead only using implicit task-parallel load balancing. (2) “persist-worker_size-FETCH_SIZE” utilizes persistent kernels with
+CTA-sized
+workers. (3) “discrete-worker_size-FETCH_SIZE” utilizes discrete kernels and
+CTA-sized
+workers. Both CTA variants use load balancing search
+(
+Merrill
+et al. 2012
+)
+(a data-parallel load balancing technique) inside workers in conjunction with implicit task-parallel load balancing.
+
+For BFS and PageRank, we compare the performance of our implementations to Gunrock
+(
+Wang et al. 2017
+)
+, a state-of-the-art single-GPU BSP-based graph framework, which extensively uses data-parallel load-balancing techniques. For Graph Coloring, Gunrock’s independent-set graph coloring algorithm is not comparable, so we faithfully implemented a BSP graph coloring using the same speculative greedy graph coloring algorithm. Our BSP implementation uses the Gunrock’s bucket-based data-parallel load balancing method
+(
+Wang et al. 2017
+)
+, described in Section
+3.3
+.
+
+We run the three case studies on three scale-free and two mesh-like datasets (see Table
+2
+) and summarize the runtime (speedup) results for four implementations in Table
+1
+.
+
+Table 1
+.
+Runtime with speedup comparing to BSP in the paraphrase of BSP and three Atos implementations. Graph types are s (scale-free) and m (mesh-like). Runtime unit: ms
+
+Application: BFS (BSP=Gunrock)
+
+Dataset
+
+BSP
+
+persist
+
+warp
+
+persist
+
+CTA
+
+discrete
+
+CTA
+
+soc-LiveJournal1
+s
+
+15.3
+
+22.3 (x0.68)
+
+12.4 (x1.23)
+
+10.7 (x1.42)
+
+hollywood_2009
+s
+
+9.26
+
+12.2 (x0.75)
+
+6.23 (x1.48)
+
+4.56 (x2.02)
+
+indochina_2004
+s
+
+13.2
+
+15.6 (x0.84)
+
+8.03 (x1.65)
+
+7.42 (x1.79)
+
+road_usa
+m
+
+604
+
+327 (x1.84)
+
+46.9 (x12.8)
+
+174 (x3.46)
+
+roadNet_ca
+m
+
+55.9
+
+39.6 (x1.41)
+
+4.35 (x12.8)
+
+15.5 (x3.58)
+
+Application: PageRank (BSP=Gunrock)
+
+Dataset
+
+BSP
+
+persist
+
+warp
+
+persist
+
+CTA
+
+discrete
+
+CTA
+
+soc-LiveJournal1
+s
+
+262
+
+156 (x1.68)
+
+113 (x2.31)
+
+116 (x2.25)
+
+hollywood_2009
+s
+
+87.1
+
+80.0 (x1.08)
+
+68.5 (x1.27)
+
+72.4 (x1.20)
+
+indochina_2004
+s
+
+159
+
+84.7 (x1.88)
+
+52.6 (x3.02)
+
+49.6 (x3.20)
+
+road_usa
+m
+
+221
+
+169 (x1.30)
+
+121 (x1.81)
+
+112 (x1.95)
+
+roadNet_ca
+m
+
+20.5
+
+16.2 (x1.26)
+
+10.1 (x2.03)
+
+8.28 (x2.47)
+
+Application: Graph Coloring
+
+Dataset
+
+BSP
+
+persist
+
+warp
+
+persist
+
+CTA
+
+discrete
+
+warp
+
+soc-LiveJournal1
+s
+
+96.5
+
+20.4 (x4.71)
+
+36.1 (x2.67)
+
+63.2 (x1.52)
+
+hollywood_2009
+s
+
+77.9
+
+31.9 (x2.4)
+
+59.3 (x1.31)
+
+274 (x0.28)
+
+indochina_2004
+s
+
+673
+
+74.1 (x9.08)
+
+184 (x3.65)
+
+2073 (x0.32)
+
+road_usa
+m
+
+38.2
+
+51.4 (x0.74)
+
+19.3 (x1.97)
+
+81.9 (x0.46)
+
+roadNet_ca
+m
+
+9.11
+
+4.18 (x2.18)
+
+3.52 (x2.58)
+
+12.0 (x0.75)
+
+Table 2
+.
+Summary of datasets used in our experiments. Graph types are s (scale-free) and m (mesh-like)
+
+Max.
+
+Max.
+
+Avg.
+
+Dataset
+
+Vertices
+
+Edges
+
+Diam.
+
+indeg.
+
+outdeg.
+
+degree
+
+soc-LiveJournal1
+s
+
+4.8M
+
+68M
+
+20
+
+13,905
+
+20,292
+
+14
+
+hollywood_2009
+s
+
+1.1M
+
+11M
+
+11
+
+11,467
+
+11,467
+
+105
+
+indochina_2004
+s
+
+7.4M
+
+191M
+
+26
+
+256,425
+
+6,984
+
+8
+
+road_usa
+m
+
+23.9M
+
+57M
+
+6,809
+
+9
+
+9
+
+2
+
+roadNet_ca
+m
+
+1.9M
+
+5M
+
+849
+
+12
+
+12
+
+2
+
+6.3.
+Performance Challenges in Three Study Cases
+
+Each of our study cases embodies a subset of the BSP performance challenges discussed in Section
+2.1
+, which informs our choice of design decisions in the Atos framework. We summarize the BSP performance challenges in Table
+3
+.
+
+Load Imbalance Problem:
+All three algorithms involve iterating over a vertex’s neighbor list; thus variance in the vertices’ degrees leads to load imbalance. This issue is much more severe on scale-free datasets where vertex degree variance is high. In contrast, mesh-like graphs have low maximum degree, and hence low degree variance (see Table
+2
+).
+
+Small Frontier Problem:
+In Figures
+3
+,
+4
+, and
+5
+, we plot throughput against timeline for each BSP implementation of the three algorithms. Low throughput over a long duration of time indicates the presence of the small-frontier problem.
+
+BFS:
+In Figure
+3
+, Gunrock has high throughput on scale-free datasets, and thus does not have the small-frontier problem. This is because scale-free datasets have low diameter (leading to a small number of BSP iterations) and high average degree (leading to a large amount of work per iteration). In contrast, Gunrock on mesh-like datasets
+does exhibit
+the small frontier problem, because these datasets have high diameters and small average degree; consequently, there is a large number of iterations, with little work per iteration, leading to low throughput over many iterations.
+
+PageRank:
+In Figure
+4
+, for Gunrock PageRank, both scale-free and mesh-like datasets do not exhibit the small frontier problem, as they have high throughput over most of the execution time and converge in fewer than 35 iterations (though Indochina-2004 exhibits a long flat tail in the latter half of execution).
+
+Graph Coloring:
+In Figure
+5
+, for BSP graph coloring, scale free datasets have low throughput for more than 70% of execution time, and thus have the small frontier problem. Mesh-like datasets terminate in fewer than 40 iterations, and have short tails, and thus do not have the small frontier problem. This is because on scale-free datasets, the high-degree vertices will need to be recolored many times, leading to a large number of iterations, during which the frontier contains a few high-degree vertices with color conflicts. In contrast, mesh-like datasets have low average degree, and are less likely to have color conflicts.
+
+Table 3
+.
+Summary of performance challenges for each case study.
+
+BFS
+
+PageRank
+
+Graph Coloring
+
+Scale-Free
+
+Load Imbalance
+
+Load Imbalance
+
+Load Imbalance + Small Frontier
+
+Mesh-Like
+
+Small Frontier
+
+None
+
+None
+
+6.4.
+Relaxing Barriers
+
+Table 4
+.
+Upper: Workload ratio of three Atos implementations relative to Gunrock’s implementations for BFS and PageRank. A workload ratio of
+n
+means that our implementation does
+n
+times as much work as Gunrock. Lower: the workload ratio of four implementations relative to the input graph’s total vertex count for graph coloring.
+
+Application: BFS
+
+Application: PageRank
+
+Dataset
+
+persist
+
+warp
+
+persist
+
+CTA
+
+discrete
+
+CTA
+
+persist
+
+warp
+
+persist
+
+CTA
+
+discrete
+
+CTA
+
+soc-LiveJournal1
+s
+
+1.43
+
+1.06
+
+1.01
+
+0.73
+
+0.72
+
+0.72
+
+hollywood_2009
+s
+
+2.26
+
+1.19
+
+1.07
+
+1.08
+
+1.18
+
+0.9
+
+indochina_2004
+s
+
+1.28
+
+1.00
+
+1.00
+
+0.76
+
+0.73
+
+0.75
+
+road_usa
+m
+
+3.56
+
+1.05
+
+1.04
+
+0.79
+
+0.79
+
+0.92
+
+roadNet_ca
+m
+
+2.05
+
+1.02
+
+1.04
+
+1.18
+
+1.11
+
+0.97
+
+Application: Graph Coloring
+
+Dataset
+
+BSP
+
+persist
+
+warp
+
+persist
+
+CTA
+
+discrete
+
+warp
+
+soc-LiveJournal1
+s
+
+1.17
+
+1.00
+
+1.74
+
+2.78
+
+hollywood_2009
+s
+
+3.31
+
+1.15
+
+5.24
+
+37.34
+
+indochina_2004
+s
+
+1.96
+
+1.04
+
+4.45
+
+16.97
+
+road_usa
+m
+
+1.22
+
+1.00
+
+1.46
+
+1.41
+
+roadNet_ca
+m
+
+2.55
+
+1.00
+
+1.74
+
+2.44
+
+As discussed in Sections
+2
+–
+3
+, relaxing barriers exposes more concurrency, giving higher throughput and shorter execution time. However, relaxing barriers may result in extra work. If the performance improvement from increased concurrency outweighs the cost of extra work, we obtain a net performance gain.
+
+There are two key factors influencing this tradeoff. First, we find that in the presence of a small frontier problem, the increase in concurrency from relaxing barriers is always more significant than the cost of extra work. Second, on naturally unordered algorithms such as PageRank, one can always relax the barrier: although the barrier gives the BSP implementation a more predictable convergence rate, the barrier generally does not make the convergence faster.
+
+Table
+4
+summarizes the extra work for three study cases. Figures
+3
+,
+4
+and
+5
+plot the throughput of four implementations (BSP + three Atos variants) of three study cases against timeline for four datasets. Notably, these plots show the
+normalized throughput
+, which is the measured throughput divided by the overwork factors in Table
+4
+. This gives a fair measure of overall performance, as it incorporates both the benefits of improved concurrency (higher absolute throughput) and the cost of extra work. Essentially, normalized throughput measures “useful” throughput rather than raw absolute throughput. We provide detailed analysis below for each application.
+
+Figure 3
+.
+Normalized throughput vs. time on BFS. The top charts are scale-free; bottom charts are mesh-like.
+
+Figure 4
+.
+Normalized throughput vs. time on PageRank.
+
+Figure 5
+.
+Normalized throughput vs. time on graph coloring.
+
+BFS:
+Figure
+3
+shows that for the two mesh-like datasets, all 3 Atos implementations achieve considerably higher normalized throughput than Gunrock. Why? Table
+3
+shows that Gunrock on mesh-like datasets has a severe small frontier problem. Therefore, the increase in concurrency in the 3 Atos implementations offers a significant performance advantage. Table
+4
+indicates that the persistent-warp implementation generates 3.5x extra work vs. Gunrock, but despite this extra work, Atos’s normalized throughput is still significantly higher than Gunrock. Scale-free graphs, on the other hand, exhibit more parallelism and do not suffer from the small-frontier problem. Atos’s fastest implementations are still faster than Gunrock’s, but not nearly as much as for the mesh networks.
+
+On all BFS experiments, Atos’s CTA implementations are faster than its warp ones. Atos’s CTA implementations use a combination of task-parallel and data-parallel load balancing techniques (see Section
+6.5
+for details), and thus have better load balancing than its warp implementations, which only use task-parallel load balancing. This leads to higher GPU utilization and hence higher absolute throughput. Second, CTA implementations produce less extra work than warp (see Table
+4
+). Due to better load balancing in CTA, the workload of each worker has lower variance. If a worker receives too much work, there will be a long delay before the vertices’ updated depths are visible to other workers; this increases the likelihood that downstream vertices are first reached via other sub-optimal paths, which leads to extra work.
+
+PageRank:
+Unlike BFS, PageRank is naturally unordered, as it satisfies Dijkstra’s don’t care non-determinism
+(
+Dijkstra 1976
+)
+. Therefore, relaxing the barrier in the outer loop does not generate any misspeculations and hence results in no wasted work. In fact, Table
+4
+shows that the Atos implementations perform
+less
+work than Gunrock in general. This is because the BSP barrier forces each vertex to be processed at most once per iteration. By relaxing this barrier, the Atos implementations can update certain important vertices (e.g., vertices with high centrality) more frequently than other vertices, thus leading to more efficient propagation of rank.
+
+Figure
+4
+shows that all three Atos implementations compact the workload and process it with higher normalized throughput (persist-CTA has a higher profiling cost).
+Though PageRank does not suffer from the small frontier problem, the three Atos implementations nonetheless have superior performance over Gunrock, because relaxing the barrier increases concurrency. In addition, relaxing the barrier lowered the overall workload in practice, even though in theory it may lead to a more unpredictable convergence rate.
+
+Graph Coloring:
+
+Unlike BFS and PageRank, all graph coloring implementations (including BSP) use a speculative approach (greedy graph coloring) and thus all have extra work. Table
+4
+summarizes the multiplicative factor of extra work, which is defined as a ratio vs. the number of vertices in the graph (the lowest possible workload). Atos’s persist warp has the least extra work; on some datasets, the extra work is less than 1%, which means after the first color assignment, only 1% of vertices have a color conflict and must be recolored.
+Atos’s discrete warp has the most extra work (on hollywood-2009, 37.34x). The extra work is due to the combination of two factors:
+
+1. Conflicts tend to arise when neighboring vertices are colored concurrently:
+From Section
+5.3
+, given a vertex, the algorithm first checks its neighbors’ colors, then assigns a color to the vertex that does not conflict with its neighbors. The color assignment is speculative because it is done using possibly outdated color information from the vertex’s neighbors. When neighboring vertices are colored simultaneously, they read outdated colors from each other, leading to conflicts and recoloring.
+
+2. Consecutive vertices on the work queue are likely to be neighbors:
+On many if not most graphs, the vertex ID is semantically meaningful: vertices whose vertex ID are numerically close are more likely to be neighbors. At the beginning of graph coloring, all vertices are initially inserted onto the work queue in order of vertex ID.
+
+Since consecutive vertices on the work queue tend to be assigned colors concurrently, the above implies a high likelihood of color conflicts. We verify that the large amount of extra work is indeed due to semantically meaningful vertex IDs: running the exact same experiment with randomly permuted vertex IDs, the amount of extra work drops to less than 1.5x for all four implementations on all datasets. ID permutation leads to the following runtime improvements (in ms) on scale-free datasets:
+
+Impl.
+
+soc-LiveJournal1
+
+hollywood
+
+indochina
+
+discrete-warp
+
+63
+\rightarrow
+31
+
+274
+\rightarrow
+26
+
+2073
+\rightarrow
+222
+
+persist-CTA
+
+36
+\rightarrow
+21
+
+59
+\rightarrow
+28
+
+184
+\rightarrow
+50
+
+BSP
+
+96
+\rightarrow
+89
+
+77
+\rightarrow
+61
+
+673
+\rightarrow
+485
+
+The BSP implementation has a more modest improvement because BSP’s thread-warp-CTA load balancing scheme
+(
+Merrill
+et al. 2012
+)
+already divides each bucket into three individually-load-balanced subbuckets, reducing inter-bucket conflicts.
+Persist-warp has little change as there is almost no extra work even before permutation. Notably, after permutation, all three Atos variants are faster than BSP implementation on scale-free datasets.
+
+Comparing persist-warp and persist-CTA:
+persist-CTA has better load balancing, allowing for more (potentially adjacent) vertices to be colored simultaneously, resulting in more extra work than persist-warp. We verify this from Table
+4
+.
+Roughly speaking, the amount of extra work for persist-CTA is more significant on scale-free graphs, as a vertex can have a large number of neighbors, leading to more potential conflicts. Therefore, persist-CTA outperforms persist-warp on mesh-like graphs, where the increased concurrency and better load-balancing outweigh the cost of wasted work; conversely, on scale-free datasets, persist-CTA is slower than persist-warp, because the cost of extra work is too high (see Tables
+1
+and
+4
+).
+
+Comparing persist-warp and discrete-warp:
+Discrete-warp has more extra work than persist-warp, hurting its performance, for two reasons.
+
+1) The scheduling policies of discrete and persistent kernels are different. When kernels are launched from the CPU (discrete-kernel strategy), the kernel launched earlier always has a higher scheduling (hardware) priority than the kernel launched later. This effectively causes vertices to always be colored in roughly the same order as their initial ordering (by vertex ID, which causes many conflicts). In contrast, the persistent kernel only incurs one kernel launch and warps within it are scheduled by the hardware scheduler, whose decisions are much less ordered by vertex ID. Thus persist-warp has fewer coloring conflicts caused by adjacencies and hence less overwork.
+
+2) discrete-warp has lower register usage than persistent-warp (72 vs. 42), so persist-warp only achieves 43% occupancy per SM and discrete-warp achieves 62%. Therefore the discrete-wrap assigns colors to more vertices simultaneously, leading to a greater likelihood of conflicts than persist-warp. Unlike our other applications, in graph coloring, the cost of extra work largely reduces the benefit of increased concurrency. On scale-free datasets (without random permutation), our highest performance is achieved with lower concurrency and less overwork (persist-warp variant), which achieves a lower absolute throughput but a higher normalized throughput (and hence higher performance overall).
+
+6.5.
+Worker Size and Trade-off between Task- and Data-Parallelism Load Balancing
+
+As discussed in Section
+3
+, Atos enables the user to trade off between task-parallelism and data-parallelism load balancing by adjusting the worker size and FETCH_SIZE. Atos persist-CTA, like persist-warp, uses a persistent kernel to exploit task parallelism, but now the task-parallel work units are fewer and larger (the size of a CTA) and we can leverage more data parallelism within a CTA. In most cases, persist-CTA outperforms persist-warp with both higher normalized/absolute throughput, except for the graph coloring on scale-free datasets, where it achieves only higher absolute throughput. Figure
+6
+illustrates this tradeoff for BFS and PageRank on soc-LiveJournal (scale-free) and road_usa (mesh-like). We exclude graph coloring because it can only be run with one CTA size, due to high register usage (72) and high shared memory usage (46 KB).
+
+Figure 6
+.
+Runtime (ms) heatmap plotted with different worker size and fetch size for BFS and PageRank on soc-LiveJournal
+s
+and road_usa
+m
+. Note only the lower triangle is valid.
+
+6.6.
+Kernel Strategy
+
+From Section
+3
+, the chief advantage of the persistent kernel is removing the overhead associated with kernel invocation, which is most significant for fine-grained tasks that involve many small kernel launches. Based on the performance results in Table
+1
+and Figure
+3
+, the performance gap between persistent kernel and discrete kernel is particularly large for BFS on mesh-like graphs, which require many small kernel launches due to the high diameter and small workload per iteration. Graph coloring on indochina-2004 also shows a large kernel launch overhead. Using a random permutation of vertex IDs (see Section
+6.4
+), Atos’s persistent variant is 4.3x faster than its discrete variant.
+
+7.
+Conclusion
+
+In this paper, we present our task-parallel GPU dynamic scheduling framework, Atos, and analyze its performance across numerous design parameters on three case studies. Our analysis provides the following guidelines on what applications are suitable to run in a capable task-parallel framework, as well as what Atos configurations to use, given an application’s characteristics:
+
+(1)
+
+If the dynamic application either exhibits the small frontier problem or has load imbalance, Atos will have a performance advantage.
+
+(2)
+
+If the application exhibits the small frontier problem, it should be run with a persistent kernel.
+
+(3)
+
+If the application exhibits load imbalance, it should be run with both task- and data-parallelism load balancing in tandem to achieve better performance. For different applications, the optimal tradeoff point varies.
+
+(4)
+
+By relaxing the outer loop dependency in the application, Atos increases concurrency at the cost of extra work due to mis-speculation, or less predictable convergence rates. The optimal tradeoff between the increased concurrency and additional cost is application-dependent. When an application is naturally unordered (e.g., PageRank) or has the small frontier problem (e.g., BFS on mesh-like datasets and graph coloring on scale-free datasets), the increased concurrency usually outweighs the cost. Conversely, on problems such as BFS on scale-free graphs or graph coloring on mesh-like graphs, the cost of extra work can hurt performance. The best way to reduce extra work is application-dependent and may include better load balancing (e.g., BFS) or reducing concurrency (e.g., graph coloring).
+
